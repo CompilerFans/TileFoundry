@@ -252,6 +252,7 @@ class MemoryMetadata(IRMetadata):
     footprint: Footprint | None = None
     buffer_bytes: int | None = None
     offsets: tuple[int, ...] = ()
+    alias: BufferAlias | None = None
 
 
 class ReuseWindow:
@@ -313,14 +314,23 @@ class Traffic:
 Every traffic amount is what a boundary's own relation reaches. The Op's
 evaluator says which way each boundary moves and whether it materialises
 anything; it does not say how much, and an Op with no relation fails closed.
+When a boundary axis's coordinate is determined by data (`reached_at`'s `free`
+axes), that boundary is a lookup. Its movement MUST be capped at the number of
+domain coordinates when countable: each coordinate selects at most one element
+from the possible image. If the domain count is unknown, the countable image
+remains the movement upper bound. The footprint MUST retain the full possible
+image. Out-of-bounds
+IndexSelect indices with `fill_value` are not statically distinguished; traffic
+counts one slice per index as an upper bound.
 
 | Field | How it is computed | Reads the target |
 |---|---|---|
 | `MemoryMetadata.topologies` | The effective Module topology levels, coarsest first. | No |
 | `MemoryMetadata.traffic` | One occurrence's per-boundary movement, grouped by storage and communication boundary. | No; projection reads resolved Mesh and topology extents. |
 | `MemoryMetadata.operands` | One occurrence's movement in order `(*call.args, call)`. | No |
-| `MemoryMetadata.buffer_bytes` | The bytes in one physical copy of an address-placed `gmem` or `smem` Call result, or `None` when the result is not address-placed. | No |
-| `MemoryMetadata.offsets` | The byte offset of each physical result copy, in copy order. An `rmem` result has no reported offsets. | No |
+| `MemoryMetadata.buffer_bytes` | The bytes in one physical copy of an address-placed `gmem` or `smem` tensor result, including a carried phi. `None` for tuple results or results that are not address-placed. | No |
+| `MemoryMetadata.offsets` | The byte offset of each physical result slot: each copy of a staged tensor in copy order, or each tuple `AllocationValue` in flattened result-index order. An `rmem` result has no reported offsets. Staged tuple results MUST raise `AnalysisError`. | No |
+| `MemoryMetadata.alias` | See [`BufferAlias`](#bufferalias). Only lowering reads it; it MUST NOT appear in analysis reports. | No |
 | `RegionMemoryMetadata.topologies` | The same effective Module topology levels. | No |
 | `RegionMemoryMetadata.traffic` | Every reachable occurrence. `logical` multiplies only loops the value varies in; `total` and `per_unit` multiply every enclosing loop. | No |
 
@@ -458,26 +468,116 @@ are monotonic across the whole Function, including nested and sibling regions.
 
 | Field | How it is computed | Reads the target |
 |---|---|---|
-| `ValueLifetime.binding` | Use the parameter or binding name, suffixed with `:` and the line of the value's source span when it has one. Repeated names differ by the printer's numeric suffix in definition order. A value with neither name nor span is `<value N>` in definition order. | No |
-| `ValueLifetime.memory_level` | Emit one lifetime per storage level occupied by the value's Type. | No |
+| `ValueLifetime.binding` | Use the parameter or binding name, suffixed with `:` and the line of the value's source span when it has one. Repeated names differ by the printer's numeric suffix in definition order. A value with neither name nor span is `<value N>` in definition order. A tuple result appends `[index]`, its flattened `AllocationValue.index`; tensor results retain the unsuffixed name. | No |
+| `ValueLifetime.memory_level` | Emit one lifetime per material `AllocationValue`, at the level occupied by its projected Type. | No |
 | `ValueLifetime.bytes` | Project the Type through every authored split at or coarser than the explicit level's `owner`, then take its logical bytes; a target-owned or undeclared level remains global. A `ScheduleOp` whose selected instruction has a write-only result occupies `buffers` copies of those bytes; a `READ \| WRITE` result occupies one. | `MemoryHierarchyFacts.explicit_levels[].owner` |
 | `ValueLifetime.defined_at` | Definition event on the Function-wide structured SSA timeline. A staged (`buffers > 1`) result starts at the outermost enclosing loop's phi event rather than its own definition event. | No |
-| `ValueLifetime.last_used_at` | Greatest ordinary-consumer, region-entry, loop-backedge, or region-exit use event; the final timeline event for a parameter. | No |
+| `ValueLifetime.last_used_at` | Greatest ordinary-consumer, region-entry, loop-backedge, or region-exit use event belonging to this result index. Static tuple projections use only the selected result; other tuple uses use every result. | No |
 | `ValueLifetime.persistent` | True for parameters and false for body allocations. | No |
 | `RegionMemoryMetadata.lifetimes` | Every value residency except a non-material view. | As above |
 
 - constraints:
-  - An op registered with `register_buffer_alias(Op, Op.param)` describes the
-    bytes of that input parameter, re-addressed. `Slice` and `Reshape` register
-    their `x` parameter and MUST NOT receive independent lifetimes. A result
-    reached only through a `MeshRegion` result binding edge and tuple
-    projections likewise describes
-    bytes already held by the region body and MUST NOT receive an independent
-    lifetime. Every other result, including `Transpose` or a result that overwrites
-    a destination, MUST allocate its own. Analysis MUST use operation semantics
-    for this distinction rather than infer aliasing from layouts.
   - A caller-owned parameter MUST NOT be reused. Donation is a contract with
     the caller, not a conclusion this family may draw.
+
+##### `BufferAlias`
+
+```python
+class BufferAlias:
+    buffer: Expr                  # the value whose bytes hold this result
+    relation: AccessRelation      # result coordinates -> buffer coordinates
+    index: int = 0                # flattened tensor result index of buffer
+```
+
+| Field | How it is computed | Reads the target |
+|---|---|---|
+| `BufferAlias.buffer` | A registered view: the operand `aliased_operand` names. An adopted InsertSlice update window: the destination resolved through region captures. A carried-phi tie: the initial value. | No |
+| `BufferAlias.relation` | A registered view: `renaming_relation`. An update window: the proven operand-to-result relation with parameters resolved to values visible at the producer. A tie: identity. | No |
+| `BufferAlias.index` | The flattened tensor result index of `buffer`; zero for a tensor result. Source identity is `(buffer, index)`. | No |
+
+- constraints:
+  - An op registered with `@register_buffer_alias(Op)` returns the viewed
+    input's position or `None` for each Call. `buffer_alias()` returns
+    `BufferAlias(buffer, relation)`, describing that input's bytes and the
+    result-to-input coordinates, and proves the declaration on every call.
+    `Slice` and `Reshape` alias input zero and MUST NOT allocate independent
+    buffers. `Tuple`, `MeshRegion`, and `LoopRegion` results and static tuple
+    projections describe bytes already held by their selected body or carry.
+    They MUST have their own AllocationValue intervals and require the operand's
+    address through constraints. Static tuple projections are visitor structural rules, like
+    `Tuple`, `MeshRegion`, and `LoopRegion`, rather than registered views.
+    Every other result, including `Transpose` or a result that overwrites
+    a destination, MUST allocate its own. Analysis MUST use operation semantics
+    for this distinction rather than infer aliasing from layouts.
+  - Reshard MUST alias its source when storage is unchanged, both layouts are
+    plain (including compositions without `ShardLayout` components) with
+    strides stated in every `Layout` component, the shape is literal, and the
+    two layouts map every colex coordinate to the same address. An
+    address-changing, storage-changing, or sharded Reshard MUST
+    retain its independent buffer.
+  - Bitcast MUST alias its source and allocate no independent buffer. Its
+    declared access relation MUST bijectively map result coordinates to source
+    coordinates with the same physical address, requiring the source's
+    address and recording zero traffic.
+  - Registered buffer aliases MUST create an `AllocationValue(value, index, lifetime)`
+    with its own SSA interval and the operand's byte span, requiring the same
+    address and alias group. A persistent operand MUST pin its alias at the same
+    address. Aliases MUST NOT receive independent `buffer_bytes` or
+    `offsets`. Analysis MUST resolve structural tuple projections to their
+    selected element without a coordinate-renaming proof. For other aliases,
+    `buffer_alias()` MUST prove that the result-to-operand map is single-valued, injective, and
+    contained in the operand's index box, using the call's own unmodified
+    declared access relation via `renaming_relation`, not its folded accesses.
+    Failure to prove that declaration MUST raise `AnalysisError`. `Transpose`
+    is not registered: it writes a new value, retains its access permutation,
+    and receives its own allocation under the ordinary conflict rules.
+  - Allocation MUST return storage for each SSA value and record adopted
+    InsertSlice update windows and carried-phi ties in `MemoryMetadata.alias`.
+    An update window MUST be adopted only together with the InsertSlice's
+    destination alias. A material tuple op's leaf MAY reuse the destination's
+    window in analysis, but its producer MUST NOT receive `MemoryMetadata.alias`:
+    lowering does not support material tuple results. An update window's buffer
+    MUST be the destination resolved through
+    region captures; its relation MUST map producer coordinates to destination
+    coordinates. The destination and SSA parameters MUST be defined in the
+    producer's scope or an ancestor, before the producer's definition event.
+    Constants and dimension variables are always visible;
+    a mesh coordinate is visible only if an enclosing mesh region declares its
+    topology. Lowering MUST execute this decision without reading
+    the InsertSlice's parameters at the producer. An untied carry MUST receive
+    its own storage and a copy of its initial value before entering the loop.
+    Ordinary `smem` aliases use their placed offsets; `rmem` alias groups only
+    estimate peaks. Scope construction MUST compute each value's source once
+    per view in definition order, using only its operands' source entries.
+    Registered views compose their result-to-input relation with the input's
+    source. MeshRegion results use their body's source; static tuple projections
+    select a structural element or a material op's flattened result index;
+    loop results use their corresponding carried phi; capture parameters use
+    their arguments' sources. Every other source is the value itself and identity.
+    `resolve_access` MUST perform one source lookup and one relation composition,
+    rather than trace producers per access. Boundary parameters MUST be eliminated
+    before composition in the operand's coordinate space. View parameters MUST
+    be eliminated when constructing that view's source, in the input's coordinate
+    space and using the input's type for widening. Source relations retain their
+    defining loop prefix, aligned to the access's enclosing loops; loops internal
+    to an escaping region MUST be projected out.
+  - Liveness MUST record each SSA value's own interval. Every tensor SSA value,
+    including views, region parameters and results, and static tuple projections,
+    MUST have its own `AllocationValue`; intervals MUST NOT be merged or extended
+    to include aliases. Every tuple value MUST have one `AllocationValue(value, index)`
+    per flattened tensor result. Its interval runs from the tuple's definition to
+    the last use belonging to that result: a static tuple projection uses only
+    the selected result, while whole-tuple operations, region captures, synthetic
+    loop uses, and returns use every result. Corresponding results MUST be joined
+    by required-alias constraints. Same-group values MAY overlap; different groups
+    with intersecting intervals MUST NOT overlap. Register and other non-address-solved
+    peaks MUST count each live alias group once, including alias values. In-place
+    checks MUST read liveness uses of every group member and reject a result when
+    a member has a later ordinary use. A dynamic tuple projection MUST conservatively
+    keep every possible tensor leaf resident until the function timeline ends,
+    using an `AllocationValue` at the projection's definition tied to that leaf's
+    address and group. The projection and its forwards have no independent storage
+    and MUST NOT participate in in-place reuse or loop ties.
 
 ##### `MemoryLevelPeak`
 
@@ -547,23 +647,6 @@ class MemoryLevelPeak:
     operand, including a narrowing pointwise operation; an exact contained
     relation MUST keep the operand range inside the result range. These alias
     requirements are mandatory rather than optional placement choices.
-  - Registered buffer aliases MUST follow their named operand to its storage
-    owner and MUST NOT receive independent `buffer_bytes` or `offsets`. Analysis
-    MUST prove that the result-to-operand map is single-valued, injective, and
-    contained in the operand's index box, using the call's own unmodified
-    declared access relation via `renaming_relation`, not its folded accesses.
-    Failure to prove that declaration MUST raise `AnalysisError`. `Transpose`
-    is not registered: it writes a new value, retains its access permutation,
-    and receives its own allocation under the ordinary conflict rules.
-  - Liveness MUST propagate a use through the same storage-sharing edges used
-    by `storage_owners`: registered buffer aliases to their source, mesh-region
-    results to their body, and tuple projections to their selected element.
-    Chains MUST propagate to the final owner. Placement interference, register
-    peaks, and in-place conflict checks MUST consume this liveness directly,
-    without independently rebuilding shared-storage intervals.
-    Storage ownership MUST be resolved once per value for an analysis, with
-    each registered alias proved once; allocation consumers MUST reuse that
-    owner table rather than repeat the proofs.
   - Every placed offset MUST be aligned to the greater of 16 bytes and the
     result element width. A staged result's copies MUST be contiguous: copy
     `k` starts at the solved block offset plus `k * buffer_bytes`.
@@ -1282,6 +1365,7 @@ class AnalysisResult:
     Attributes:
         module: attribute; Source Module.
         function: attribute; Function that received records.
+        scopes: attribute; Shared iteration-scope tree built for that Function by this Analyze call.
         analyses: attribute; Requested root analyses in first-occurrence order.
         topology_level: attribute; Topology level whose unit the per-unit quantities describe, or None.
         executed: attribute; Analyses executed in dependency order.
@@ -1290,6 +1374,7 @@ class AnalysisResult:
 
     module: "Module"
     function: "Function"
+    scopes: "IterationScope"
     analyses: tuple[str, ...]
     topology_level: str | None
     executed: tuple[str, ...]
@@ -1394,7 +1479,17 @@ def analyze(
 
 The normalized HIR is visited once per `analyze()` call. That visit produces an
 `IterationScope` tree parallel to Function, LoopRegion, and MeshRegion nesting
-and `Access` relations for the narrow and device views. A mesh scope adds no
+and `Access` relations for the narrow, device and unit views. Without a selected
+topology level, the unit view MUST use logical coordinates. Every view MUST
+construct a source for every value in its own coordinates. Unit coordinates are the logical
+coordinates composed with the layout's decomposition map; intersection with the
+operand's index box and parameter widening MUST use its unit-local type.
+Registered-view proofs MUST run once in logical coordinates and be reused for
+the unit view: bijective decomposition preserves the proven properties. Unit
+accesses MUST NOT fall back to narrow accesses. A refused unit boundary MUST
+contribute unknown evidence; a missing boundary MUST contribute lower-bound
+evidence through the same completeness rules as other refused or missing
+boundaries. A mesh scope adds no
 iteration dimension: it keeps its parent's depth and domain, so the first
 `depth` input dimensions of an access relation remain the enclosing loops.
 `IterationScope.domain` is the accumulated authored loop domain;
@@ -1404,7 +1499,10 @@ An input `Access` stores its original Call boundary index as well as its relatio
 and allocation expression; an output stores `input_index=None` and its own output
 boundary index, which is the tuple field it answers for. Failed boundaries remain
 absent without shifting the index on later successful inputs or outputs. Storage
-level and element width are read from the allocation type. A refused descendant
+level and element width are read from the allocation type. `Access.index` is the
+source's flattened tensor result index, zero for tensor results; buffers MUST be
+grouped by `(Access.buffer, Access.index)`, and a tuple result's label is
+`<name>[index]`. A refused descendant
 makes its owning scope unknown for that view. Non-affine runtime indices retain
 the widest legal access approximation.
 Normalization clones each reached Function call site independently. Within one

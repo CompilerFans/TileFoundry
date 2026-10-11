@@ -53,6 +53,7 @@ class AccessRelation:
 
     relation: "isl.map"
     values: IslParamValues = field(default_factory=dict)
+    may_access: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.relation, isl.multi_aff):
@@ -215,8 +216,8 @@ def projected(
     )
     share = _own_iterations(relations, placed, answered, ninputs)
     carried = tuple(
-        _addressed(relation, view[0], bindings, label, call)
-        for relation, view, label in zip(placed, views, where, strict=True)
+        _addressed(relation, view[0], bindings, label, call, may_access=access.may_access)
+        for relation, view, label, access in zip(placed, views, where, relations, strict=True)
     )
     if share is None:
         return carried
@@ -296,7 +297,9 @@ def _iterating_over(
             f"{share} this participant performs: {error}"
         ) from error
     names = _parameter_names(held)
-    return AccessRelation(held, {name: bindings[name] for name in names if name in bindings})
+    return AccessRelation(
+        held, {name: bindings[name] for name in names if name in bindings}, access.may_access
+    )
 
 
 def renaming_relation(call, ctx, local_relations: tuple[AccessRelation, ...]) -> AccessRelation:
@@ -319,7 +322,10 @@ def renaming_relation(call, ctx, local_relations: tuple[AccessRelation, ...]) ->
     folded = written.reverse().apply_range(reads)
     bindings = _values_of(local_relations)
     names = _parameter_names(folded)
-    return AccessRelation(folded, {name: bindings[name] for name in names if name in bindings})
+    return AccessRelation(
+        folded,
+        {name: bindings[name] for name in names if name in bindings},
+    )
 
 
 def _values_of(relations: tuple[AccessRelation, ...]) -> IslParamValues:
@@ -407,7 +413,6 @@ def _placed(
     if (
         not isinstance(local, TensorType)
         or not isinstance(logical, TensorType)
-        or relation.is_empty()
     ):
         return relation
     if relation.dim(isl.dim_type.OUT) != len(logical.shape):
@@ -441,7 +446,7 @@ def _within_positions(relation: "isl.map", local) -> "isl.map":
 
 
 def _addressed(
-    relation: "isl.map", local, bindings: IslParamValues, where: str, call
+    relation: "isl.map", local, bindings: IslParamValues, where: str, call, *, may_access=False
 ) -> AccessRelation:
     """One placed boundary, held to the coordinates the value actually has.
 
@@ -451,7 +456,9 @@ def _addressed(
     held = _within_positions(relation, local)
     names = _parameter_names(held)
     return _held_countable(
-        AccessRelation(held, {name: bindings[name] for name in names if name in bindings}),
+        AccessRelation(
+            held, {name: bindings[name] for name in names if name in bindings}, may_access
+        ),
         where,
         call,
     )
@@ -693,6 +700,7 @@ def _by_identity(relations: tuple[AccessRelation, ...], rank: int) -> tuple[Acce
         return AccessRelation(
             _renamed(access.relation, targets, taken),
             {canonical[id(value)]: value for value in access.values.values()},
+            access.may_access,
         )
 
     return tuple(renamed(access) for access in relations)
@@ -739,7 +747,9 @@ def _held_to(access: AccessRelation, domain: "isl.set", values: IslParamValues) 
         )
     held = relation.intersect_domain(domain)
     names = _parameter_names(held)
-    return AccessRelation(held, {name: values[name] for name in names if name in values})
+    return AccessRelation(
+        held, {name: values[name] for name in names if name in values}, access.may_access
+    )
 
 
 def projected_axes(access: AccessRelation) -> tuple[int | None, ...]:
@@ -836,7 +846,16 @@ def reached_elements(
     image = _reached_image(access, box, within)
     if image.dim(isl.dim_type.PARAM):
         return None
-    return cardinality(image)
+    reached = cardinality(image)
+    if not access.may_access or reached is None:
+        return reached
+    relation = settled(access)
+    if within is not None:
+        relation = relation.intersect_domain(within)
+    if box is not None and box.tuple_dim() == relation.dim(isl.dim_type.OUT):
+        relation = relation.intersect_range(box)
+    coordinates = cardinality(relation.domain())
+    return reached if coordinates is None else min(reached, coordinates)
 
 
 def control_leaves(type_: "Type") -> int:
@@ -925,7 +944,7 @@ def reached_at(
     An Op reasons in logical axes and a participant is indexed by the positions
     its layout made, so the expressions are given per axis and spread over the
     positions holding it. An axis named `free` is one whose coordinate is a value
-    nobody has here -- the element a lookup read decides it -- so the relation
+    nobody has here because data determines it, so this may-access relation
     covers every coordinate that axis could legally name instead of guessing one.
     That keeps the answer bounded, and countable, without a carrier a reader has
     to special-case.
@@ -947,7 +966,9 @@ def reached_at(
     domain = ", ".join(f"d{index}" for index in range(rank))
     where = f" : {' and '.join(guards)}" if guards else ""
     return AccessRelation(
-        isl.map(f"{_declared(values)}{{ [{domain}] -> [{', '.join(image)}]{where} }}"), values
+        isl.map(f"{_declared(values)}{{ [{domain}] -> [{', '.join(image)}]{where} }}"),
+        values,
+        may_access=bool(free),
     )
 
 
@@ -1083,6 +1104,32 @@ def broadcast_shapes(a: tuple, b: tuple, *, raising: bool = True):
     return tuple(out)
 
 
+def broadcast_all(shapes: tuple[tuple, ...]) -> tuple:
+    """The common right-aligned broadcast shape of these operands."""
+    out_shape = shapes[0]
+    for shape in shapes[1:]:
+        out_shape = broadcast_shapes(out_shape, shape)
+    return out_shape
+
+
+def broadcast_relations(shapes: tuple[tuple, ...]) -> tuple[AccessRelation, ...]:
+    """Map the broadcast domain to each operand and then to the result."""
+    out_shape = broadcast_all(shapes)
+    rank = len(out_shape)
+    dims = [f"d{i}" for i in range(rank)]
+    source = "[" + ", ".join(dims) + "]"
+    maps = []
+    for shape in shapes:
+        pad = rank - len(shape)
+        accessed = [
+            "0" if is_one(shape[i]) and not is_one(out_shape[pad + i]) else dims[pad + i]
+            for i in range(len(shape))
+        ]
+        maps.append(AccessRelation(isl.map(f"{{ {source} -> [{', '.join(accessed)}] }}")))
+    maps.append(AccessRelation(isl.map(f"{{ {source} -> [{', '.join(dims)}] }}")))
+    return tuple(maps)
+
+
 def broadcast_access(result_shape: tuple, operand_shape: tuple) -> AccessRelation:
     """Which coordinate of an operand a result coordinate reads.
 
@@ -1136,6 +1183,23 @@ def _operand_reads(
         else:
             reads.append(out_axes[axis + shift])
     return reads
+
+
+def gather_relations(
+    source: TensorType, index: TensorType, axis: int
+) -> tuple[AccessRelation, AccessRelation, AccessRelation]:
+    """Read source slices selected by index, then write the gathered result."""
+    out_shape = (*source.shape[:axis], index.shape[0], *source.shape[axis + 1 :])
+    rank = len(out_shape)
+    carried = {position: f"d{position}" for position in range(rank)}
+    return iterating(
+        out_shape,
+        (
+            reached_at(rank, source, source, carried, free=(axis,)),
+            reached_at(rank, index, index, {0: carried.get(axis, "0")}),
+            identity_access(rank),
+        ),
+    )
 
 
 def matmul_relations(
@@ -1293,6 +1357,9 @@ def static_bytes(type_: "Type") -> int | None:
 __all__ = [
     "AccessRelation",
     "access_relation_registry",
+    "broadcast_all",
+    "broadcast_relations",
+    "gather_relations",
     "iterating",
     "identity_access",
     "identity_relations",

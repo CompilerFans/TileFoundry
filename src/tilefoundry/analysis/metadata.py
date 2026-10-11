@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from tilefoundry.ir.core.metadata import IRMetadata
 from tilefoundry.visitor_registry.contexts import TrafficBytes
 
+from .access import BufferAlias
 from .precision import AnalysisPrecision
 
 
@@ -134,6 +135,7 @@ class MemoryMetadata(IRMetadata):
     footprint: Footprint | None = None
     buffer_bytes: int | None = None
     offsets: tuple[int, ...] = ()
+    alias: BufferAlias | None = None
 
 
 @dataclass(frozen=True)
