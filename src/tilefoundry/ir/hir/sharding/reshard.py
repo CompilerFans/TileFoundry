@@ -20,7 +20,7 @@ from tilefoundry.ir.types.shard_layout import (
 )
 from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.ir.types.stride import compact_row_major
-from tilefoundry.ir.types.utils import is_literal_shape
+from tilefoundry.ir.types.utils import is_literal_shape, is_unsharded_layout, strip_broadcast_layout
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
     AccessRelation,
@@ -180,7 +180,10 @@ def _stated_strides(layout) -> bool:
 
 
 def _plain(layout) -> bool:
-    """Plain address functions have stated strides and no shard component."""
+    """Plain address functions include full broadcasts with stated strides."""
+    if not is_unsharded_layout(layout):
+        return False
+    layout = strip_broadcast_layout(layout)
     return (
         isinstance(layout, (Layout, ComposedLayout))
         and shard_layout_of(layout) is None
@@ -203,7 +206,9 @@ def _buffer_alias(call: Call) -> int | None:
         return None
     if not is_literal_shape(result.shape):
         return None
-    return 0 if _same_addresses(source.layout, result.layout, prod(result.shape)) else None
+    source_layout = strip_broadcast_layout(source.layout)
+    result_layout = strip_broadcast_layout(result.layout)
+    return 0 if _same_addresses(source_layout, result_layout, prod(result.shape)) else None
 
 
 @register_access_relation(Reshard)
@@ -251,7 +256,11 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
         )
     new_storage = op.storage if op.storage is not None else x_ty.storage
     new_layout = op.layout
-    if isinstance(new_layout, ShardLayout) and new_layout.layout.strides is None:
+    if (
+        isinstance(new_layout, ShardLayout)
+        and isinstance(new_layout.layout, Layout)
+        and new_layout.layout.strides is None
+    ):
         new_layout = _materialize_reshard_strides(new_layout, x_ty, new_storage)
     return TensorType(
         shape=x_ty.shape,

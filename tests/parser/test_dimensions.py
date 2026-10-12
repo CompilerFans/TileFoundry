@@ -4,13 +4,66 @@ from __future__ import annotations
 
 import pytest
 
-from tilefoundry import func, module
-from tilefoundry.dsl import Mesh, Tensor, Topology, tf
+from tests._source import import_dsl
+from tilefoundry.dsl import *
+from tilefoundry.inspection import as_script
 from tilefoundry.ir.core import Call
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.sharding.reshard import Reshard
 from tilefoundry.parser import ParseError
 from tilefoundry.target import CudaTarget
+
+
+@pytest.mark.parametrize(
+    ("layout", "message"),
+    [
+        ("(8, 16) @ {}", "layout states must be"),
+        ("(8, 16) @ {mesh.lane @ B()}", "layout states must be"),
+        ('(8, 16) @ {B(), mesh.lane @ P("sum")}', "layout states must be"),
+        ('(8, 16) @ {mesh.lane @ P("")}', "layout states must be"),
+        ("3 @ {B()}", "layout states require"),
+    ],
+)
+def test_layout_states_reject_invalid_forms(layout: str, message: str) -> None:
+    source = f'''from __future__ import annotations
+from tilefoundry.dsl import *
+from tilefoundry.target import CudaTarget
+
+@module(target=CudaTarget("nvidia.h200_sxm"))
+class Model:
+    @func(mesh=Mesh((Topology("thread", 8),), layout=(8,), names=("lane",)))
+    def f(x: Tensor[(8, 16), "f32", {layout}, "rmem"]):
+        return x
+'''
+    with pytest.raises(ParseError, match=message):
+        import_dsl(source, "Model")
+
+
+def test_composed_layout_states_parse_round_trip_and_reshard() -> None:
+    @module(entry="f", target=CudaTarget("nvidia.h200_sxm"))
+    class Model:
+        @func(mesh=Mesh((Topology("thread", 8),), layout=(8,), names=("lane",)))
+        def f(
+            x: Tensor[
+                (8, 16), "f32",
+                ((8, 16) + 4 | Swizzle(2, 4, 3)) @ {mesh.lane @ P("sum")},
+                "rmem",
+            ],
+        ):
+            return tf.reshard(
+                x, ((8, 16) + 4 | Swizzle(2, 4, 3)) @ {B()}, "smem"
+            )
+
+    function = Model.entry_function()
+    execution_mesh = Mesh((Topology("thread", 8),), (8,), ("lane",))
+    composed = ComposedLayout(Swizzle(2, 4, 3), 4, Layout((8, 16), (16, 1)))
+    assert function.params[0].type.layout == ShardLayout(
+        composed, (P("sum"),), execution_mesh
+    )
+    assert function.body.type.layout == ShardLayout(composed, (B(),), execution_mesh)
+    assert function.body.type.storage is StorageKind.SMEM
+    printed = as_script(Model)
+    assert as_script(import_dsl(printed, "Model")) == printed
 
 
 def test_body_local_integer_arithmetic_is_normalized_before_layout_construction() -> None:

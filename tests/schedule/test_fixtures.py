@@ -109,7 +109,7 @@ PLAIN_DIMS = {"chunk_rmsnorm": {"chunks": 16}}
 PLAIN_REFUSED = {
     "gemm_relu_gemm_smem_staged": (
         r"no nvidia\.h200_sxm MMA reads lhs f32 smem and rhs f32 smem into f32"
-        r"(.|\n)*gemm_relu_gemm_smem_staged\.py:41:29"
+        r"(.|\n)*gemm_relu_gemm_smem_staged\.py:39:29"
     ),
 }
 CANDIDATES_REFUSED = {
@@ -224,10 +224,17 @@ RMEM_EXPECTED = {
     "captured_insert_update": {},
     "loop_carry_from_param": {},
     "sparse_decode": {
+        "cta@0:1#0": _RmemExpectation(
+            512, "the seven index/mask SSA values form one 512-byte alias group",
+        ),
         "thread@128:128#0": _RmemExpectation(33_024, "attention intermediates and row reductions"),
         "thread@0:256#0": _RmemExpectation(33_024, "parent envelope of attention compute"),
     },
     "scalar_binary": {
+        "cta@0:1#0": _RmemExpectation(
+            132, "the child thread's 128-byte tile/region-result alias chain overlaps "
+            "a 4-byte rhs literal fill",
+        ),
         "thread@0:32#0": _RmemExpectation(
             132,
             "rhs literal materializes in rmem during lowering; the new result reuses "
@@ -235,6 +242,10 @@ RMEM_EXPECTED = {
         ),
     },
     "fp8_block_scaled_gemm": {
+        "cta@0:1#0": _RmemExpectation(
+            4, "the 1x1 f32 tile-scale copy is unsplit; thread-split accumulators "
+            "do not contribute to the CTA record",
+        ),
         "thread@128:256#0": _RmemExpectation(65_536, "128x128 f32 zero accumulator"),
         "thread@128:256#1": _RmemExpectation(
             66_048,
@@ -564,14 +575,13 @@ def test_scheduled_hir_program_has_analysis_metadata(
             for region in regions
             if (record := get_metadata(region, RegionMemoryMetadata)) is not None
         )
-        assert bool(region_records) == bool(RMEM_EXPECTED[path.stem])
         if path.stem == "gemm_8192x17408x5120_tma_store":
-            assert len(region_records) == 4
+            assert len(region_records) == 7
         for record in region_records:
             assert record.solver_status == "feasible"
             assert record.topologies == placement.topologies
             assert record.peaks
-            assert all(peak.memory_level == "rmem" for peak in record.peaks)
+            assert all(peak.memory_level in ("rmem", "smem") for peak in record.peaks)
             assert not record.traffic.storage.kinds
             assert not record.traffic.communication.kinds
             assert record.footprint is None
@@ -586,12 +596,18 @@ def test_scheduled_hir_program_has_analysis_metadata(
         )
         occurrences: dict[str, int] = {}
         observed_rmem = {}
+        observed_smem = {}
         for window in liveness.regions:
             key = _region_key(window.region, occurrences)
             record = get_metadata(window.region, RegionMemoryMetadata)
             peak = record.peak_for("rmem") if record is not None else None
             if peak is not None:
                 observed_rmem[key] = peak.peak_bytes
+            smem_peak = record.peak_for("smem") if record is not None else None
+            if smem_peak is not None:
+                observed_smem[key] = smem_peak.peak_bytes
+        if path.stem == "captured_insert_update":
+            assert observed_smem["thread@0:32#0"] == 16
         expected_rmem = {
             key: expectation.peak_bytes
             for key, expectation in RMEM_EXPECTED[path.stem].items()
@@ -905,8 +921,8 @@ def _check_smem_placement(out: Path, captured: pytest.CaptureResult[str]) -> Non
         "two shared tiles need 16384 bytes"
     )
     lines = lines[5:]
-    assert lines[41].strip() == "ks = T.tensor_view(", "the lowered key tile is at line 42"
-    assert lines[42].strip() == "8192,", "the lowered key tile starts at 8192 bytes"
+    assert lines[29].strip() == "ks = T.tensor_view(", "the lowered key tile is at line 30"
+    assert lines[30].strip() == "8192,", "the lowered key tile starts at 8192 bytes"
 
 
 def _attention_tensor(name: str) -> torch.Tensor:

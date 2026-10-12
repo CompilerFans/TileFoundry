@@ -53,10 +53,7 @@ from pathlib import Path
 
 from transformers import AutoConfig
 
-from tilefoundry import func, module
-from tilefoundry.dsl import ConstTensor, ReduceKind, Tensor, tf
-from tilefoundry.ir.types.dim import DimVar
-from tilefoundry.ir.types import Topology
+from tilefoundry.dsl import *
 from tilefoundry.target import CudaTarget
 
 _MAIN_ROPE: "tuple | None" = None
@@ -97,7 +94,6 @@ def _rope_cos_sin(position: int, *, device):
 #: from one drawn at a fixed seed instead.
 SEED_CTX_LEN = 1
 SEED_CTX_SEED = 20260728
-
 
 
 # ── the checkpoint's own configuration, and the shapes it implies ────────────
@@ -873,7 +869,7 @@ def _submodules(config: DSV4Config):
                 hidden, shared_w1_weight, shared_w1_scale,
                 shared_w3_weight, shared_w3_scale, shared_w2_weight, shared_w2_scale,
             )
-            combined: where(layout=((_, _, dim), {cta @ B()})) = combine_expert_outputs(
+            combined: where(layout=(_, _, dim) @ {cta @ B()}) = combine_expert_outputs(
                 routed_value, shared_value,
             )
             return combined
@@ -1237,7 +1233,7 @@ def _submodules(config: DSV4Config):
                 hidden, shared_w1_weight, shared_w1_scale,
                 shared_w3_weight, shared_w3_scale, shared_w2_weight, shared_w2_scale,
             )
-            combined: where(layout=((_, _, dim), {cta @ B()})) = combine_expert_outputs(
+            combined: where(layout=(_, _, dim) @ {cta @ B()}) = combine_expert_outputs(
                 routed_value, shared_value,
             )
             return combined

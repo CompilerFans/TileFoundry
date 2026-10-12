@@ -349,6 +349,12 @@ Field meanings:
   sub-box ([tir §1.5](./tir.md#15-sync))
 - `names` — optional human-readable names (`cta.x`, `cta.y`, …)
 
+In a kernel, `with Mesh(selection, layout=shape, names=names)` rearranges a lexical,
+single-level selection.
+`layout=(shape, strides)` states selection-local numbering (row-major by default); it MUST
+cover every selected position once, with one fixed physical stride per axis.
+Composition preserves topology and offset; slicing the resulting composed mesh is rejected.
+
 Every mesh MUST state one arrangement per level it names, each in that level's
 own numbering, as one nested `Layout` whose mode `i` is level `i` -- a mesh
 naming one level included. `Mesh` normalizes what was written into that form at
@@ -598,12 +604,31 @@ Field meanings:
   propagation
 ([semantic-analysis §3.2](./semantic-analysis.md#32-relation-driven-shard-propagation)).
 
-Surface syntax sugar:
+Comparing or combining shard layouts and consuming their mesh use one projection
+that keeps mesh axes aligned with their attributes without rewriting stored types.
+It omits all-Broadcast levels except an instruction's required participant levels;
+levels containing Split or Partial remain part of the distribution.
 
-- `S(i)` ≡ `Split(axis=i)`
-- `P()` / `P("sum")` ≡ `Partial(reduction="sum")`
-- `B()` ≡ `Broadcast()`
-- omitted mesh axes are `Broadcast`
+### Surface syntax sugar
+
+| Written form | Meaning |
+| --- | --- |
+| `(8, 16)` | Plain row-major `Layout` |
+| `((8, 16), (1, 8))` | Plain `Layout` with explicit strides |
+| `(8 @ t.w, 16)` | `ShardLayout` splitting a tensor dimension over `t.w` |
+| `(8, 16) @ {B()}` | All-Broadcast `ShardLayout` |
+| `((8, 16) + 4 \| Swizzle(2, 4, 3)) @ {B()}` | All-Broadcast `ShardLayout` based on a `ComposedLayout` |
+| `(8 @ t.w, 16) @ {t.l @ P("sum")}` | Split placement with Partial values on `t.l` |
+| `((8 @ t.w, 16), (16, 1)) @ {t.l @ P("sum")}` | Placement with explicit strides and Partial values |
+| `where(layout=(_, _, dim) @ {cta @ B()})` | Broadcast constraint on the named topology `cta` |
+
+Placement covers the current composed mesh scope, or the function mesh in a
+signature; unstated axes are Broadcast. `None`, plain `Layout`, and an
+all-Broadcast `ShardLayout` are compatible forms without a split; when both
+layouts are stated, their written shape and stride constraints remain.
+Shared-memory distribution belongs to CTA or coarser levels; author-written tiles
+in thread scope use plain layouts. A `where` clause constrains named topologies;
+acceptance rules are generated in [parser §2](./parser.md#2-syntax-and-rules).
 
 ---
 

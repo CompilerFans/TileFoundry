@@ -12,8 +12,9 @@ from tilefoundry.ir.types.storage import StorageKind
 from .dtype import DType
 from .layout import ComposedLayout, Layout, apply
 from .layout_algebra import size
-from .mesh import Mesh, Topology, separate
+from .mesh import Mesh, Topology, make_mesh, separate
 from .shard_layout import (
+    Broadcast,
     ShardLayout,
     Split,
     canonical_shard_layout,
@@ -79,20 +80,65 @@ def _inner_layout(layout: Layout, counts: tuple[int, ...]) -> tuple[Layout, dict
     )
 
 
-def participant_mesh(source: Mesh, required: Mesh) -> tuple[Mesh, int]:
-    """Select the trailing modes that state the required physical frame."""
-    required_names = tuple(getattr(topology, "name", topology) for topology in required.topologies)
-    source_names = tuple(getattr(topology, "name", topology) for topology in source.topologies)
-    if source_names != required_names:
-        source = next(
-            (
-                level
-                for level in separate(source)
-                if tuple(getattr(topology, "name", topology) for topology in level.topologies)
-                == required_names
-            ),
-            source,
-        )
+def participant_layout(
+    layout: ShardLayout, required: Mesh | tuple[str, ...] | None = None
+) -> ShardLayout:
+    """Select participating levels while keeping their mesh axes and attrs aligned.
+
+    An instruction retains all axes of its required levels, including Broadcast.
+    Other levels may be omitted only when every attribute is Broadcast. Without
+    an instruction frame, retain distributed levels, or the innermost level for
+    an entirely broadcast value.
+    """
+    def topology_name(topology):
+        return getattr(topology, "name", topology)
+
+    levels = separate(layout.mesh)
+    required_names = (
+        {topology_name(topology) for topology in required.topologies}
+        if isinstance(required, Mesh)
+        else None if required is None else set(required)
+    )
+    if len(levels) == 1 and (
+        required_names is None
+        or topology_name(levels[0].topologies[0]) in required_names
+    ):
+        return layout
+    attrs_by_level = []
+    offset = 0
+    for level in levels:
+        rank = len(flatten(level.layout).shape)
+        attrs_by_level.append(layout.attrs[offset : offset + rank])
+        offset += rank
+    if offset != len(layout.attrs):
+        raise ValueError("shard attributes must have the rank of their mesh")
+    if required_names is None:
+        required_names = {
+            topology_name(level.topologies[0])
+            for level, attrs in zip(levels, attrs_by_level, strict=True)
+            if any(not isinstance(attr, Broadcast) for attr in attrs)
+        }
+    if not required_names:
+        required_names = {topology_name(levels[-1].topologies[0])}
+    selected = []
+    selected_attrs = []
+    for level, attrs in zip(levels, attrs_by_level, strict=True):
+        name = topology_name(level.topologies[0])
+        if name in required_names:
+            selected.append(level)
+            selected_attrs.extend(attrs)
+        elif any(not isinstance(attr, Broadcast) for attr in attrs):
+            raise ValueError(f"non-Broadcast placement outside participant level {name!r}")
+    if not selected:
+        raise ValueError("shard layout has no participant level")
+    if len(selected) == len(levels):
+        return layout
+    return ShardLayout(layout.layout, tuple(selected_attrs), make_mesh(*selected))
+
+
+def _participant_frame(source: Mesh, required: Mesh) -> tuple[Mesh, int]:
+    """Find a physical suffix; its dropped count indexes the full source layout."""
+    assert len(required.topologies) == 1, "participant frames require one topology level"
     source_layout = flatten(source.layout)
     required_layout = flatten(required.layout)
     if not isinstance(source_layout, Layout) or not isinstance(required_layout, Layout):
@@ -122,8 +168,8 @@ def participant_mesh(source: Mesh, required: Mesh) -> tuple[Mesh, int]:
 
     return (
         Mesh(
-            source.topologies,
-            ComposedLayout(None, starts(source)[0], required.layout),
+            source.topologies[-len(required.topologies) :],
+            ComposedLayout(None, starts(source)[-1], required.layout),
             required.names,
         ),
         dropped,
@@ -154,7 +200,7 @@ def issue_frames(source: Mesh, required: Mesh, repeat: tuple, tile: tuple):
     physical = flatten(source.layout)
     if not isinstance(physical, Layout) or physical.strides is None:
         raise ValueError("group axes need a static strided physical mesh")
-    participant, dropped = participant_mesh(source, required)
+    participant, dropped = _participant_frame(source, required)
     outer = tuple(
         (index, extent)
         for index, extent in enumerate(physical.shape[:dropped])
@@ -211,13 +257,14 @@ def tile_view_layout(
         outer = layout.outer if composed else layout
         if isinstance(outer, ShardLayout):
             held, positions = _inner_layout(outer.layout, counts)
+            projected = outer if participant is None else participant_layout(outer, participant)
             mesh, dropped = (
-                (outer.mesh, 0)
+                (projected.mesh, 0)
                 if participant is None
-                else participant_mesh(outer.mesh, participant)
+                else _participant_frame(projected.mesh, participant)
             )
             attrs = []
-            for attr in outer.attrs[dropped:]:
+            for attr in projected.attrs[dropped:]:
                 if isinstance(attr, Split):
                     if attr.axis not in positions:
                         raise ValueError(f"tile prefix removes sharded layout axis {attr.axis}")
@@ -233,7 +280,7 @@ def tile_view_layout(
     if shard_attrs is not None and not isinstance(inner_layout, ShardLayout):
         if participant is None or enclosing is None:
             raise ValueError("a declared shard fragment needs an enclosing participant mesh")
-        frame, _dropped = participant_mesh(enclosing, participant)
+        frame, _dropped = _participant_frame(enclosing, participant)
         inner_layout = ShardLayout(inner_layout, shard_attrs, frame)
     return inner_layout
 
@@ -259,6 +306,21 @@ def tile_inner_type(
     return TensorType(tuple(inner_shape), type_.dtype, layout, type_.storage)
 
 
+def is_unsharded_layout(layout: object) -> bool:
+    """Recognize the three tensor layout forms that carry no distribution."""
+    shard = shard_layout_of(layout)
+    if shard is not None:
+        return all(isinstance(attr, Broadcast) for attr in shard.attrs)
+    return layout is None or isinstance(layout, (Layout, ComposedLayout))
+
+
+def strip_broadcast_layout(layout):
+    """Remove a top-level all-Broadcast wrapper, retaining its address function."""
+    if isinstance(layout, ShardLayout) and is_unsharded_layout(layout):
+        return layout.layout
+    return layout
+
+
 def types_compatible(declared: Type, actual: Type) -> bool:
     """Return whether *actual* may bind a position declared as *declared*.
 
@@ -279,24 +341,38 @@ def types_compatible(declared: Type, actual: Type) -> bool:
                 and field_compatible(declared_layout.strides, actual_layout.strides)
             )
         if isinstance(declared_layout, ShardLayout):
+            if not isinstance(actual_layout, ShardLayout):
+                return False
+            declared_layout = participant_layout(declared_layout)
+            actual_layout = participant_layout(actual_layout)
             return (
-                isinstance(actual_layout, ShardLayout)
-                and field_compatible(declared_layout.mesh, actual_layout.mesh)
+                field_compatible(declared_layout.mesh, actual_layout.mesh)
                 and field_compatible(declared_layout.attrs, actual_layout.attrs)
                 and layout_compatible(declared_layout.layout, actual_layout.layout)
             )
         return actual_layout == declared_layout
 
     if isinstance(declared, TensorType):
+        if not isinstance(actual, TensorType):
+            return False
+        if is_unsharded_layout(declared.layout) and is_unsharded_layout(actual.layout):
+            declared_layout = strip_broadcast_layout(declared.layout)
+            actual_layout = strip_broadcast_layout(actual.layout)
+            compatible_layout = (
+                declared_layout is None
+                or actual_layout is None
+                or layout_compatible(declared_layout, actual_layout)
+            )
+        else:
+            compatible_layout = layout_compatible(declared.layout, actual.layout)
         return (
-            isinstance(actual, TensorType)
-            and declared.shape == actual.shape
+            declared.shape == actual.shape
             and declared.dtype == actual.dtype
             and (
                 declared.storage is StorageKind.UMAT
                 or declared.storage == actual.storage
             )
-            and layout_compatible(declared.layout, actual.layout)
+            and compatible_layout
         )
     if isinstance(declared, TupleType):
         return (
