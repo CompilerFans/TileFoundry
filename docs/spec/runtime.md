@@ -323,8 +323,9 @@ LinkedModule → load → CompiledModule (fully-loaded, public, callable Runtime
 ([codegen §4.3](./codegen.md#43-linkedmodule)); the loader that turns it into a
 `CompiledModule` is owned here. The loader and `LinkedModule` are not public
 API; only `CompiledModule` (a `RuntimeModule`) is. `load_linked_module` returns
-`CompiledModule(type=linked.entry, fn=entry_callable)`; `name` / `entry` are
-both `linked.entry.name`. Its `forward` implements the out-param calling
+`CompiledModule(type=replace(entry.signature, name=entry.name), fn=entry_callable)`,
+where `entry` is the one `LinkedFunction`; `name` / `entry` are its registration
+name. Its `forward` implements the out-param calling
 convention directly ([§1.1](#11-runtimemodulepy)) — there is no separate function-body object it
 delegates to. The compiled path has no `resource` / `weights` / `states`
 (weights are ordinary entry arguments), so its `load` is the inherited no-op.
@@ -341,14 +342,24 @@ Load contract:
 - codegen produces the `LinkedModule` artifact
   ([codegen §4.3](./codegen.md#43-linkedmodule))
 - loading uses `tvm_ffi.load_module(...)`
-- entry binding uses the symbol named by `RuntimeModule.entry`
+- immediately after loading, entry binding uses
+  `tvm_ffi.get_global_func(entry.name)`; `RuntimeModule.entry` is this
+  dotted registration name
+- the loader keeps every library it loads until process exit, because the
+  global registration table does not keep the shared library loaded
+- host registration allows override: another load replaces the global entry,
+  while an existing `CompiledModule` retains its own callable
+- the compiled loader requires exactly one `LinkedFunction`
 - callable arguments are DLPack-compatible tensors; `torch.Tensor` is one
   supported caller-side provider but is not the semantic contract itself
 
-Generated host wrappers export entry symbols with TVM FFI:
+Generated host wrappers register entry functions with TVM FFI:
 
 ```cpp
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(<entry_symbol>, <entry_function>);
+TVM_FFI_STATIC_INIT_BLOCK() {
+  tvm::ffi::Function::SetGlobal(export_name,
+      tvm::ffi::Function::FromTyped(entry_function, export_name), /*override=*/true);
+}
 ```
 
 The exported function accepts flattened input/output tensor arguments. HIR

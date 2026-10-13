@@ -1,4 +1,4 @@
-"""The device ``.cu`` translation unit: one kernel and one shim per function.
+"""The device ``.cu`` translation unit: one kernel and one launcher per function.
 
 Two passes over each function and nothing between them: one writes the
 declaration a caller sees without entering the body, the other writes the
@@ -19,46 +19,48 @@ from tilefoundry.codegen.cuda.abi import (
     kernel_signature,
 )
 from tilefoundry.codegen.cuda.context import CudaCodegenContext, topology_scope_str
+from tilefoundry.codegen.cuda.hir.function import device_functions
 from tilefoundry.codegen.cuda.templates import render
-from tilefoundry.codegen.linkable import LinkableFunction, LinkableModule
+from tilefoundry.codegen.linkable_function import LinkableFunction
+from tilefoundry.codegen.linkable_module import LinkableModule
 from tilefoundry.codegen.registry import CodeGenerator
 from tilefoundry.codegen.signature import CallableSignature
-from tilefoundry.ir.core.module import Module
-from tilefoundry.ir.tir.prim_function import PrimFunction
+from tilefoundry.ir.core.module import Module, ModuleFunction
 from tilefoundry.ir.types.utils import static_dim_value
 from tilefoundry.target import Target
+from tilefoundry.target.base import UnsupportedCapabilityError, _target_summary
 
 Geometry = tuple[tuple[object, object, object], tuple[object, object, object]]
 
 
-def _emit_function(fn: PrimFunction, ctx: CudaCodegenContext) -> LinkableFunction:
+def _emit_function(fn: ModuleFunction, ctx: CudaCodegenContext) -> LinkableFunction:
     """*fn* in both of its positions, written from the one convention it is called by.
 
-    A caller can name the shim and nothing else, so that is what the
+    A caller can name the launcher and nothing else, so that is what the
     declaration states; the kernel is defined beside it and named only here.
     """
-    shim = ctx.signature_of(fn)
-    kernel = kernel_signature(shim, fn.name)
+    launcher = ctx.signature_of(fn)
+    kernel = kernel_signature(launcher, ctx.codegen_context.symbols.by_function[id(fn)].symbol)
     return LinkableFunction(
         name=fn.name,
-        declaration=f'extern "C" void {shim.name}({ctx.parameters(shim, exported=True)});',
-        definition=ctx.capture(lambda scope: _define(fn, shim, kernel, scope)),
+        declaration=f'extern "C" void {launcher.name}({ctx.parameters(launcher, exported=True)});',
+        definition=ctx.capture(lambda scope: _define(fn, launcher, kernel, scope)),
     )
 
 
 def _define(
-    fn: PrimFunction,
-    shim: CallableSignature,
+    fn: ModuleFunction,
+    launcher: CallableSignature,
     kernel: CallableSignature,
     ctx: CudaCodegenContext,
 ) -> None:
-    """The kernel and the shim that launches it, in that order."""
+    """The kernel and the launcher that launches it, in that order."""
     _define_kernel(fn, kernel, ctx)
     ctx.blank()
-    _define_shim(shim, kernel, ctx)
+    _define_launcher(launcher, kernel, ctx)
 
 
-def _define_kernel(fn: PrimFunction, kernel: CallableSignature, ctx: CudaCodegenContext) -> None:
+def _define_kernel(fn: ModuleFunction, kernel: CallableSignature, ctx: CudaCodegenContext) -> None:
     """The ``__global__``: what it was told, then what it was written to do."""
     ctx.reset_barrier_ids()
     ctx.emit(f"__global__ void {kernel.name}({ctx.parameters(kernel)}) {{")
@@ -70,14 +72,14 @@ def _define_kernel(fn: PrimFunction, kernel: CallableSignature, ctx: CudaCodegen
     ctx.emit("}")
 
 
-def _define_shim(
-    shim: CallableSignature, kernel: CallableSignature, ctx: CudaCodegenContext
+def _define_launcher(
+    launcher: CallableSignature, kernel: CallableSignature, ctx: CudaCodegenContext
 ) -> None:
     """The ``extern "C"`` entry: the geometry it was handed, spent on one launch."""
-    ctx.emit(f'extern "C" void {shim.name}({ctx.parameters(shim, exported=True)}) {{')
+    ctx.emit(f'extern "C" void {launcher.name}({ctx.parameters(launcher, exported=True)}) {{')
     ctx.indent()
-    _tell_the_block(shim, ctx)
-    grid_x, block_x, smem = (signature.name for signature in shim.trailing)
+    _tell_the_block(launcher, ctx)
+    grid_x, block_x, smem = (signature.name for signature in launcher.trailing)
     ctx.emit(f"dim3 grid({grid_x}, 1, 1);")
     ctx.emit(f"dim3 block({block_x}, 1, 1);")
     ctx.emit(f"{kernel.name}<<<grid, block, {smem}, nullptr>>>({kernel_arguments(kernel, ctx)});")
@@ -85,23 +87,23 @@ def _define_shim(
     ctx.emit("}")
 
 
-def _tell_the_block(shim: CallableSignature, ctx: CudaCodegenContext) -> None:
-    """Gather the ids the shim was told into the block the kernel takes.
+def _tell_the_block(launcher: CallableSignature, ctx: CudaCodegenContext) -> None:
+    """Gather the ids the launcher was told into the block the kernel takes.
 
-    Which levels these are is the signature's answer, so the shim states no
+    Which levels these are is the signature's answer, so the launcher states no
     level of its own: one line per id the convention put in front.
     """
-    if not shim.leading:
+    if not launcher.leading:
         return
     ctx.emit(f"{PROGRAM_META_CTYPE} {PROGRAM_META.name}{{}};")
-    for signature in shim.leading:
+    for signature in launcher.leading:
         scope = topology_scope_str(signature.topology_level)
         ctx.emit(
             f"{PROGRAM_META.name}.program_id[int({scope})] = static_cast<int>({signature.name});"
         )
 
 
-def _one_geometry(kernels: tuple[PrimFunction, ...], ctx: CudaCodegenContext) -> Geometry:
+def _one_geometry(kernels: tuple[ModuleFunction, ...], ctx: CudaCodegenContext) -> Geometry:
     """The geometry this unit runs at, which every kernel in it states the same.
 
     A unit specializes ``program_dim`` once, so two kernels launched at
@@ -117,7 +119,7 @@ def _one_geometry(kernels: tuple[PrimFunction, ...], ctx: CudaCodegenContext) ->
     return distinct.pop()
 
 
-def _launched_at(fn: PrimFunction, ctx: CudaCodegenContext) -> Geometry:
+def _launched_at(fn: ModuleFunction, ctx: CudaCodegenContext) -> Geometry:
     """The geometry *fn*'s call states, which is the only thing that states one."""
     geometry = ctx.launches.get(id(fn))
     if geometry is None:
@@ -150,13 +152,23 @@ def _program_dims(geometry: Geometry) -> list[dict[str, str]]:
 
 
 def emit_cuda_module(
-    module: Module, cuda_fns: tuple[PrimFunction, ...], target: Target, ctx: CudaCodegenContext
+    module: Module, cuda_fns: tuple[ModuleFunction, ...], target: Target, ctx: CudaCodegenContext
 ) -> LinkableModule:
     """Emit the device ``.cu`` linkable module for one topology domain."""
-    kernels = tuple(fn for fn in cuda_fns if fn.target == target)
+    if ctx.codegen_context is None:
+        raise ValueError("CUDA module emission requires a CodegenContext")
+    if ctx.codegen_context.options.emit == "skeleton" and target.device_count is not None:
+        raise UnsupportedCapabilityError(
+            f"{_target_summary(target)}: skeleton emission supports only single-device CUDA "
+            "targets without device_count"
+        )
+    kernels = tuple(fn for fn in cuda_fns if ctx.codegen_context.targets[id(fn)] == target)
     if not kernels:
         raise ValueError(f"emit_cuda_module: module {module.name!r} has no CUDA device kernels")
-    functions = tuple(_emit_function(fn, ctx) for fn in kernels)
+    functions = (
+        *device_functions(kernels, ctx),
+        *(_emit_function(fn, ctx) for fn in kernels),
+    )
     geometry = _one_geometry(kernels, ctx)
     preamble = render(
         "cuda_preamble.cu.j2",
@@ -170,7 +182,7 @@ def emit_cuda_module(
     return LinkableModule(target="cuda", language="cu", preamble=preamble, functions=functions)
 
 
-CUDA_CODE_GENERATOR = CodeGenerator(emit_cuda_module)
+CUDA_CODE_GENERATOR = CodeGenerator(emit_cuda_module, emits=frozenset({"full", "skeleton"}))
 
 
 __all__ = ["CUDA_CODE_GENERATOR", "emit_cuda_module"]

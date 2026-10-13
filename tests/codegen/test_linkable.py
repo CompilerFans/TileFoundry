@@ -6,7 +6,8 @@ from tests.fixtures.tir.square import TirSquare
 from tilefoundry.codegen.context_builder import build_codegen_context
 from tilefoundry.codegen.cpu.context import CpuCodegenContext
 from tilefoundry.codegen.cpu.module import emit_host_module
-from tilefoundry.codegen.linkable import LinkableFunction, LinkableModule
+from tilefoundry.codegen.linkable_function import LinkableFunction
+from tilefoundry.codegen.linkable_module import LinkableModule
 
 
 def _linkable_function(name: str) -> LinkableFunction:
@@ -31,6 +32,7 @@ def _host_unit() -> LinkableModule:
     view = root.for_group(group)
     ctx = CpuCodegenContext(
         symbols=view.symbols,
+        codegen_context=view.codegen,
         target=entry.target,
         resolved_launches=view.resolved_launches,
     )

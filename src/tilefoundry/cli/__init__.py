@@ -14,6 +14,7 @@ from tilefoundry.cli.check import add_arguments as add_check_arguments
 from tilefoundry.cli.check import guidance as check_guidance
 from tilefoundry.cli.check import run_check
 from tilefoundry.cli.models import run_models
+from tilefoundry.cli.scaffold import run_scaffold
 from tilefoundry.cli.schedule import run_candidates as run_schedule_candidates
 from tilefoundry.cli.schedule import run_facts as run_schedule_facts
 from tilefoundry.cli.schedule import run_finalize as run_schedule_finalize
@@ -37,6 +38,7 @@ _COMMANDS = {
     "analyze": "report what a program costs: flops, traffic, bounds, timing",
     "target": "list, show, add, or remove compilation targets",
     "schedule": "finalize scheduled HIR and inspect instruction choices",
+    "scaffold": "generate an editable project for the program's Target",
 }
 
 _TARGET_COMMANDS = {
@@ -264,6 +266,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME=EXTENT",
         help="bind one open dimension to a concrete extent; repeat for other dimensions",
     )
+    scaffold = commands.add_parser(
+        "scaffold", help=_COMMANDS["scaffold"], description=_COMMANDS["scaffold"]
+    )
+    _add_source_argument(scaffold)
+    scaffold.add_argument("out_dir", metavar="OUT_DIR", help="write the project to an empty directory")
+
     return parser
 
 
@@ -301,6 +309,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     for warning in registrations.warnings:
         print(f"tilefoundry: warning: {warning}", file=sys.stderr)
+    if args.command == "scaffold":
+        try:
+            return run_scaffold(args.source, args.out_dir)
+        except Exception as error:
+            print(f"tilefoundry scaffold: error: {error}", file=sys.stderr)
+            return 1
     if args.command == "models":
         try:
             return run_models(args.name, source=args.source)

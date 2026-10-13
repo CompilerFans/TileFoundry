@@ -124,6 +124,34 @@ so naming the implementation is enough to reach what it is judged against. A
 runtime module that states none MUST be refused rather than compared against
 something chosen for it.
 
+## Scaffold
+
+```text
+tilefoundry scaffold SOURCE OUT_DIR
+```
+
+The project is determined by the generator of the Target resolved by the selected Module.
+`SOURCE` uses the shared authored-Module selector syntax described under
+[Commands](#commands). The command accepts HIR or TIR and delegates Target
+capability checks to codegen ([codegen §2.1](./codegen.md#21-target-selected-service)).
+Currently, CUDA Targets without `device_count` can generate skeleton projects.
+`OUT_DIR` MUST be absent or an empty directory; existing nonempty output MUST
+be rejected without overwriting files.
+
+The command runs host-entry normalization
+([passes §7.3](./passes.md#73-insert_default_host_entry)), selects all CPU entries,
+and calls skeleton `codegen/link_module.py:link_program`
+([codegen §4.3](./codegen.md#43-linkedmodule)). It writes `CMakeLists.txt`,
+`host.cpp` and `device_<i>.cu` directly in `OUT_DIR`, compiles the project and
+returns zero on success. The library is `OUT_DIR/build/lib<root Module name>.so`. Generated
+CUDA bodies are editable placeholders; signatures, views, variant dispatch,
+launchers and host registrations remain intact. The project can be rebuilt with
+`cmake -G Ninja -S OUT_DIR -B BUILD_DIR` followed by `cmake --build BUILD_DIR`. Load the
+library with `tvm_ffi.load_module`, then bind its dotted registrations with
+`tvm_ffi.get_global_func`. The caller manages this library's lifetime and MUST
+retain it while its registrations may be called; this does not involve a
+`RuntimeModule`. Authored host orchestration remains in Python.
+
 ## Check
 
 `check` is the one command that reports agreement. It runs an implementation and,

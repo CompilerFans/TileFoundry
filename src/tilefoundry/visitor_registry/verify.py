@@ -375,15 +375,20 @@ def verify_prim_function(
     ctx = VerifyContext()
     scope: list[Mesh] = []
 
-    from tilefoundry.ir.core.module import Module, module_functions  # noqa: PLC0415
+    from tilefoundry.ir.core.module import (  # noqa: PLC0415
+        Module,
+        function_selectors,
+        module_functions,
+    )
 
+    module_fn_map: dict[str, tuple[PrimFunction | Function, ...]] = {}
     if isinstance(module_fns, Module):
+        module_fn_map.update({selector: (f,) for selector, f in function_selectors(module_fns)})
         module_fns = (
             function
             for function in module_functions(module_fns)
             if isinstance(function, PrimFunction)
         )
-    module_fn_map: dict[str, tuple[PrimFunction, ...]] = {}
     for f in module_fns:
         module_fn_map[f.name] = (*module_fn_map.get(f.name, ()), f)
 
@@ -754,7 +759,10 @@ def _verify_launch(stmt: Evaluate, fn, module_fn_map, ctx):
     (a launch tensor arg's storage vs the runtime device type).
 
     The launch is ``Evaluate(Launch(...), (SymbolRef(callee), grid_x, grid_y,
-    grid_z, block_x, block_y, block_z, *forwarded))``.
+    grid_z, block_x, block_y, block_z, *forwarded))``. An HIR callee's arguments
+    were written and checked by the host-entry pass that built the Launch
+    ([passes §7.3](docs/spec/passes.md#73-insert_default_host_entry)), so only
+    its selector is resolved here.
     """
     ref = stmt.args[0]
     if not isinstance(ref, SymbolRef):
@@ -783,6 +791,8 @@ def _verify_launch(stmt: Evaluate, fn, module_fn_map, ctx):
     if not module_fn_map:
         return
     callee = _resolve_symbol_ref(ref.name, module_fn_map)
+    if isinstance(callee, Function):
+        return
     if not isinstance(callee.target, CudaTarget):
         raise VerifyError(f"Launch callee {callee.name!r} must target a CUDA device")
     expected = callable_type_for_prim_function(callee)

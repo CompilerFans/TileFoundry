@@ -6,21 +6,17 @@ Three public verbs, all accept ``Module`` exclusively.
 from __future__ import annotations
 
 import hashlib
-import os
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
-from tilefoundry.codegen.context_builder import build_codegen_context
-from tilefoundry.codegen.cpu.context import CpuCodegenContext
-from tilefoundry.codegen.cuda.context import CudaCodegenContext
-from tilefoundry.codegen.linker import link_modules
+from tilefoundry.codegen.link_module import link_program
 from tilefoundry.inspection import as_script as _as_script
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.passes.pass_manager import PassManager
 from tilefoundry.passes.transforms import InsertHostEntryPass
 from tilefoundry.runtime.loader import load_linked_module
-from tilefoundry.target import CpuTarget, CudaTarget, Target, default_target
+from tilefoundry.target import Target, default_target
 from tilefoundry.target.base import _target_summary, target_instance
 
 
@@ -101,76 +97,7 @@ def build(
         )
 
     workdir = tempfile.mkdtemp(prefix=f"tilefoundry_build_{mod.entry}_split_")
-    return _build_split_runtime_module(mod, workdir=workdir)
-
-
-def _build_split_runtime_module(mod: Module, *, workdir: str) -> "RuntimeModule":
-    """Codegen + compile + load *mod* through the split host/device pipeline.
-
-    What every emitter has to agree on is settled first and once: the table of
-    how each function is called, and the geometry each launch runs at. Each
-    translation unit is then emitted, compiled with its own toolchain and
-    linked into one host-callable ``.so``. That library is built under a
-    directory named for the code in it, so two programs of one process never
-    load each other's. Unsupported module shapes raise during codegen -- there
-    is no fallback to a single-source path.
-    """
-    codegen = build_codegen_context(mod)
-    cpu_entry = mod.entry_function()
-    if not isinstance(cpu_entry.target, CpuTarget):
-        raise ValueError(
-            f"tilefoundry.build: entry {cpu_entry.name!r} is not a CPU host entry; "
-            "build() accepts pass-prepared TIR"
-        )
-
-    device_modules = []
-    host_module = None
-    for group in codegen.groups:
-        view = codegen.for_group(group)
-        if isinstance(group.target, CudaTarget):
-            context = CudaCodegenContext(
-                symbols=view.symbols,
-                target=view.target,
-                launches=view.launches,
-                codegen_context=view.codegen,
-            )
-            device_modules.append(
-                group.target.get_code_generator().emit(
-                    group.owner, group.functions, group.target, context
-                )
-            )
-        elif isinstance(group.target, CpuTarget):
-            if cpu_entry not in group.functions:
-                continue
-            context = CpuCodegenContext(
-                symbols=view.symbols,
-                target=view.target,
-                resolved_launches=view.resolved_launches,
-                codegen_context=view.codegen,
-            )
-            host_module = group.target.get_code_generator().emit(
-                group.owner, (cpu_entry,), group.target, context
-            )
-    if host_module is None:
-        raise ValueError("tilefoundry.build: root context produced no host entry group")
-
-    units = (*device_modules, host_module)
-    digest = hashlib.sha256("".join(m.source for m in units).encode("utf-8")).hexdigest()[:16]
-    entry_signature = codegen.symbols.by_function[id(cpu_entry)].callable
-    loaded_as = replace(entry_signature, name=cpu_entry.name)
-    device_targets = tuple(
-        group.target for group in codegen.groups if isinstance(group.target, CudaTarget)
-    )
-    if not device_targets:
-        raise ValueError(f"tilefoundry.build: module {mod.name!r} has no CUDA device functions")
-    linked_module = link_modules(
-        units,
-        workdir=os.path.join(workdir, digest),
-        lib_name=cpu_entry.name,
-        entry=loaded_as,
-        cuda_arch=device_targets[0].arch.removeprefix("sm_"),
-    )
-    return load_linked_module(linked_module)
+    return load_linked_module(link_program(mod, workdir=workdir))
 
 
 def compile(
@@ -304,4 +231,10 @@ def _jit_cache_key_payload(
     )
 
 
-__all__ = ["build", "compile", "jit", "normalize_to_module", "CompilerOptions"]
+__all__ = [
+    "build",
+    "compile",
+    "jit",
+    "normalize_to_module",
+    "CompilerOptions",
+]

@@ -2,32 +2,78 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 
+from tilefoundry.codegen.cuda.abi import check_parameter_names
+from tilefoundry.codegen.options import CodegenOptions
 from tilefoundry.codegen.signature import (
     LAUNCH_ABI,
     CallableSignature,
     called_as,
     program_id_params,
 )
-from tilefoundry.ir.core.module import Module, module_functions, owning_module, subtree
+from tilefoundry.ir.core.module import (
+    Module,
+    function_selectors,
+    module_functions,
+    owning_module,
+    subtree,
+)
+from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.tir.launch import Launch
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Evaluate, Sequential
 from tilefoundry.target import CpuTarget, Target
 
 
+def _function_paths(module: Module, prefix: tuple[str, ...] = ()):
+    """Root-relative paths for every declared function, using child mount names."""
+    for function in module.functions:
+        yield (*prefix, function.name), function
+    for child in module.modules:
+        yield from _function_paths(child, (*prefix, child.name))
+
+
+def function_path(root: Module, fn) -> tuple[str, ...]:
+    """Use the selector traversal for prototypes and their specialization labels."""
+    from tilefoundry.ir.hir.specialize import display_name  # noqa: PLC0415
+
+    matches = []
+    for path, function in _function_paths(root):
+        if function is fn:
+            matches.append((root.name, *path))
+        for index, variant in enumerate(function.variants or ()):
+            if variant is fn:
+                matches.append((root.name, *path, display_name(variant) or f"v{index}"))
+    if len(matches) != 1:
+        raise ValueError(f"codegen: function {fn.name!r} has no unique path in {root.name!r}")
+    return matches[0]
+
+
+def mangle(root: Module, fn) -> str:
+    """Encode each path segment with its length; reject non-C identifiers."""
+    path = function_path(root, fn)
+    for segment in path:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", segment) is None:
+            raise ValueError(f"codegen: invalid path segment {segment!r} in {'.'.join(path)!r}")
+    return "tilefoundry_" + "".join(f"{len(segment)}{segment}" for segment in path)
+
+
+def export_name(root: Module, fn) -> str:
+    """The dotted TVM FFI registration name corresponding to a selector."""
+    return ".".join(function_path(root, fn))
+
+
 @dataclass(frozen=True)
 class FunctionSymbol:
     """Resolved IR identity and generated ABI names for one callable function."""
 
-    function: PrimFunction
-    ir_name: str
-    kernel_name: str | None
-    shim_name: str | None
-    host_name: str | None
+    function: PrimFunction | Function
+    symbol: str
+    export_name: str
     owner: Module
     target: Target
     callable: CallableSignature
@@ -38,8 +84,6 @@ class FunctionSymbolTable:
     """Separate IR and generated-name namespaces shared by every emitter."""
 
     by_function: Mapping[int, FunctionSymbol]
-    by_ir_name: Mapping[str, FunctionSymbol]
-    by_kernel_name: Mapping[str, FunctionSymbol]
 
     @property
     def callables(self) -> Mapping[int, CallableSignature]:
@@ -54,7 +98,7 @@ class LaunchEdge:
 
     launch: Evaluate
     caller: PrimFunction
-    callee: PrimFunction
+    callee: PrimFunction | Function
     symbol: FunctionSymbol
     callable: CallableSignature
     grid_x: object
@@ -65,7 +109,7 @@ class LaunchEdge:
 class EmissionGroup:
     owner: Module
     target: Target
-    functions: tuple[PrimFunction, ...]
+    functions: tuple[PrimFunction | Function, ...]
 
 
 @dataclass(frozen=True)
@@ -75,10 +119,10 @@ class EmitContext:
     codegen: CodegenContext
     owner: Module
     target: Target
-    functions: tuple[PrimFunction, ...]
+    functions: tuple[PrimFunction | Function, ...]
     symbols: Mapping[int, CallableSignature]
     launches: Mapping[int, tuple[tuple[object, object, object], tuple[object, object, object]]]
-    resolved_launches: Mapping[int, PrimFunction]
+    resolved_launches: Mapping[int, PrimFunction | Function]
 
 
 @dataclass(frozen=True)
@@ -86,7 +130,8 @@ class CodegenContext:
     """Complete compile-wide resolution performed once before emission."""
 
     module: Module
-    functions: tuple[PrimFunction, ...]
+    options: CodegenOptions
+    functions: tuple[PrimFunction | Function, ...]
     ownership: Mapping[int, Module]
     targets: Mapping[int, Target]
     symbols: FunctionSymbolTable
@@ -126,7 +171,7 @@ class CodegenContext:
         )
 
 
-def _domain_functions(node: Module) -> tuple[PrimFunction, ...]:
+def _domain_functions(node: Module) -> tuple[PrimFunction | Function, ...]:
     inherited = tuple(
         function
         for child in node.modules
@@ -136,7 +181,7 @@ def _domain_functions(node: Module) -> tuple[PrimFunction, ...]:
     return (*node.functions, *inherited)
 
 
-def _domains(root: Module) -> tuple[tuple[Module, tuple[PrimFunction, ...]], ...]:
+def _domains(root: Module) -> tuple[tuple[Module, tuple[PrimFunction | Function, ...]], ...]:
     domains = [(root, _domain_functions(root))]
     for node in subtree(root):
         domains.extend(
@@ -145,6 +190,19 @@ def _domains(root: Module) -> tuple[tuple[Module, tuple[PrimFunction, ...]], ...
             if child.topologies is not None
         )
     return tuple(domains)
+
+
+def hir_domains(root: Module):
+    """Coalesce HIR owners by equal effective topology hierarchy."""
+    domains = []
+    for owner in subtree(root):
+        hierarchy = owner.effective_topologies()
+        row = next((row for row in domains if row[0].effective_topologies() == hierarchy), None)
+        if row is None:
+            domains.append((owner, list(owner.functions)))
+        else:
+            row[1].extend(owner.functions)
+    return tuple((owner, tuple(functions)) for owner, functions in domains)
 
 
 def _product(values: tuple[object, ...]) -> object:
@@ -170,7 +228,7 @@ def _launch_extents(owner: Module) -> tuple[object, object]:
     return _product(ctas), _product(threads)
 
 
-def _launch_statements(function: PrimFunction) -> tuple[Evaluate, ...]:
+def _launch_statements(function: PrimFunction | Function) -> tuple[Evaluate, ...]:
     body = function.body
     if not isinstance(body, Sequential):
         return ()
@@ -181,14 +239,38 @@ def _launch_statements(function: PrimFunction) -> tuple[Evaluate, ...]:
     )
 
 
-def build_codegen_context(module: Module) -> CodegenContext:
-    """Resolve functions, symbols, Launch edges, domains, and groups once."""
+def build_codegen_context(
+    module: Module, options: CodegenOptions = CodegenOptions()
+) -> CodegenContext:
+    """Resolve functions, symbols, Launch edges, domains, and groups once.
+
+    An HIR function enters codegen only as the callee a Launch names, and takes
+    the arguments that Launch binds; Python wraps any other one.
+    """
     functions = tuple(module_functions(module))
-    if not all(isinstance(function, PrimFunction) for function in functions):
-        bad = next(function for function in functions if not isinstance(function, PrimFunction))
-        raise TypeError(
-            f"codegen expects PrimFunction values, got {type(bad).__name__} {bad.name!r}"
-        )
+    for function in functions:
+        if isinstance(function, Function) and options.emit != "skeleton":
+            raise ValueError(
+                f"codegen: HIR function {export_name(module, function)!r} requires "
+                'emit="skeleton" or lowering to TIR first'
+            )
+    selected = function_selectors(module)
+    launched = {
+        stmt.args[0].name: stmt.args[7:]
+        for caller in functions
+        for stmt in _launch_statements(caller)
+    }
+    launch_args = {
+        id(each): launched[selector]
+        for selector, function in selected
+        if selector in launched
+        for each in (function, *function.variants)
+    }
+    functions = tuple(
+        function
+        for function in functions
+        if not isinstance(function, Function) or id(function) in launch_args
+    )
     expanded_list: list[PrimFunction] = []
     seen_expanded: set[int] = set()
     for function in functions:
@@ -197,67 +279,90 @@ def build_codegen_context(module: Module) -> CodegenContext:
                 seen_expanded.add(id(variant))
                 expanded_list.append(variant)
     expanded = tuple(expanded_list)
+    identities = {id(fn): fn for fn in (*functions, *expanded)}
     ownership: dict[int, Module] = {}
     targets: dict[int, Target] = {}
-    for function in (*functions, *expanded):
+    for function in identities.values():
         owner = owning_module(module, function)
         if owner is None:
             raise ValueError(f"codegen: function {function.name!r} has no unique owning Module")
-        if function.target is None:
+        target = function.target if isinstance(function, PrimFunction) else module.resolve_target()
+        if target is None:
             raise ValueError(f"codegen: function {function.name!r} has no resolved Target")
         ownership[id(function)] = owner
-        targets[id(function)] = function.target
+        targets[id(function)] = target
 
     device_targets = tuple(
         dict.fromkeys(
-            function.target
-            for function in (*functions, *expanded)
-            if not isinstance(function.target, CpuTarget)
+            targets[id(function)]
+            for function in identities.values()
+            if not isinstance(targets[id(function)], CpuTarget)
         )
     )
     if len(device_targets) != 1:
         raise ValueError(f"codegen: expected one device Target, found {len(device_targets)}")
     program_ids = program_id_params(module, device_targets[0])
     by_function: dict[int, FunctionSymbol] = {}
-    by_ir_name: dict[str, FunctionSymbol] = {}
-    by_kernel_name: dict[str, FunctionSymbol] = {}
-    for function in functions:
-        signature = called_as(function, program_ids)
-        is_device = not isinstance(function.target, CpuTarget)
+    selectors = {id(fn): selector for selector, fn in selected}
+    by_selector: dict[str, FunctionSymbol] = {}
+    device_functions = tuple(
+        fn for fn in identities.values() if not isinstance(targets[id(fn)], CpuTarget)
+    )
+    cpu_functions = tuple(
+        fn for fn in identities.values() if isinstance(targets[id(fn)], CpuTarget)
+    )
+    for function in (*device_functions, *cpu_functions):
+        launches = _launch_statements(function)
+        launched = by_selector.get(launches[0].args[0].name) if len(launches) == 1 else None
+        if launched is not None and isinstance(launched.function, Function):
+            mangled = launched.symbol
+            registered_name = launched.export_name
+        else:
+            mangled = mangle(module, function)
+            registered_name = export_name(module, function)
+        signature = called_as(
+            function,
+            mangled,
+            program_ids,
+            target=targets[id(function)],
+            params=launch_args.get(id(function)),
+        )
+        check_parameter_names(registered_name, signature.params)
         symbol = FunctionSymbol(
             function=function,
-            ir_name=function.name,
-            kernel_name=function.name if is_device else None,
-            shim_name=signature.name if is_device else None,
-            host_name=signature.name if not is_device else None,
+            symbol=mangled,
+            export_name=registered_name,
             owner=ownership[id(function)],
-            target=function.target,
+            target=targets[id(function)],
             callable=signature,
         )
-        if function.name in by_ir_name:
-            raise ValueError(f"codegen: duplicate IR function name {function.name!r}")
         by_function[id(function)] = symbol
-        by_ir_name[function.name] = symbol
-        if symbol.kernel_name is not None:
-            if symbol.kernel_name in by_kernel_name:
-                raise ValueError(f"codegen: duplicate kernel symbol {symbol.kernel_name!r}")
-            by_kernel_name[symbol.kernel_name] = symbol
+        if id(function) in selectors:
+            by_selector[selectors[id(function)]] = symbol
 
     table = FunctionSymbolTable(
         MappingProxyType(by_function),
-        MappingProxyType(by_ir_name),
-        MappingProxyType(by_kernel_name),
     )
     edges: list[LaunchEdge] = []
     launch_callables: dict[int, CallableSignature] = {}
     for caller in functions:
         for stmt in _launch_statements(caller):
             reference = stmt.args[0]
-            symbol = by_ir_name.get(reference.name)
+            symbol = by_selector.get(reference.name)
             if symbol is None:
-                raise ValueError(
-                    f"codegen: launch from {caller.name!r} names unknown function {reference.name!r}"
-                )
+                owner = ownership[id(caller)]
+                candidates = [
+                    by_function[id(fn)]
+                    for fn in module_functions(owner)
+                    if fn.name == reference.name
+                ]
+                if len(candidates) != 1:
+                    names = [candidate.export_name for candidate in candidates]
+                    raise ValueError(
+                        f"codegen: launch from {caller.name!r} names {reference.name!r} "
+                        f"in owner {owner.name!r}: expected one match, found {len(candidates)} {names}"
+                    )
+                symbol = candidates[0]
             grid_x, block_x = _launch_extents(symbol.owner)
             callable_signature = replace(symbol.callable, trailing=LAUNCH_ABI)
             launch_callables[id(stmt)] = callable_signature
@@ -273,13 +378,20 @@ def build_codegen_context(module: Module) -> CodegenContext:
                 )
             )
 
-    domain_rows = _domains(module)
+    domain_rows = tuple(
+        (owner, tuple(function for function in owned if id(function) in identities))
+        for owner, owned in (
+            hir_domains(module)
+            if any(isinstance(fn, Function) for fn in functions)
+            else _domains(module)
+        )
+    )
     topology_domains = {id(function): owner for owner, owned in domain_rows for function in owned}
     groups: list[EmissionGroup] = []
     for owner, owned in domain_rows:
         by_target: dict[Target, list[PrimFunction]] = {}
         for function in owned:
-            by_target.setdefault(function.target, []).append(function)
+            by_target.setdefault(targets[id(function)], []).append(function)
         for target, grouped in by_target.items():
             if not isinstance(target, CpuTarget) and not any(
                 edge.callee in grouped for edge in edges
@@ -290,6 +402,7 @@ def build_codegen_context(module: Module) -> CodegenContext:
 
     return CodegenContext(
         module=module,
+        options=options,
         functions=functions,
         ownership=MappingProxyType(ownership),
         targets=MappingProxyType(targets),
@@ -309,4 +422,7 @@ __all__ = [
     "FunctionSymbolTable",
     "LaunchEdge",
     "build_codegen_context",
+    "function_path",
+    "mangle",
+    "export_name",
 ]

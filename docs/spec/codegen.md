@@ -21,7 +21,18 @@ flowchart LR
 
 ## 1. Pipeline
 
-- **Input** is verified TIR. HIR Ops MUST NOT reach codegen.
+- **Input** is verified TIR for `emit="full"`. HIR `Function` signatures may
+  enter codegen only with `emit="skeleton"`; HIR Ops are not emitted as bodies.
+  Full emission encountering HIR reports its path and requires skeleton mode
+  or prior lowering.
+- `CodegenOptions.emit` is `"full"` (default) or `"skeleton"` and lives in the
+  compile-wide `CodegenContext`. Emitters read it through
+  `ctx.codegen_context.options`; a missing compile context is an error.
+  Skeleton emission retains CUDA signatures, parameter views, specialization
+  dispatch and launchers, replacing body statements with `// TODO: <fn>`.
+- Program emission and linking are owned by [§4.3](#43-linkedmodule);
+  runtime compilation entry points and loading are owned by
+  [runtime §1.6](./runtime.md#16-compilepy).
 - A module's functions are grouped by equal Target values in source order. Each
   group is emitted by the exact Target's CodeGenerator into one
   `LinkableModule`.
@@ -32,8 +43,8 @@ flowchart LR
   not own the user-facing entry points (`compile` / `build` / `jit`).
 - **Host / device boundary.** A host `LinkableModule` MUST NOT reference CUDA or
   CuTe symbols or types. A CUDA `LinkableModule` owns the kernels and their
-  C-ABI launch shims. The host module invokes device code only through that
-  C-ABI shim.
+  C-ABI launchers. The host module invokes device code only through that
+  C-ABI launcher.
 
 The target-specific generator behavior — how a CPU vs CUDA function emits,
 program-shape / dynamic-CTA accessors, and the `ShardLayout` runtime mapping —
@@ -51,6 +62,7 @@ class CodeGenerator:
     emit: Callable[
         [Module, tuple[PrimFunction, ...], Target, CodegenContext], LinkableModule
     ]
+    emits: frozenset[EmitGranularity] = frozenset({"full"})
 
 
 class Target:
@@ -68,6 +80,14 @@ def emit_cuda_module(
 - constraints:
   - A Target MUST return one immutable CodeGenerator descriptor. A subclass MAY
     inherit its base generator without another registration step.
+  - `emits` MUST state the source emission granularities the generator supports;
+    its default is `{"full"}`. Built-in CPU and CUDA generators support both
+    `"full"` and `"skeleton"`. Before any group emits, `link_program` MUST check
+    each group's generator and raise `UnsupportedCapabilityError` naming the
+    Target and requested granularity when unsupported. The CLI MUST delegate
+    Target capability admission to codegen. CUDA skeleton emission MUST reject
+    targets with `device_count` through `UnsupportedCapabilityError` in its
+    generator; those targets require a different project implementation.
   - All generators MUST share the `(module, functions, target, ctx)` callable
     shape. The context is built once per compile and carries what every
     generator has to agree on ([§2.3](#23-codegencontext)); a generator MUST
@@ -236,6 +256,7 @@ emission that produces these calls is owned by [target](./target.md).
 
 ### 4.1 `LinkableFunction`
 
+Defined in `codegen/linkable_function.py`.
 
 One lowered function's pre-link source, in both of its positions.
 
@@ -260,6 +281,8 @@ class LinkableFunction:
     this function, so the two cannot state different parameters.
 
 ### 4.2 `LinkableModule`
+
+Defined in `codegen/linkable_module.py`.
 
 One target's pre-link translation unit.
 
@@ -303,34 +326,75 @@ user-callable.
 ### 4.3 `LinkedModule`
 
 The link output: a loadable artifact plus the host-visible metadata the loader
-needs.
+needs. Defined in `codegen/linked_module.py`.
+`codegen/linked_function.py` separates each registration name from its C++ host
+signature:
 
 ```python
+class LinkedFunction:
+    """One linked function's registration name and host signature.
+
+    Attributes:
+        name: attribute; the dotted registration name.
+        signature: attribute; the host C++ calling convention and name.
+    """
+
+    name: str
+    signature: CallableSignature
+
 class LinkedModule:
-    """Linked library plus the entry's signature.
+    """Linked library plus its exported functions.
 
     Attributes:
         library_path: attribute; produced shared-library path.
         source: attribute; assembled host and device source.
-        entry: attribute; the loaded entry's signature.
+        functions: attribute; the linked functions exported by the library.
     """
 
     library_path: Path
     source: str
-    entry: CallableSignature
+    functions: tuple[LinkedFunction, ...]
 ```
 
 - constraints:
+  - `LinkedFunction.name` MUST be the dotted registration name;
+    `signature` MUST retain the host C++ calling convention and its C++ name
+    ([§4.4](#44-signatures)). `codegen/link_function.py:link_function(symbol)`
+    creates this pair from a resolved `FunctionSymbol`.
+  - `LinkedModule.functions` MUST list every emitted host export, in emission
+    order. Compilation supplies one entry; scaffold projects supply every
+    synthesized or selected CPU entry. The compiled runtime loader requires one
+    ([runtime §1.4](./runtime.md#14-runtimeloaderpy)).
   - MUST carry the assembled host + device source — the diagnostic source the
     runtime exposes as `RuntimeModule.source` ([runtime](./runtime.md)).
 
-The `entry` signature is [§4.4](#44-signatures)'s `CallableSignature`: codegen
-produces it and the runtime loader consumes it.
+`codegen/link_function.py` owns `link_function`:
 
-The link step consumes the per-target `LinkableModule`s, compiles each with its
-own toolchain, and links them into one `LinkedModule`. `LinkedModule` is
-consumed by the runtime loader ([runtime](./runtime.md)); the concrete compiler
-commands are an implementation detail and not part of the contract.
+```python
+def link_function(symbol: FunctionSymbol) -> LinkedFunction: ...
+```
+
+`codegen/link_module.py` owns `link_program` and `link_modules`:
+
+```python
+def link_program(
+    mod: Module, *, workdir: str | Path,
+    options: CodegenOptions = CodegenOptions(), entries=None,
+) -> LinkedModule: ...
+
+def link_modules(modules, *, workdir, lib_name, functions, **toolchain) -> LinkedModule: ...
+```
+
+`link_program` emits and links without loading. `entries=None` selects the
+root entry; an explicit sequence selects those CPU entries, with launcher
+declarations deduplicated. Sources are written directly in `workdir`; the
+library is `workdir/build/lib<root Module name>.so`. The link step compiles each
+source unit with its own toolchain and links the units into one library.
+`LinkedModule` is consumed by the runtime loader ([runtime](./runtime.md));
+the concrete compiler commands are an implementation detail and not part of
+the contract. `build()` chooses a fresh
+work directory ([runtime §1.6](./runtime.md#16-compilepy)); the scaffold command
+chooses its output directory ([cli](./cli.md#scaffold)).
 
 ### 4.4 Signatures
 
@@ -403,23 +467,43 @@ class CallableSignature(Signature):
     which is what makes them hidden. Each is its own class, so whoever writes
     one out dispatches on the type instead of reading the name.
   - one compiled function has three C++ conventions — the host entry, the
-    launch shim and the device kernel — and they differ only in `leading` and
+    launcher and the device kernel — and they differ only in `leading` and
     `trailing`. They MUST be three `CallableSignature` values; the class MUST
     NOT be subclassed. Only the first two are reachable by name; the kernel's
     is derived inside the unit that defines it and is not in the table.
-  - every identifier codegen generates carries the `tilefoundry_` prefix: the
-    three symbols, the parameters codegen inserts, and any state a unit emits
-    for itself. How one is spelled belongs to the target whose language it is
-    written in, so each target states its own; there is no neutral module
-    spelling names for all of them. A user's own parameter names are never
-    prefixed, and a name that reaches C++ through one of these is a plain C
-    identifier -- a mangled variant's `$` is not one.
+  - `function_path(root, fn)` MUST return the root Module name followed by the
+    selector segments. Child segments are their mount names. Variant paths add
+    the display name or `v<index>` when absent. A function without a unique path
+    MUST be rejected.
+  - `mangle(root, fn)` MUST be the unique source of generated function-symbol
+    roots: `tilefoundry_` followed by each segment's decimal length and spelling.
+    Every segment MUST be a C identifier; invalid segments raise with the segment
+    and complete path.
+  - `export_name(root, fn)` MUST join this same path with dots. For each HIR
+    selector it equals `<root name>.<selector>`.
+  - function paths reuse the IR selector traversal
+    ([core-ir §1.2](./core-ir.md#12-selecting-a-node-by-path)). These naming
+    functions live in `codegen/context_builder.py`, which produces FunctionSymbol
+    identities. Target conventions supply suffixes: CUDA derives `_launch` and
+    `_kernel`, while CPU functions use the mangled root. Conventions receive
+    the resolved symbol and target rather than reconstructing them.
+  - parameters codegen inserts (`tilefoundry_meta`,
+    `tilefoundry_<level>_program_id`) and unit-owned state MUST carry the
+    `tilefoundry_` prefix. Their spellings belong to their respective targets.
+  - host wrappers use `export_name(root, fn)` registration names, registering
+    through `Function::SetGlobal` with override enabled.
+  - user parameter names are used verbatim. They MUST be C identifiers, MUST
+    NOT be C++ keywords or start with `tilefoundry_`, and MUST NOT collide with
+    another parameter or derived view name (`<name>_tensor`, each dynamic
+    `<name>_shape_<axis>`, or a sharded parameter's `<name>_mesh`). Errors name
+    the function path and parameter.
   - the entry the loader is handed ([§4.3](#43-linkedmodule)) is a fourth
-    value of the same shape: its `name` is the exported symbol, and each
-    `leading` entry is a `ProgramIdSignature` whose `topology_level` names the
-    level whose id the host must supply, because that caller reads the id out
-    of a `Placement` ([shard §5](./shard.md#5-mesh)) instead of writing a C++
-    declaration.
+    value of the same shape: its `name` is the TVM FFI registration name, which
+    the loader combines with the `LinkedFunction`'s `signature` to obtain it,
+    and each `leading` entry is a `ProgramIdSignature` whose `topology_level`
+    names the level whose id the host must supply, because that caller reads
+    the id out of a `Placement` ([shard §5](./shard.md#5-mesh)) instead of writing
+    a C++ declaration.
 
 ```python
 def program_id_params(
@@ -442,13 +526,34 @@ def symbol_table(module: Module, target: Target) -> Mapping[int, CallableSignatu
     device can read, so its id arrives with the call.
   - `symbol_table` states one `CallableSignature` per function in the tree,
     keyed by `id(fn)`, so a call site holds its callee and never asks which
-    module the callee lives in. A specialization variant gets no row: nothing
-    calls one, because its prototype compiles to the one symbol and picks
-    between the variants inside it ([§5](#5-specialization-dispatch)).
+    module the callee lives in. Only device prototypes enter the Launch-target
+    symbol map. Variant identities carry symbol metadata for HIR device bodies;
+    their prototype selects them inside the kernel ([§5](#5-specialization-dispatch)).
   - a row is what a caller must write and nothing about what an emitter
-    produced. A device function appears as its launch shim, because that is
+    produced. A device function appears as its launcher, because that is
     the only convention a caller can reach; the kernel's own convention is not
     in the table.
+
+`codegen/cuda/hir/function.py` owns HIR skeleton emission. An HIR function
+enters codegen only as the callee a `Launch` names; Python wraps any other
+function and calls the exported entries. Each launched function gets one
+editable `__device__` body taking cute parameter views, one `__global__` entry
+and one launcher.
+Device bodies (including variants) precede all global entries, ordered stably
+by increasing reachable-function count so callees precede callers. Prototypes
+have empty bodies and variants receive their display-name path segment or
+`v<index>` fallback. Global entries wrap parameters and dispatch by the same
+range rules as TIR, trapping outside the specialization ranges.
+
+HIR functions with equal effective topology hierarchies share a device unit,
+including children that explicitly redeclare the same hierarchy; TIR grouping
+is unchanged. HIR same-kernel context rules are owned by
+[hir §1.1](./hir.md#11-function). An HIR function's parameters are the
+arguments its `Launch` binds
+([passes §7.3](./passes.md#73-insert_default_host_entry)), and its variants
+take the same ones; generated names follow [§4.4](#44-signatures).
+A synthesized host entry launching HIR uses that HIR function's symbol and
+registration name; its own IR name does not add another path segment.
 
 ## 5. Specialization dispatch
 
@@ -463,7 +568,7 @@ variant runs is decided on the device.
     express.
   - Because the geometry is one, the host MUST NOT choose between variants: it
     writes the one call the symbol table names ([§4.4](#44-signatures)). There
-    is no host-side chain over N shims and no per-variant shim.
+    is no host-side chain over N launchers and no per-variant launcher.
   - The prototype's kernel holds every variant as a branch, taken on the extent
     the call already carries -- the parameter the open axis expands into. A
     shape outside every variant's range is a call-contract violation and the
