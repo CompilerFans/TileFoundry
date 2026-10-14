@@ -7,6 +7,7 @@ instruction issue geometry. This file only turns those two facts into statements
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from math import prod
 
@@ -36,14 +37,14 @@ from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.math.binary import Binary as HirBinary
 from tilefoundry.ir.hir.mesh_region import MeshRegion
-from tilefoundry.ir.hir.schedule import ScheduleOp, operand_relations
+from tilefoundry.ir.hir.schedule import ScheduleOp, instruction_schema, operand_relations
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
 from tilefoundry.ir.hir.tensor._view_layout import derive_view_layout
 from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.hir.tensor.zeros import Zeros
 from tilefoundry.ir.isl_interop import isl_to_dim
-from tilefoundry.ir.tir.async_copy import CopyAsync, is_indexed_schedule
+from tilefoundry.ir.tir.async_copy import CopyAsync, is_indexed_copy
 from tilefoundry.ir.tir.memory import AllocTensor, Copy, Fill, PtrOf, TensorView
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Evaluate, For, LetStmt, MeshScope, Sequential
@@ -754,6 +755,35 @@ class Lowering(ExprVisitor[Expr]):
         )
         return result
 
+    def _declare_result(self, call: Call, buffers: int) -> Expr:
+        staged = isinstance(call.type, TensorType) and call.type.storage in (
+            StorageKind.SMEM,
+            StorageKind.GMEM,
+        )
+        if (
+            isinstance(call.type, TensorType)
+            and call.type.storage is StorageKind.RMEM
+            and buffers != 1
+        ):
+            raise LoweringError(f"{_label(call)} staged buffer has no owning scope")
+        owner = self._staging_owner(call) if staged else self.function
+        destination = self.owner_cursors.get(id(owner))
+        if destination is None:
+            raise LoweringError(f"{_label(call)} staged buffer has no owning scope")
+        return self._declare(call, call.type, buffers, destination)
+
+    def visit_Empty(self, call: Call, cursor: _Cursor) -> Expr:
+        return self._declare_result(call, call.target.buffers)
+
+    def _bind_window_alias(self, producer: Call, window: BufferAlias) -> None:
+        self._alias_value(producer, window.buffer)
+        for value in window.relation.values.values():
+            if (
+                isinstance(value, Expr) and not isinstance(value, Constant)
+                and not (isinstance(value, Call) and isinstance(value.target, MeshCoord))
+            ):
+                self._alias_value(producer, value)
+
     def visit_Zeros(self, call: Call, cursor: _Cursor) -> Expr:
         if call.type.storage is StorageKind.GMEM:
             out = self._ensure_output_seed(call)
@@ -784,7 +814,7 @@ class Lowering(ExprVisitor[Expr]):
     def visit_IndexSelect(self, call: Call, cursor: _Cursor) -> Expr:
         raise LoweringError(
             f"{_label(call)} is an unscheduled IndexSelect; write "
-            "tf.schedule((x, idx), op=T.copy_async(smem_layout=..., fill=...))"
+            "tf.schedule((x, tf.empty(...), idx), op=T.copy_async(fill=...))"
         )
 
     def visit_InsertSlice(self, call: Call, cursor: _Cursor) -> Expr:
@@ -852,45 +882,38 @@ class Lowering(ExprVisitor[Expr]):
             )
         scope = self.scope_for_call.get(id(call))
         mesh = scope.enclosing_mesh() if scope is not None else None
-        params = self._instruction_params(op, len(call.args))
+        operand_count = len(call.args)
+        if not isinstance(call.target, ScheduleOp):
+            operand_count += sum(
+                param.kind == "input" and param.effect == MemoryEffect.WRITE and not param.optional
+                for param in type(op)._op_schema.signature
+            )
+        params = self._instruction_params(op, operand_count)
         reads = tuple(param for param in params if param.effect & MemoryEffect.READ)
         writes = tuple(param for param in params if param.effect & MemoryEffect.WRITE)
         produced = tuple(param for param in writes if not param.effect & MemoryEffect.READ)
         output_window = self.output_windows.get(id(call))
+        destination_operand = None
+        if isinstance(call.target, ScheduleOp) and produced:
+            destination_operand = call.args[params.index(produced[0])]
+            output_window = self.output_windows.get(id(destination_operand))
         if output_window is not None:
-            self._alias_value(call, output_window.buffer)
-            for value in output_window.relation.values.values():
-                if (
-                    isinstance(value, Expr) and not isinstance(value, Constant)
-                    and not (isinstance(value, Call) and isinstance(value.target, MeshCoord))
-                ):
-                    self._alias_value(call, value)
+            self._bind_window_alias(call, output_window)
         written = None
-        buffers = call.target.buffers if isinstance(call.target, ScheduleOp) else 1
-        if produced and output_window is None:
-            staged = isinstance(call.type, TensorType) and call.type.storage in (
-                StorageKind.SMEM,
-                StorageKind.GMEM,
-            )
-            if (
-                isinstance(call.type, TensorType)
-                and call.type.storage is StorageKind.RMEM
-                and buffers != 1
-            ):
-                raise LoweringError(f"{_label(call)} staged buffer has no owning scope")
-            if staged:
-                destination = self.owner_cursors.get(id(self._staging_owner(call)))
-            else:
-                destination = self.owner_cursors[id(self.function)]
-            if destination is None:
-                raise LoweringError(f"{_label(call)} staged buffer has no owning scope")
-            written = self._declare(call, call.type, buffers, destination)
+        if produced and output_window is None and not isinstance(call.target, ScheduleOp):
+            written = self._declare_result(call, 1)
+        if destination_operand is not None and output_window is None:
+            written = self.visit(destination_operand, cursor)
         read_values = {}
-        for param, operand in zip(reads, call.args, strict=True):
-            value = self.visit(operand, cursor)
+        supplied = params if isinstance(call.target, ScheduleOp) else reads
+        for param, operand in zip(supplied, call.args, strict=True):
+            if param.effect == MemoryEffect.WRITE and output_window is not None:
+                read_values[param.name] = None
+                continue
+            value = written if operand is destination_operand else self.visit(operand, cursor)
             if (
                 isinstance(op, CopyAsync)
-                and is_indexed_schedule(call.args)
+                and is_indexed_copy(call.args)
                 and param.name == "src"
                 and (
                     value.type.layout is None
@@ -925,11 +948,13 @@ class Lowering(ExprVisitor[Expr]):
                 self.logical[id(scalar)] = scalar_type
                 value = scalar
             read_values[param.name] = value
-        if id(call) in self.staged:
-            written = self._stage(call)
         operands: list[tuple[str, Expr | None]] = []
         for param in params:
-            value = read_values[param.name] if param.effect & MemoryEffect.READ else written
+            value = (
+                read_values[param.name]
+                if isinstance(call.target, ScheduleOp) or param.effect & MemoryEffect.READ
+                else written
+            )
             if value is None and output_window is None:
                 raise LoweringError(f"{_label(call)} has no storage for {param.name}")
             operands.append((param.name, value))
@@ -937,6 +962,8 @@ class Lowering(ExprVisitor[Expr]):
         written = self._emit_instruction(
             call, op, tuple(operands), mesh, output_window, written, cursor
         )
+        if destination_operand is not None and output_window is not None and written is not None:
+            self._memo[id(destination_operand)] = (destination_operand, written)
         result_param = next(param for param in params if param.effect & MemoryEffect.WRITE)
         if result_param.effect & MemoryEffect.READ:
             return read_values[result_param.name]
@@ -1099,26 +1126,10 @@ class Lowering(ExprVisitor[Expr]):
 
     @staticmethod
     def _instruction_params(op, operand_count: int | None = None) -> tuple:
-        schema = getattr(type(op), "_op_schema", None)
-        if schema is None:
-            raise LoweringError(f"{type(op).__name__} is not a registered operation")
-        params = tuple(param for param in schema.signature if param.kind == "input")
-        if any(param.effect is None for param in params):
-            raise LoweringError(f"{type(op).__name__} does not declare every operand memory effect")
-        if operand_count is not None:
-            required_reads = sum(
-                bool(param.effect & MemoryEffect.READ)
-                for param in params
-                if not param.optional
-            )
-            optional_reads = tuple(
-                param for param in params if param.optional and param.effect & MemoryEffect.READ
-            )
-            supplied_optional = operand_count - required_reads
-            included = {id(param) for param in optional_reads[: max(0, supplied_optional)]}
-            params = tuple(
-                param for param in params if not param.optional or id(param) in included
-            )
+        try:
+            params, _writes = instruction_schema(op, operand_count)
+        except ValueError as error:
+            raise LoweringError(str(error)) from error
         return params
 
     @staticmethod
@@ -1301,6 +1312,7 @@ class ConvertHIRToTIR(ModulePass):
     """Replace one selected HIR entry with its scheduled TIR function."""
 
     entry: str | None = None
+    dims: Mapping[str, int] | None = None
 
     name = "convert-hir-to-tir"
     requires = ()
@@ -1309,7 +1321,7 @@ class ConvertHIRToTIR(ModulePass):
         authored = module.entry_function() if self.entry is None else module.lookup(self.entry)
         if not isinstance(authored, Function):
             raise LoweringError(f"{getattr(authored, 'name', self.entry)!r} is not an HIR function")
-        result = analyze(module, authored, analysis=("memory",))
+        result = analyze(module, authored, analysis=("memory",), dims=self.dims)
         lowered = Lowering(result, authored).run()
         lowered.metadata = result.function.metadata
         for record in render_analysis(result).summary:

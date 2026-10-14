@@ -177,22 +177,33 @@ single registered operations that lowering will select by default.
 ```bash
 set -euo pipefail
 tilefoundry schedule candidates grid.py candidates.txt
-grep -E 'tf.matmul|candidate   T.cuda.sm90.Wgmma|n=256, dtype=bf16, form=SS|tf.binary|tf.cast.*x=.*rmem|default' candidates.txt
+sed -n '/tf.matmul/,+4p; /refused.*T.binary/,+1p; /refused.*T.cast/,+1p' candidates.txt
 ```
 
 ```text
-  v10:31  tf.matmul  per cta  lhs=Tensor[(128, 64), "bf16", (128, 64), "smem"]  rhs=Tensor[(64, 256), "bf16", (64, 256), "smem"]
-    candidate   T.cuda.sm90.Wgmma  needs thread p0:p0+256, p0 % 128 = 0
-                  n=256, dtype=bf16, form=SS
-  v12:32  tf.binary  per cta  lhs=Tensor[(128, 256), "f32", "rmem"]  rhs=Tensor[(128, 256), "f32", (128, 256), "rmem"]  result=Tensor[(128, 256), "f32", (128, 256), "rmem"]
-    default     T.binary
-  v13:33  tf.cast  per cta  x=Tensor[(128, 256), "f32", "rmem"]  result=Tensor[(128, 256), "bf16", "rmem"]
-    default     T.cast
+    refused     T.binary
+                  mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout((*execution_shape,), (*execution_strides,))))
+    refused     T.binary
+                  mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout((*execution_shape,), (*execution_strides,))))
+  v10:31  tf.matmul  per cta  lhs=Tensor[(128, 64), "bf16", (128, 64), "smem"]  rhs=Tensor[(64, 256), "bf16", (64, 256), "smem"]  result=Tensor[(128, 256), "f32", (128, 256), "rmem"]
+    refused     T.cuda.sm90.Wgmma
+                  mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((*g, 4, 8, 4),), ((*gs, 32, 4, 1),))))
+    refused     T.cuda.sm80.Mma
+                  mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((*g, 4, 8),), ((*gs, 1, 4),))))
+    refused     T.binary
+                  mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout((*execution_shape,), (*execution_strides,))))
+    refused     T.cast
+                  mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout((*execution_shape,), (*execution_strides,))))
 ```
 
-The matmul still needs an atom and repetition choice. `T.binary` and the rmem cast have
-one registered operation whose required attributes come from the HIR, so they say
-`default`. Next inspect the exact WGMMA contract admitted by H200.
+This baseline has only a CTA mesh. Each instruction shown requires a thread
+mesh, so the first matching branch refuses it, including `T.binary` and `T.cast`.
+A single registered operation becomes `default` only when it matches.
+
+After stating the thread scope, the unscheduled matmul also needs a C fragment
+layout for its accumulator. Its inferred compact result does not declare that
+fragment, so use an explicit accumulator and a hand-written schedule, as below.
+Next inspect the exact WGMMA contract admitted by H200.
 
 ```bash
 set -euo pipefail
@@ -238,10 +249,10 @@ T.cuda.sm90.Wgmma
 The complete program below makes the structural decisions explicit:
 
 - `Topology("cta", 132)` plus `g / bn / mi` states persistent G=16 traversal.
-- `buffers=3` on the two `T.copy_async_tensor` loads states the BK64 TMA ring.
+- `buffers=3` on the two `tf.empty` load destinations states the BK64 TMA ring.
 - `threads[0, :32]` is the producer; `threads[1:3, :]` are two consumers.
 - `Wgmma(n=256, dtype=bf16, form=SS, a_major=K)` with `repeat=(2, 1, 4)` states eight K16 atoms.
-- `T.copy(smem_layout=OUT_SMEM)` keeps the 64 KiB output staging tile outside all six
+- `tf.empty(Tensor[..., OUT_SMEM, "smem"])` keeps the 64 KiB output staging tile outside all six
   load-ring slots, then `T.copy_async_tensor` writes it to global memory.
 
 <!-- tilefoundry-source: optimal.py -->
@@ -301,15 +312,29 @@ class GEMM_8192X17408X5120_OPTIMAL:
 
                             for k in tf.tile(K, BK):
                                 with threads[0, :32] as _loader:
+                                    lhs_ring = tf.empty(
+                                        Tensor[
+                                            (128, 64), "bf16",
+                                            Layout(((2, 8, 8), (4, 16)), ((4096, 512, 64), (16, 1))) | Swizzle(3, 4, 3),
+                                            "smem",
+                                        ],
+                                        buffers=STAGES,
+                                    )
                                     lhs = tf.schedule(
-                                        (a[m:m + BM, k],),
-                                        op=T.copy_async_tensor(smem_layout=Layout(((2, 8, 8), (4, 16)), ((4096, 512, 64), (16, 1))) | Swizzle(3, 4, 3)),
+                                        (a[m:m + BM, k], lhs_ring),
+                                        op=T.copy_async_tensor(),
+                                    )
+                                    rhs_ring = tf.empty(
+                                        Tensor[
+                                            (64, 256), "bf16",
+                                            Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))) | Swizzle(3, 4, 3),
+                                            "smem",
+                                        ],
                                         buffers=STAGES,
                                     )
                                     rhs = tf.schedule(
-                                        (b[k, n:n + BN],),
-                                        op=T.copy_async_tensor(smem_layout=Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))) | Swizzle(3, 4, 3)),
-                                        buffers=STAGES,
+                                        (b[k, n:n + BN], rhs_ring),
+                                        op=T.copy_async_tensor(),
                                     )
 
                                 with Mesh(threads[1:3, :], layout=(2, 4, 8, 4), names=("group", "warp", "lane8", "lane4")) as _compute:
@@ -321,12 +346,20 @@ class GEMM_8192X17408X5120_OPTIMAL:
 
                             with Mesh(threads[1:3, :], layout=(2, 4, 8, 4), names=("group", "warp", "lane8", "lane4")) as _compute:
                                 tile_out = tf.cast(acc, dtype="bf16")
+                                staged_dst = tf.empty(
+                                    Tensor[
+                                        (128, 256), "bf16",
+                                        Layout((128, (4, 64)), (64, (8192, 1))) | Swizzle(3, 4, 3),
+                                        "smem",
+                                    ],
+                                )
                                 staged = tf.schedule(
-                                    (tile_out,), op=T.copy(smem_layout=Layout((128, (4, 64)), (64, (8192, 1))) | Swizzle(3, 4, 3))
+                                    (tile_out, staged_dst), op=T.copy()
                                 )
 
                             with threads[0, :32] as _storer:
-                                tile = tf.schedule((staged,), op=T.copy_async_tensor())
+                                tile_dst = tf.empty(Tensor[(128, 256), "bf16", (128, 256)])
+                                tile = tf.schedule((staged, tile_dst), op=T.copy_async_tensor())
                                 out = tf.insert_slice(out, tile, (m, n))
 
                 return out
@@ -346,7 +379,7 @@ sed -n '1,114p' optimal_tir.py
 ```text
 # analysis target=nvidia.h200_sxm module=GEMM_8192X17408X5120_OPTIMAL function=gemm topology=cta wave=132/132
 # selection requested=memory executed=memory
-# memory traffic=gmem:r192.00MB/w306.00MB@logical,r133.68GB/w39.45GB@total,r1.01GB/w306.00MB@cta,r1.01GB/w306.00MB@thread;rmem:r2.71GB/w2.67GB@logical,r357.29GB/w357.20GB@total,r2.71GB/w2.71GB@cta,r11.51MB/w10.82MB@thread;smem:r1.01GB/w192.00MB@logical,r133.68GB/w133.68GB@total,r1.01GB/w1.01GB@cta,r192.31MB/w1020.07MB@thread footprint=a:256.00KB;b:288.00KB;v27:80:128.00KB;v28:81:8.25MB footprint-precision=exact peak=gmem:522.00MB;rmem:128.00KB;smem:208.00KB persistent=gmem:250.00MB
+# memory traffic=gmem:r192.00MB/w306.00MB@logical,r133.68GB/w39.45GB@total,r1.01GB/w306.00MB@cta,r1.01GB/w306.00MB@thread;rmem:r2.71GB/w2.67GB@logical,r357.29GB/w357.20GB@total,r2.71GB/w2.71GB@cta,r11.51MB/w10.82MB@thread;smem:r1.01GB/w192.00MB@logical,r133.68GB/w133.68GB@total,r1.01GB/w1.01GB@cta,r192.31MB/w1020.07MB@thread footprint=a:256.00KB;b:288.00KB;v30:101:64.00KB;v32:103:8.25MB footprint-precision=exact peak=gmem:522.00MB;rmem:128.00KB;smem:208.00KB persistent=gmem:250.00MB
 
 from __future__ import annotations
 
@@ -379,7 +412,7 @@ def gemm(
         with Mesh((Topology("thread", 384),), layout=(3, 128), names=("d0", "d1")) as scope:
             for g in range(0, 4, 1):
                 for bn in range(0, 68, 1):
-                    staged = T.tensor_view(
+                    staged_dst = T.tensor_view(
                         147456,
                         dtype="bf16",
                         storage="smem",
@@ -391,12 +424,12 @@ def gemm(
                             scope[1:], layout=(2, 4, 8, 4), names=("d0", "d1", "d2", "d3")
                         ) as threads:
                             T.fill(acc, 0.0)
-                        lhs_stages = (
+                        lhs_ring_stages = (
                             T.tensor_view(98304, dtype="bf16", storage="smem", layout=Layout(((2, 8, 8), (4, 16)), ((4096, 512, 64), (16, 1))) | Swizzle(3, 4, 3), shape=(128, 64)),
                             T.tensor_view(114688, dtype="bf16", storage="smem", layout=Layout(((2, 8, 8), (4, 16)), ((4096, 512, 64), (16, 1))) | Swizzle(3, 4, 3), shape=(128, 64)),
                             T.tensor_view(131072, dtype="bf16", storage="smem", layout=Layout(((2, 8, 8), (4, 16)), ((4096, 512, 64), (16, 1))) | Swizzle(3, 4, 3), shape=(128, 64)),
                         )
-                        rhs_stages = (
+                        rhs_ring_stages = (
                             T.tensor_view(0, dtype="bf16", storage="smem", layout=Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))) | Swizzle(3, 4, 3), shape=(64, 256)),
                             T.tensor_view(32768, dtype="bf16", storage="smem", layout=Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))) | Swizzle(3, 4, 3), shape=(64, 256)),
                             T.tensor_view(65536, dtype="bf16", storage="smem", layout=Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))) | Swizzle(3, 4, 3), shape=(64, 256)),
@@ -409,14 +442,14 @@ def gemm(
                                     shape=(128, 64),
                                 )
                                 with Mesh(scope_1, layout=(32,), names=("d0",)) as threads_1:
-                                    T.copy_async_tensor(tile, lhs_stages[(k // 64) % 3])
+                                    T.copy_async_tensor(tile, lhs_ring_stages[(k // 64) % 3])
                                 tile_1 = T.tensor_view(
                                     T.ptr_of(b[k:k + 64, bn * 256:bn * 256 + 256]),
                                     layout=((64, 256), (17408, 1)),
                                     shape=(64, 256),
                                 )
                                 with Mesh(scope_1, layout=(32,), names=("d0",)) as threads_2:
-                                    T.copy_async_tensor(tile_1, rhs_stages[(k // 64) % 3])
+                                    T.copy_async_tensor(tile_1, rhs_ring_stages[(k // 64) % 3])
                             with Mesh(
                                 scope[1:], layout=(2, 4, 8, 4), names=("d0", "d1", "d2", "d3")
                             ) as scope_2:
@@ -432,12 +465,12 @@ def gemm(
                                                     shape=(64, 256),
                                                 )
                                                 lhs_view = T.tensor_view(
-                                                    T.ptr_of(lhs_stages[(k // 64) % 3][o_m:o_m + 64, o_k:o_k + 16]),
+                                                    T.ptr_of(lhs_ring_stages[(k // 64) % 3][o_m:o_m + 64, o_k:o_k + 16]),
                                                     layout=(Layout(((8, 8), 16), ((512, 64), 1)) | Swizzle(3, 4, 3)) @ {B()},
                                                     shape=(64, 16),
                                                 )
                                                 rhs_view = T.tensor_view(
-                                                    T.ptr_of(rhs_stages[(k // 64) % 3][o_k:o_k + 16, o_n:o_n + 256]),
+                                                    T.ptr_of(rhs_ring_stages[(k // 64) % 3][o_k:o_k + 16, o_n:o_n + 256]),
                                                     layout=(Layout(((2, 8), (4, 64)), ((512, 64), (1024, 1))) | Swizzle(3, 4, 3)) @ {B()},
                                                     shape=(16, 256),
                                                 )
@@ -453,7 +486,7 @@ def gemm(
                                                     shape=(64, 256),
                                                 )
                                                 lhs_view_1 = T.tensor_view(
-                                                    T.ptr_of(lhs_stages[(k // 64) % 3][o_m:o_m + 64, o_k + 16:o_k + 16 + 16]),
+                                                    T.ptr_of(lhs_ring_stages[(k // 64) % 3][o_m:o_m + 64, o_k + 16:o_k + 16 + 16]),
                                                     layout=(Layout(((8, 8), 16), ((512, 64), 1)) + 16 | Swizzle(3, 4, 3)) @ {B()},
                                                     shape=(64, 16),
                                                 )

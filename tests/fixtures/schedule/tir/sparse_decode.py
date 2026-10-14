@@ -1,7 +1,7 @@
 # analysis target=nvidia.h200_sxm module=SparseDecode function=gemm topology=cta wave=1/1
 # selection requested=memory executed=memory
-# memory traffic=gmem:r17.00KB/w0@logical,r17.00KB/w0@total,r17.00KB/w0@cta,r17.00KB/w0@thread;rmem:r181.58KB/w153.52KB@logical,r181.58KB/w153.52KB@total,r181.58KB/w153.52KB@cta,r6.29KB/w2.11KB@thread;smem:r40.00KB/w48.00KB@logical,r40.00KB/w48.00KB@total,r40.00KB/w48.00KB@cta,r18.38KB/w48.00KB@thread footprint=idx:512B;kv:32.00KB;q:128B footprint-precision=exact peak=gmem:64.50KB;rmem:32.25KB;smem:16.00KB persistent=gmem:64.50KB
-#   buffer=kv holds=32.13KB time=r space=none reuse=1.97MB fits=yes precision=exact
+# memory traffic=gmem:r17.00KB/w0@logical,r17.00KB/w0@total,r17.00KB/w0@cta,r17.00KB/w0@thread;rmem:r181.58KB/w153.52KB@logical,r181.58KB/w153.52KB@total,r181.58KB/w153.52KB@cta,r6.29KB/w2.11KB@thread;smem:r40.00KB/w48.00KB@logical,r40.00KB/w48.00KB@total,r40.00KB/w48.00KB@cta,r18.38KB/w48.00KB@thread footprint=idx:512B;kv:128B;q:128B footprint-precision=exact peak=gmem:64.50KB;rmem:32.25KB;smem:16.00KB persistent=gmem:64.50KB
+#   buffer=kv holds=264B time=r space=none reuse=7.88KB fits=yes precision=exact
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def gemm(
                 (64, 64), "f32", ((8, 2, 4, 2, 4, 8), (1, 8, 16, 64, 128, 512)), "rmem"
             ]
         )
-        pr = T.alloc_tensor(
+        pr_dst = T.alloc_tensor(
             tensor_type=Tensor[
                 (64, 64),
                 "bf16",
@@ -85,7 +85,7 @@ def gemm(
         live = T.alloc_tensor(tensor_type=Tensor[(64,), "bool", (64,), "rmem"])
         value_2 = T.alloc_tensor(tensor_type=Tensor[(64,), "bool", (64,), "rmem"])
         ii = T.alloc_tensor(tensor_type=Tensor[(64,), "i64", (64,), "rmem"])
-        ii_1 = T.alloc_tensor(tensor_type=Tensor[(64,), "i64", (64,), "rmem"])
+        ii_dst = T.alloc_tensor(tensor_type=Tensor[(64,), "i64", (64,), "rmem"])
         value_3 = T.alloc_tensor(tensor_type=Tensor[(64,), "bool", (64,), "rmem"])
         s_1 = T.alloc_tensor(
             tensor_type=Tensor[
@@ -125,11 +125,11 @@ def gemm(
             with Mesh(scope[1:], layout=(4, 8, 4), names=("d0", "d1", "d2")) as scope_3:
                 with scope_3 as threads_2:
                     T.fill(o, 0.0)
-                    T.copy(idx, ii_1)
+                    T.copy(idx, ii_dst)
                 scalar = T.alloc_tensor(tensor_type=Tensor[(), "i64", "rmem"])
                 T.fill(scalar, 0)
                 with scope_3 as threads_4:
-                    T.binary(ii_1, scalar, ii, kind=BinaryKind.ADD)
+                    T.binary(ii_dst, scalar, ii, kind=BinaryKind.ADD)
                 scalar_1 = T.alloc_tensor(tensor_type=Tensor[(), "i64", "rmem"])
                 T.fill(scalar_1, 0)
                 with scope_3 as threads_5:
@@ -353,7 +353,7 @@ def gemm(
                         shape=(64, 64),
                     )
                     dst_frame_7 = T.tensor_view(
-                        T.ptr_of(pr[0:0 + 64, 0:0 + 64]),
+                        T.ptr_of(pr_dst[0:0 + 64, 0:0 + 64]),
                         layout=((4, 8 @ threads_10.d1, 2, 4 @ threads_10.d0, 2, 4 @ threads_10.d2, 2), (1024, 1, 8, 16, 64, 128, 512)),
                         shape=(64, 64),
                     )
@@ -378,7 +378,7 @@ def gemm(
                                     shape=(64, 64),
                                 )
                                 lhs_view_4 = T.tensor_view(
-                                    T.ptr_of(pr[o_m_1:o_m_1 + 64, o_k_1:o_k_1 + 16]),
+                                    T.ptr_of(pr_dst[o_m_1:o_m_1 + 64, o_k_1:o_k_1 + 16]),
                                     layout=((8 @ threads_19.d1, 2, 4 @ threads_19.d0, 2, 4 @ threads_19.d2, 2), (1, 8, 16, 64, 128, 512)),
                                     shape=(64, 16),
                                 )

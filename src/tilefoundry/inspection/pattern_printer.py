@@ -8,8 +8,9 @@ from enum import Enum
 from tilefoundry.ir.clause.layout import is_layout_wildcard
 from tilefoundry.ir.core.param_def import collect_param_defs
 from tilefoundry.ir.pattern.pattern import Pattern
+from tilefoundry.ir.pattern.predicates import Formula, failing
 from tilefoundry.ir.pattern.utils import declared_execution_mesh
-from tilefoundry.ir.types import Broadcast, DType, Split
+from tilefoundry.ir.types import Broadcast, DType, Split, StorageKind
 from tilefoundry.ir.types.dim import DimFloorDiv, DimMul, DimVar, is_dim_op_call
 
 _UNNAMED = "_"
@@ -55,20 +56,72 @@ class PatternPrinter:
             return ((tuple(bindings), pattern),)
         return self._dispatch("alternatives", pattern, tuple(bindings))
 
-    def refusal(self, refusal) -> str:
-        """Render one structural match refusal at a consumer boundary."""
+    def refusal_reason(self, refusal, parameter=None) -> str:
+        """The failed node's reason, optionally named by its instruction operand."""
         if refusal is None:
-            return "the pattern did not match"
-        rules = self.rules(refusal.pattern)
-        if rules:
-            reason = f"could not satisfy {rules[0]}"
+            reason = "the pattern did not match"
         else:
+            pattern = refusal.pattern
+            if isinstance(pattern, Formula):
+                failed = failing((pattern,), refusal.bindings)
+                if failed is not None:
+                    pattern = failed
             reason = (
-                f"{refusal.subject!r} does not match "
-                f"{self.written(refusal.pattern)}"
+                self._dispatch("refused", pattern, refusal.subject)
+                if isinstance(pattern, Pattern)
+                else self.refused_Pattern(pattern, refusal.subject)
             )
-        bindings = self._written_bindings(refusal.bindings.items())
-        return reason if not bindings else f"{reason} ({bindings})"
+        return reason if parameter is None else f"{parameter}: {reason}"
+
+    def match_data(self, paths, reason="") -> dict:
+        """Merge ordered match paths without separating parameters from internal captures."""
+        merged = {}
+        for path in paths:
+            for name, value in path:
+                written = (
+                    self._subject_value(value)
+                    if isinstance(value, float) else getattr(value, "name", str(value))
+                )
+                values = merged.setdefault(name, [])
+                if written not in values:
+                    values.append(written)
+        return {
+            "path": [{"name": name, "value": "|".join(values)} for name, values in merged.items()],
+            "reason": reason,
+        }
+
+    def match_text(self, identifier, data) -> str:
+        """Write an instruction and its ordered path, followed by a refusal reason."""
+        path = ", ".join(f"{item['name']}={item['value']}" for item in data["path"])
+        first = identifier + (f"  {path}" if path else "")
+        reason = data["reason"]
+        return first if not reason else f"{first}\n  {reason}"
+
+    def refusal(self, refusal) -> str:
+        """Render structural evidence with the same path/reason form as instruction reports."""
+        path = () if refusal is None else tuple(refusal.bindings.items())
+        data = self.match_data((path,), self.refusal_reason(refusal))
+        return self.match_text("", data).lstrip()
+
+    def _subject_value(self, value) -> str:
+        from .printer_base import PythonPrinter  # noqa: PLC0415
+
+        if isinstance(value, (DType, StorageKind)):
+            return self._written_value(value)
+        return PythonPrinter().print(value)
+
+    def refused_Pattern(self, pattern, subject) -> str:
+        return f"{self._subject_value(subject)} does not match {self.written(pattern)}"
+
+    def refused_Predicate(self, pattern, subject) -> str:
+        return "could not satisfy " + "; ".join(self.rules(pattern))
+
+    def refused_SwitchPattern(self, pattern, subject) -> str:
+        options = ", ".join(self._written_value(value) for value, _ in pattern.branches)
+        return (
+            f"{pattern.param} has no matching branch for "
+            f"{self._subject_value(subject)}; branches: {options}"
+        )
 
     def declaration(self, op_type) -> dict[str, tuple[str, ...]]:
         """Render declaration sections without flattening them into report text."""
@@ -125,13 +178,15 @@ class PatternPrinter:
         return rendered
 
     def _declared(self, pattern, name: str) -> str:
-        if not any(cls.__name__ == "SwitchPattern" for cls in type(pattern).__mro__):
+        if not any(cls.__name__ in ("SwitchPattern", "TensorPattern") for cls in type(pattern).__mro__):
             return self.described(pattern, name)
         alternatives = tuple(
             (bindings, alternative, self.rules(alternative, name))
             for bindings, alternative in self.alternatives(pattern)
         )
         if not alternatives:
+            return self.described(pattern, name)
+        if len(alternatives) == 1 and not alternatives[0][0]:
             return self.described(pattern, name)
         common = tuple(
             rule
@@ -186,12 +241,16 @@ class PatternPrinter:
         return str(getattr(value, "value", value))
 
     def _written_value(self, value) -> str:
+        if isinstance(value, float):
+            return self._subject_value(value)
         if isinstance(value, Broadcast):
             return "B()"
         if isinstance(value, DType):
             return value.name
         if isinstance(value, Split):
             return f"S({value.axis})"
+        if isinstance(value, StorageKind):
+            return value.name.lower()
         if isinstance(value, Enum):
             return f"{type(value).__name__}.{value.name}"
         if isinstance(value, tuple):
@@ -504,6 +563,8 @@ class PatternPrinter:
         )
 
     def _written_expression(self, value) -> str:
+        if isinstance(value, float):
+            return self._subject_value(value)
         name = type(value).__name__
         if name == "Formula":
             if value.op == "not":
@@ -533,7 +594,7 @@ class PatternPrinter:
             )
         if name == "Term":
             if value.op == "constant":
-                return repr(value.args[0])
+                return self._written_expression(value.args[0])
             if value.op in {"variable", "bits"}:
                 return (
                     value.args[0]
@@ -572,11 +633,42 @@ class PatternPrinter:
         )
 
     def alternatives_SwitchPattern(self, pattern, bindings) -> tuple:
+        known = dict(bindings)
+        if pattern.param in known:
+            branch = next(
+                (branch for value, branch in pattern.branches if value == known[pattern.param]), None
+            )
+            return () if branch is None else self.alternatives(branch, bindings)
         return tuple(
             held
             for value, branch in pattern.branches
             for held in self.alternatives(branch, (*bindings, (pattern.param, value)))
         )
+
+    def alternatives_TensorPattern(self, pattern, bindings) -> tuple:
+        from tilefoundry.ir.pattern.utils import selected_pattern  # noqa: PLC0415
+
+        states = ((bindings, pattern),)
+        for field in ("dtype", "storage"):
+            states = tuple(
+                (held, replace(tensor, **{field: alternative}))
+                for bound, tensor in states
+                for held, alternative in self.alternatives(getattr(tensor, field), bound)
+            )
+        if pattern.shape is not None:
+            for index in range(len(pattern.shape)):
+                states = tuple(
+                    (
+                        held,
+                        replace(
+                            tensor,
+                            shape=(*tensor.shape[:index], alternative, *tensor.shape[index + 1 :]),
+                        ),
+                    )
+                    for bound, tensor in states
+                    for held, alternative in self.alternatives(tensor.shape[index], bound)
+                )
+        return tuple((bound, selected_pattern(tensor, dict(bound))) for bound, tensor in states)
 
     def alternatives_ShardLayoutPattern(self, pattern, bindings) -> tuple:
         return tuple(

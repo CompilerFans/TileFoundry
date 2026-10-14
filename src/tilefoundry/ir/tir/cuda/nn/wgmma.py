@@ -195,64 +195,54 @@ def _by_major(mn_major_pattern, k_major_patterns, element_bytes: int) -> dict:
     return arrangements
 
 
-def _a_role(dtype: DType) -> SwitchPattern:
+def _a_layout(dtype: DType) -> SwitchPattern:
     element_bytes = dtype.bit_width // 8
     return SwitchPattern(
         "form",
         {
-            Form.SS: TensorPattern(
-                shape=(64, _mma_k_elements(element_bytes)),
-                dtype=dtype,
-                storage=S.SMEM,
-                layout=ShardLayoutPattern(
-                    SwitchPattern(
-                        "a_major",
-                        _by_major(
-                            _a_mn_major_smem_pattern,
-                            (_a_k_major_whole_smem_pattern, _a_k_major_sliced_smem_pattern),
-                            element_bytes,
-                        ),
+            Form.SS: ShardLayoutPattern(
+                SwitchPattern(
+                    "a_major",
+                    _by_major(
+                        _a_mn_major_smem_pattern,
+                        (_a_k_major_whole_smem_pattern, _a_k_major_sliced_smem_pattern),
+                        element_bytes,
                     ),
-                    BROADCAST,
-                    execution_mesh_pattern(WARPGROUP),
                 ),
+                BROADCAST,
+                execution_mesh_pattern(WARPGROUP),
             ),
-            Form.RS: TensorPattern(
-                shape=(64, _mma_k_elements(element_bytes)),
-                dtype=dtype,
-                storage=S.RMEM,
-                layout=ShardLayoutPattern(
-                    _a_register_fragment_pattern(element_bytes),
-                    PER_THREAD,
-                    execution_mesh_pattern(WARPGROUP),
-                ),
+            Form.RS: ShardLayoutPattern(
+                _a_register_fragment_pattern(element_bytes),
+                PER_THREAD,
+                execution_mesh_pattern(WARPGROUP),
             ),
         },
     )
 
 
-def _b_role(dtype: DType) -> TensorPattern:
-    element_bytes = dtype.bit_width // 8
-    return TensorPattern(
-        shape=(_mma_k_elements(element_bytes), N),
-        dtype=dtype,
-        storage=S.SMEM,
-        layout=ShardLayoutPattern(
-            SwitchPattern(
-                "b_major",
-                _by_major(
-                    _b_mn_major_smem_pattern,
-                    (_b_k_major_whole_smem_pattern, _b_k_major_sliced_smem_pattern),
-                    element_bytes,
-                ),
+def _b_layout(dtype: DType) -> ShardLayoutPattern:
+    return ShardLayoutPattern(
+        SwitchPattern(
+            "b_major",
+            _by_major(
+                _b_mn_major_smem_pattern,
+                (_b_k_major_whole_smem_pattern, _b_k_major_sliced_smem_pattern),
+                dtype.bit_width // 8,
             ),
-            BROADCAST,
-            execution_mesh_pattern(WARPGROUP),
         ),
+        BROADCAST,
+        execution_mesh_pattern(WARPGROUP),
     )
 
 
 _A_MAJOR_16 = SwitchPattern("form", {Form.SS: OrPattern(*tuple(Major)), Form.RS: Major.K})
+
+
+_OPERAND_DTYPE = SwitchPattern("dtype", {dtype: dtype for dtype in DTYPES})
+_K_ELEMENTS = SwitchPattern(
+    "dtype", {dtype: _mma_k_elements(dtype.bit_width // 8) for dtype in DTYPES}
+)
 
 
 class Wgmma(MmaAtom):
@@ -325,8 +315,24 @@ class Wgmma(MmaAtom):
         ),
         predicates=(8 * c == n_extent,),
     )
-    A = SwitchPattern("dtype", {dtype: _a_role(dtype) for dtype in DTYPES})
-    B = SwitchPattern("dtype", {dtype: _b_role(dtype) for dtype in DTYPES})
+    A = TensorPattern(
+        dtype=_OPERAND_DTYPE,
+        storage=SwitchPattern("form", {Form.SS: S.SMEM, Form.RS: S.RMEM}),
+        shape=(
+            64,
+            _K_ELEMENTS,
+        ),
+        layout=SwitchPattern("dtype", {dtype: _a_layout(dtype) for dtype in DTYPES}),
+    )
+    B = TensorPattern(
+        dtype=_OPERAND_DTYPE,
+        storage=S.SMEM,
+        shape=(
+            _K_ELEMENTS,
+            N,
+        ),
+        layout=SwitchPattern("dtype", {dtype: _b_layout(dtype) for dtype in DTYPES}),
+    )
 
 
 __all__ = [

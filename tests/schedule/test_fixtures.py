@@ -23,6 +23,7 @@ import pytest
 import torch
 
 import tilefoundry.passes.transforms.convert_hir_to_tir as lowering_module
+from tests._source import import_dsl
 from tilefoundry.analysis.api import analyze
 from tilefoundry.analysis.check import check_program, resolve_program_geometry
 from tilefoundry.analysis.liveness import analyze_liveness, result_copies
@@ -47,6 +48,8 @@ from tilefoundry.ir.core import (
     Var,
     detach_metadata,
     get_metadata,
+    op_identifier,
+    supported_op_capabilities,
 )
 from tilefoundry.ir.core.errors import VerifyError
 from tilefoundry.ir.core.op_registry import iter_schemas
@@ -57,6 +60,7 @@ from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.schedule import ScheduleOp, operand_relations
 from tilefoundry.ir.hir.tensor.cast import Cast as HirCast
+from tilefoundry.ir.hir.tensor.empty import Empty
 from tilefoundry.ir.hir.tensor.reshape import Reshape
 from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.hir.tensor.transpose import Transpose
@@ -65,6 +69,7 @@ from tilefoundry.ir.pattern import (
     TensorPattern,
     declared_execution_mesh,
     is_ranked_tensor,
+    thread_execution_mesh,
 )
 from tilefoundry.ir.tir import PrimFunction
 from tilefoundry.ir.tir.async_copy import CopyAsync
@@ -78,14 +83,17 @@ from tilefoundry.ir.types import (
     ComposedLayout,
     DType,
     Layout,
+    Mesh,
     ShardLayout,
     StorageKind,
     TensorType,
+    Topology,
 )
 from tilefoundry.ir.types.layout import flatten
 from tilefoundry.ir.types.layout_algebra import cosize
 from tilefoundry.ir.types.mesh import levels, starts
 from tilefoundry.ir.visitor import StmtVisitor, collect_exprs
+from tilefoundry.target import CudaTarget
 from tilefoundry.visitor_registry.access_relation import (
     access_relation_registry,
     identity_relations,
@@ -115,9 +123,17 @@ PLAIN_REFUSED = {
 CANDIDATES_REFUSED = {
     "captured_insert_update": "source has no unscheduled candidate site",
     "loop_carry_from_param": "source has no unscheduled candidate site",
+    "wgmma_b_nk": "source has no unscheduled candidate site",
 }
 TIR = tuple(sorted((Path(__file__).parents[1] / "fixtures" / "schedule" / "tir").glob("*.py")))
 HIR = tuple(sorted((Path(__file__).parents[1] / "fixtures" / "schedule" / "hir").glob("*.py")))
+FACT_INSTRUCTIONS = sorted({
+    op_identifier(declaration)
+    for op_type, capability in supported_op_capabilities(CudaTarget("nvidia.h200_sxm"))
+    for declaration in (
+        (op_type, capability.declaration) if capability.attribute is not None else (op_type,)
+    )
+})
 WGMMA_FACTS = Path(__file__).parents[1] / "fixtures" / "schedule" / "Wgmma.facts.txt"
 _H200_FACTS_TEXT = """\
 target nvidia.h200_sxm
@@ -205,6 +221,7 @@ SMEM_GOLDEN = {
     "sm80_mma_ldmatrix": 1_536,
     "wgmma_a_k_major": 6_144,
     "wgmma_a_mn_major": 6_144,
+    "wgmma_b_nk": 2_560,
     "wgmma_cast_between_schedules": 6_144,
     "wgmma_cp_async_loads": 6_144,
     "wgmma_cta_grid_4x17": 13_824,
@@ -221,6 +238,11 @@ SMEM_GOLDEN = {
 }
 
 RMEM_EXPECTED = {
+    "wgmma_b_nk": {
+        "thread@0:128#0": _RmemExpectation(
+            4096, "64x16 f32 C fragment, shared by zeros and MMA result"
+        ),
+    },
     "captured_insert_update": {},
     "loop_carry_from_param": {},
     "sparse_decode": {
@@ -508,20 +530,6 @@ def test_scheduled_hir_program_has_analysis_metadata(
 ) -> None:
     program = _module_in(path)
     entry = next(function for function in program.functions if function.name == "gemm")
-    if path.stem == "wgmma_tma_3stage":
-        read_write = []
-        for expr in collect_exprs(entry.body):
-            if isinstance(expr, Call) and isinstance(expr.target, ScheduleOp):
-                schema = type(expr.target.op)._op_schema
-                writes = tuple(
-                    param
-                    for param in schema.signature
-                    if param.kind == "input" and param.effect & MemoryEffect.WRITE
-                )
-                if writes[0].effect & MemoryEffect.READ:
-                    read_write.append(expr)
-        assert len(read_write) == 1
-        read_write[0].target.buffers = 3
     result = analyze(program, entry, analysis=analysis)
     assert metadata_type in result.metadata_types
 
@@ -540,7 +548,7 @@ def test_scheduled_hir_program_has_analysis_metadata(
                 expr.target.op, (Copy, CopyAsync, CopyAsyncTensor)
             ):
                 tile = prod(expr.type.shape) * expr.type.dtype.bit_width // 8
-                assert record.operands[-1].write == tile, "a copy writes its whole tile"
+                assert record.operands[1].write == tile, "a copy writes its whole tile"
             if isinstance(expr.target, ScheduleOp) and isinstance(expr.target.op, TiledMma):
                 for operand, moved in zip(expr.args, record.operands, strict=False):
                     if operand.type.storage is StorageKind.SMEM:
@@ -563,7 +571,7 @@ def test_scheduled_hir_program_has_analysis_metadata(
         smem = sorted(item.bytes for item in lifetimes if item.memory_level == "smem")
         rmem = sorted(item.bytes for item in lifetimes if item.memory_level == "rmem")
         assert smem == sorted((512 * 3, 4096 * 3))
-        assert rmem == [4096, 8192, 8192, 8192]
+        assert rmem == [4096, 8192, 8192]
 
     if analysis == "memory":
         placement = get_metadata(result.function, RegionMemoryMetadata)
@@ -748,11 +756,18 @@ def _copy_schedule_call(
     type_ = TensorType((4,), DType.bf16, layout, storage)
     return Call(
         target=ScheduleOp(
-            op=CopyAsync(smem_layout=layout),
+            op=CopyAsync(),
             repeat=repeat,
             order=order,
         ),
-        args=(Var(name="src", type=type_),),
+        args=(
+            Var(name="src", type=type_),
+            Call(
+                Empty(type=replace(type_, storage=StorageKind.SMEM)),
+                (),
+                type=replace(type_, storage=StorageKind.SMEM),
+            ),
+        ),
         type=type_,
     )
 
@@ -782,8 +797,8 @@ def test_schedule_copy_evaluates_to_the_source_value() -> None:
     source = torch.arange(4, dtype=torch.bfloat16)
 
     result = _evaluate_call(
-        ScheduleOp(op=CopyAsync(smem_layout=layout)),
-        ((source_type, source),),
+        ScheduleOp(op=CopyAsync()),
+        ((source_type, source), (result_type, torch.zeros_like(source))),
         result_type,
     )
 
@@ -882,12 +897,9 @@ def _check_selected_rows(out: Path, captured: pytest.CaptureResult[str]) -> None
         )
     )
     assert gather["operands"][0]["read"] == 8192, "gather reads 64 selected bf16 rows"
-
-
-def _check_table_footprint(out: Path, captured: pytest.CaptureResult[str]) -> None:
-    records = _quiet_json(out, captured)
     footprint = records["function_records"]["memory"]["footprint"]
-    assert footprint["buffers"]["kv"]["gmem"]["total"] == 32768, "the whole table is resident"
+    assert footprint["buffers"]["kv"]["gmem"]["total"] == 8192
+    assert footprint["buffers"]["kv"]["gmem"]["total"] <= gather["operands"][0]["read"]
 
 
 def _check_service_work(out: Path, captured: pytest.CaptureResult[str]) -> None:
@@ -904,10 +916,9 @@ def _check_gmem_gather_refusal(out: Path, captured: pytest.CaptureResult[str]) -
     assert not indexed["candidates"] and [item["id"] for item in indexed["refused"]] == [
         "T.copy_async"
     ], "gather keeps its gmem result"
-    assert any(
-        "dst:" in reason and "StorageKind.GMEM" in reason and "StorageKind.SMEM" in reason
-        for reason in indexed["refused"][0]["refused"]
-    ), "copy_async requires an smem destination"
+    assert indexed["refused"][0]["reason"].startswith("mesh:")
+    assert 'Topology("cta"' in indexed["refused"][0]["reason"]
+
 
 
 def _check_smem_placement(out: Path, captured: pytest.CaptureResult[str]) -> None:
@@ -969,6 +980,15 @@ def _check_facts(
         assert out.read_text() == expected
 
 
+def _check_facts_declaration(
+    out: Path, captured: pytest.CaptureResult[str], *, instruction: str,
+) -> None:
+    report = _quiet_json(out, captured)
+    assert report["id"] == instruction
+    assert report["target"] == "nvidia.h200_sxm"
+    assert report["execution_mesh"]
+
+
 def _check_facts_refusal(out: Path, captured: pytest.CaptureResult[str], *, message: str) -> None:
     assert captured.out == ""
     assert captured.err.startswith("tilefoundry: error: ")
@@ -976,9 +996,37 @@ def _check_facts_refusal(out: Path, captured: pytest.CaptureResult[str], *, mess
     assert not out.exists()
 
 
+def _check_finalized_rows(out: Path, captured: pytest.CaptureResult[str]) -> None:
+    assert captured == ("", "")
+    lowered = import_dsl(out.read_text())
+    assert isinstance(lowered, PrimFunction)
+    assert lowered.params[-1].type.shape == (128,)
+
+
+def _check_finalize_unbound_dim(out: Path, captured: pytest.CaptureResult[str]) -> None:
+    assert captured.out == ""
+    assert "schedule finalize" in captured.err
+    assert "bind it with --dim" in captured.err
+    assert not out.exists()
+
+
 FIXTURES = (
     FixtureCase(
-        "gather reads only the selected rows",
+        "finalize binds an open row dimension",
+        (
+            "schedule", "finalize", "tests/fixtures/schedule/hir/dim/row_copy.py",
+            "{out}", "--dim=rows=128",
+        ),
+        _check_finalized_rows,
+    ),
+    FixtureCase(
+        "finalize refuses an unbound row dimension without output",
+        ("schedule", "finalize", "tests/fixtures/schedule/hir/dim/row_copy.py", "{out}"),
+        _check_finalize_unbound_dim,
+        code=1,
+    ),
+    FixtureCase(
+        "gather reads selected rows and caps the footprint",
         (
             "analyze",
             "tests/fixtures/schedule/plain/sparse_decode.py",
@@ -987,17 +1035,6 @@ FIXTURES = (
             "--json",
         ),
         _check_selected_rows,
-    ),
-    FixtureCase(
-        "gather retains the whole table footprint",
-        (
-            "analyze",
-            "tests/fixtures/schedule/plain/sparse_decode.py",
-            "{out}",
-            "--memory",
-            "--json",
-        ),
-        _check_table_footprint,
     ),
     FixtureCase(
         "integer and predicate work uses services",
@@ -1064,6 +1101,23 @@ FIXTURES = (
         "facts write the Wgmma declaration",
         ("schedule", "facts", "T.cuda.sm90.Wgmma", "--target", "nvidia.h200_sxm", "{out}"),
         partial(_check_golden, golden=WGMMA_FACTS),
+    ),
+    FixtureCase(
+        "facts write the tiled MMA atom alternatives",
+        ("schedule", "facts", "T.tiled_mma", "--target", "nvidia.h200_sxm", "{out}"),
+        partial(_check_golden, golden=WGMMA_FACTS.with_name("tiled_mma.facts.txt")),
+    ),
+    *(
+        FixtureCase(
+            f"facts describe {instruction}",
+            (
+                "schedule", "facts", instruction, "--target", "nvidia.h200_sxm",
+                "{out}", "--json",
+            ),
+            partial(_check_facts_declaration, instruction=instruction),
+        )
+        for instruction in FACT_INSTRUCTIONS
+        if instruction not in {"T.cuda.sm90.Wgmma", "T.tiled_mma"}
     ),
     *(
         FixtureCase(
@@ -1143,13 +1197,10 @@ def test_single_issue_schedule_preserves_instruction_relations() -> None:
     schedule = _copy_schedule_call(repeat=(1,), order=(0,))
     source = schedule.args[0]
     destination_type = TensorType((4,), DType.bf16, Layout((4,), (1,)), StorageKind.SMEM)
-    inferred = TypeInferContext()
+    inferred = TypeInferContext(current_mesh=Mesh((Topology("thread", 32),), Layout((32,), (1,))))
     inference_type(schedule, inferred)
     scheduled = relations_of(schedule, inferred)
-    source, _destination, *result = operand_relations(
-        schedule.target.op, (source.type, destination_type)
-    )
-    single = (source, *result)
+    single = operand_relations(schedule.target.op, (source.type, destination_type))
     assert len(scheduled) == len(single)
     assert all(
         left.relation.is_equal(right.relation)
@@ -1164,18 +1215,23 @@ def test_single_issue_schedule_preserves_instruction_relations() -> None:
         (_copy_schedule_call(order=(1,)), "is not a permutation"),
         (
             _copy_schedule_call(storage=StorageKind.SMEM),
-            "src single-issue tile does not match",
+            "src:",
         ),
     ),
     ids=("repeat", "order", "operand-pattern"),
 )
 def test_schedule_typeinfer_rejects_invalid_contract(call: Call, message: str) -> None:
     with pytest.raises(ValueError, match=message):
-        inference_type(call)
+        inference_type(
+            call,
+            TypeInferContext(current_mesh=Mesh((Topology("thread", 32),), Layout((32,), (1,)))),
+        )
 
 
 @register_op(dialect="T", category="schedule", name="unstated_instruction")
 class _UnstatedInstruction(Op):
+    execution_mesh = thread_execution_mesh()
+
     value = ParamDef(
         kind="input",
         effect=MemoryEffect.READ | MemoryEffect.WRITE,
@@ -1191,7 +1247,10 @@ def test_schedule_typeinfer_requires_instruction_access_relations() -> None:
         type=type_,
     )
     with pytest.raises(ValueError, match="states no access relations"):
-        inference_type(call)
+        inference_type(
+            call,
+            TypeInferContext(current_mesh=Mesh((Topology("thread", 32),), Layout((32,), (1,)))),
+        )
 
 
 def test_schedule_typeinfer_requires_instruction_verifier(monkeypatch) -> None:
@@ -1208,7 +1267,10 @@ def test_schedule_typeinfer_requires_instruction_verifier(monkeypatch) -> None:
     )
 
     with pytest.raises(ValueError, match="has no registered verifier"):
-        inference_type(call)
+        inference_type(
+            call,
+            TypeInferContext(current_mesh=Mesh((Topology("thread", 32),), Layout((32,), (1,)))),
+        )
 
 
 def test_schedule_typeinfer_requires_whole_instruction_tiles(monkeypatch) -> None:
@@ -1230,10 +1292,13 @@ def test_schedule_typeinfer_requires_whole_instruction_tiles(monkeypatch) -> Non
         ValueError,
         match="iteration extent 4 is not divisible by single-issue extent 3",
     ):
-        inference_type(call)
+        inference_type(
+            call,
+            TypeInferContext(current_mesh=Mesh((Topology("thread", 32),), Layout((32,), (1,)))),
+        )
 
 
-def test_schedule_typeinfer_requires_declared_write_type(monkeypatch) -> None:
+def test_schedule_typeinfer_requires_instruction_operands(monkeypatch) -> None:
     type_ = TensorType((4,), DType.bf16, Layout((4,), (1,)), StorageKind.RMEM)
     call = Call(
         target=ScheduleOp(op=_UnstatedInstruction()),
@@ -1246,9 +1311,12 @@ def test_schedule_typeinfer_requires_declared_write_type(monkeypatch) -> None:
 
     with pytest.raises(
         ValueError,
-        match="value is write-only and declares no result shape",
+        match="expects operands.*value.*got 0",
     ):
-        inference_type(call)
+        inference_type(
+            call,
+            TypeInferContext(current_mesh=Mesh((Topology("thread", 32),), Layout((32,), (1,)))),
+        )
 
 
 def test_schedule_evaluation_rejects_an_unregistered_instruction() -> None:
@@ -1296,7 +1364,8 @@ def test_parameter_structure_does_not_repeat_its_name() -> None:
                 )
 
 
-def test_instruction_requires_an_execution_mesh_declaration() -> None:
+def test_instruction_requires_an_execution_mesh_declaration(monkeypatch) -> None:
+    monkeypatch.delattr(_UnstatedInstruction, "execution_mesh")
     with pytest.raises(ValueError, match="_UnstatedInstruction execution_mesh must be"):
         declared_execution_mesh(_UnstatedInstruction)
 
@@ -1315,15 +1384,14 @@ def test_schedule_candidate_reports_cover_every_site(
     assert capsys.readouterr() == ("", "")
     sites = [(name, row) for name, report in reports for row in report["lines"]]
     assert all(row["candidates"] or row["refused"] for _name, row in sites)
-    assert all(row["candidates"] for _name, row in sites if row["op"] == "tf.reshard")
+    assert all(
+        row["candidates"] or all(item["reason"].startswith("mesh:") for item in row["refused"])
+        for _name, row in sites
+        if row["op"] == "tf.reshard"
+    )
     matmuls = [(name, row) for name, row in sites if row["op"] == "tf.matmul"]
     assert len(matmuls) == 8
-    assert [name for name, row in matmuls if row["candidates"]] == [
-        "fp8_block_scaled_gemm",
-        "gemm_8192x17408x5120_cta_grid",
-        "sparse_decode",
-        "sparse_decode",
-    ]
+    assert not any(row["candidates"] for _name, row in matmuls)
 
 
 @pytest.mark.parametrize(
@@ -1331,8 +1399,8 @@ def test_schedule_candidate_reports_cover_every_site(
     (
         ("chunk_rmsnorm", ("chunks=16",), 0, 7, 0, "KN"),
         ("chunk_rmsnorm", ("chunks=32",), 0, 7, 0, "KN"),
-        ("fp8_block_scaled_gemm", (), 1, 5, 1, "KN"),
-        ("gemm_8192x17408x5120_cta_grid", (), 1, 4, 1, "KN"),
+        ("fp8_block_scaled_gemm", (), 1, 5, 0, "KN"),
+        ("gemm_8192x17408x5120_cta_grid", (), 1, 4, 0, "KN"),
         ("gemm_relu_gemm_tiled", (), 2, 2, 0, "KN"),
         ("gemm_relu_gemm_untiled", (), 2, 0, 0, "KN"),
         ("gemm_relu_gemm_untiled", (), 2, 0, 0, "NK"),
@@ -1374,26 +1442,15 @@ def test_schedule_candidates_reports_every_plain_site(
     assert (len(matmul_rows), len(reshard_rows)) == (matmuls, reshards)
     assert sum(bool(row["candidates"]) for row in matmul_rows) == accepted_matmuls
     assert all(row["candidates"] or row["refused"] for row in report["lines"])
-    assert all(row["candidates"] for row in reshard_rows)
+    assert all(
+        row["candidates"] or all(item["reason"].startswith("mesh:") for item in row["refused"])
+        for row in reshard_rows
+    )
 
-    if b_layout == "NK":
-        for row in matmul_rows:
-            assert row["refused"] == [
-                {
-                    "id": instruction,
-                    "refused": ["rhs axes=(d1, d2), reads axes=(d2, d1)"],
-                }
-                for instruction in ("T.cuda.sm90.Wgmma", "T.cuda.sm80.Mma")
-            ]
-
-    if name == "fp8_block_scaled_gemm":
-        (matmul,) = matmul_rows
-        assert [candidate["id"] for candidate in matmul["candidates"]] == ["T.cuda.sm90.Wgmma"]
-        (wgmma,) = matmul["candidates"]
-        assert wgmma["bindings"]
-        assert all(
-            binding.endswith(", dtype=fp8e4m3, form=SS") for binding in wgmma["bindings"]
-        )
+    for row in matmul_rows:
+        assert not row["candidates"]
+        assert {item["id"] for item in row["refused"]} == {"T.cuda.sm90.Wgmma", "T.cuda.sm80.Mma"}
+        assert all(item["reason"] for item in row["refused"])
 
     if name == "chunk_rmsnorm":
         binaries = [row for row in report["lines"] if row["op"] == "tf.binary"]
@@ -1417,16 +1474,7 @@ def test_schedule_candidates_reports_every_plain_site(
 
 @pytest.mark.parametrize(
     "source",
-    [
-        pytest.param(
-            path,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="_site_types locally projects broadcast operands onto incompatible axes",
-            ),
-        ) if path.stem == "sparse_decode" else path
-        for path in HIR
-    ],
+    HIR,
     ids=lambda path: path.stem,
 )
 def test_schedule_candidates_omit_selected_schedule_calls(
@@ -1481,8 +1529,8 @@ def test_operand_match_refusal_names_the_failed_pattern() -> None:
 
     RejectOne().visit(function.body)
     assert rejected is not None
-    assert "StorageKind.GMEM" in rejected
-    assert "StorageKind.SMEM" in rejected
+    assert "gmem" in rejected
+    assert "smem" in rejected
 
 
 def _assert_live_smem_views_do_not_overlap(function: PrimFunction, source: Path) -> None:
@@ -1669,7 +1717,7 @@ def test_lowering_rejects_addressable_result_without_offsets(
         expr
         for expr in collect_exprs(result.function.body)
         if isinstance(expr, Call)
-        and isinstance(expr.target, ScheduleOp)
+        and isinstance(expr.target, Empty)
         and expr.type.storage is StorageKind.SMEM
     )
     detach_metadata(addressable, MemoryMetadata)

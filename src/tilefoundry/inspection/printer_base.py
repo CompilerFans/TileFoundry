@@ -33,6 +33,7 @@ from tilefoundry.ir.types.dim import (
     DimMul,
     DimSub,
     DimVar,
+    is_dim_expr,
 )
 from tilefoundry.ir.types.layout import ComposedLayout, Layout, LayoutBase, Swizzle, flatten
 from tilefoundry.ir.types.mesh import Mesh
@@ -77,7 +78,9 @@ class PythonPrinter(PrinterBase, ExprFunctor[str], TypeFunctor[str]):
     def default_visit(self, value, ctx=None) -> str:
         if isinstance(value, bool):
             return repr(value)
-        if isinstance(value, (int, float)):
+        if isinstance(value, float):
+            return self.print(value, ctx)
+        if isinstance(value, int):
             return str(value)
         raise NotImplementedError(f"no Python visit routine for {type(value).__name__}")
 
@@ -131,7 +134,7 @@ class PythonPrinter(PrinterBase, ExprFunctor[str], TypeFunctor[str]):
         return value.name
 
     def visit_Constant(self, value: Constant, ctx=None) -> str:
-        return repr(value.value)
+        return self.print(value.value, ctx)
 
     def visit_Tuple(self, value: Tuple, ctx=None) -> str:
         rendered = ", ".join(self.visit(item, ctx) for item in value.elements)
@@ -402,12 +405,18 @@ class PythonPrinter(PrinterBase, ExprFunctor[str], TypeFunctor[str]):
             result += " | " + self.print(value.inner, ctx, self._indent)
         return result
 
-    def op_value(self, value: Op, ctx=None, indent: str = "") -> str:
-        """Render a schema-backed op value through its attribute values."""
-        schema = type(value)._op_schema
+    def op_attributes(
+        self,
+        value: Op,
+        ctx=None,
+        indent: str = "",
+        *,
+        suppressed: frozenset[str] = frozenset(),
+    ) -> list[str]:
+        """Render attribute ParamDefs in declaration order, omitting defaults."""
         attrs = []
-        for param in schema.signature:
-            if param.kind != "attribute":
+        for param in type(value)._op_schema.signature:
+            if param.kind != "attribute" or param.name in suppressed:
                 continue
             attr = getattr(value, param.name, None)
             if param.default is not MISSING and attr == param.default:
@@ -419,6 +428,11 @@ class PythonPrinter(PrinterBase, ExprFunctor[str], TypeFunctor[str]):
                     else self.print(attr, ctx, indent)
                 )
             attrs.append(f"{param.name}={rendered}")
+        return attrs
+
+    def op_value(self, value: Op, ctx=None, indent: str = "") -> str:
+        """Render a schema-backed op value through its attribute values."""
+        attrs = self.op_attributes(value, ctx, indent)
         return f"{op_identifier(type(value))}({', '.join(attrs)})"
 
     def visit_ComposedLayout(self, value: ComposedLayout, ctx=None) -> str:
@@ -471,6 +485,8 @@ class PythonPrinter(PrinterBase, ExprFunctor[str], TypeFunctor[str]):
         if isinstance(value, (TensorType, PointerType, Mesh, LayoutBase)):
             with self.type_surface(indent=indent):
                 return self.visit(value, ctx)
+        if not isinstance(value, enum.Enum) and is_dim_expr(value):
+            return self.visit(value, ctx)
         if isinstance(value, Op):
             return self.op_value(value, ctx, indent)
         if isinstance(value, Printable):

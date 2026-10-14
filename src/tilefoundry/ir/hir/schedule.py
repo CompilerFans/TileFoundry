@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from typing import Tuple
 
 import isl
 
 from tilefoundry.evaluator.registry import register_eval, schedule_eval_registry
 from tilefoundry.evaluator.value import EvalError
-from tilefoundry.ir.core import Call, Op, Var
+from tilefoundry.ir.core import Call, Op, Var, op_identifier
+from tilefoundry.ir.core.errors import VerifyError
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.pattern import (
@@ -18,9 +20,10 @@ from tilefoundry.ir.pattern import (
     is_ranked_tensor,
 )
 from tilefoundry.ir.pattern.utils import (
+    declared_execution_mesh,
     declared_shape,
-    declared_write_type,
     selected_pattern,
+    variants,
 )
 from tilefoundry.ir.types import TensorType, UnitType
 from tilefoundry.ir.types.shard_layout import shard_layout_of, split_target_axes
@@ -40,9 +43,45 @@ from tilefoundry.visitor_registry.access_relation import (
     register_access_relation,
     relations_of,
 )
-from tilefoundry.visitor_registry.contexts import Cost, TrafficBytes, VerifyContext
+from tilefoundry.visitor_registry.buffer_alias import register_buffer_alias
+from tilefoundry.visitor_registry.contexts import (
+    Cost,
+    TrafficBytes,
+    TypeInferContext,
+    VerifyContext,
+)
 from tilefoundry.visitor_registry.cost_utils import operation_cost
 from tilefoundry.visitor_registry.verify import verify_between
+
+
+@dataclass(frozen=True)
+class InstructionMatch:
+    """An accepted constructed instruction and its closed matcher's ordered bindings."""
+
+    op: Op
+    path: tuple[tuple[str, object], ...]
+
+
+class ScheduleRefusal(ValueError):
+    """An instruction's failed node and the bindings reached before that refusal."""
+
+    def __init__(self, reason, *, path=(), op=None):
+        self.reason = reason
+        self.path = tuple(path.items()) if isinstance(path, dict) else tuple(path)
+        atom = getattr(op, "atom", None)
+        declaration = (
+            atom if isinstance(atom, type) else type(atom) if atom is not None else type(op)
+        )
+        self.instruction = "" if op is None else op_identifier(declaration)
+        super().__init__(reason)
+
+    def __str__(self):
+        from tilefoundry.inspection.pattern_printer import PatternPrinter  # noqa: PLC0415
+
+        printer = PatternPrinter()
+        return printer.match_text(
+            self.instruction, printer.match_data((self.path,), self.reason)
+        ).lstrip()
 
 
 @register_op(dialect="tf", category="schedule", name="schedule")
@@ -53,7 +92,6 @@ class ScheduleOp(Op):
     op = ParamDef(kind="attribute", annotation=Op)
     repeat = ParamDef(kind="attribute", annotation=tuple, optional=True, default=None)
     order = ParamDef(kind="attribute", annotation=tuple, optional=True, default=None)
-    buffers = ParamDef(kind="attribute", annotation=int, default=1)
 
     def __init__(self, **attrs) -> None:
         super().__init__(**attrs)
@@ -66,8 +104,6 @@ class ScheduleOp(Op):
             not isinstance(self.order, tuple) or any(type(value) is not int for value in self.order)
         ):
             raise ValueError("schedule order must be a tuple of integer positions")
-        if type(self.buffers) is not int or self.buffers < 1:
-            raise ValueError("schedule buffers must be a positive integer")
 
 
 @register_eval(ScheduleOp)
@@ -104,10 +140,6 @@ def _operand_pattern(param: ParamDef, op: Op, bindings: dict) -> TensorPattern |
     return selected if isinstance(selected, TensorPattern) else None
 
 
-def _declared_shape(pattern: TensorPattern | None, bindings: dict) -> tuple | None:
-    return declared_shape(pattern, bindings)
-
-
 def _iteration_shape(relations: tuple[AccessRelation, ...]) -> tuple[int, ...]:
     space = iteration_universe(relations)
     if space is None:
@@ -117,7 +149,7 @@ def _iteration_shape(relations: tuple[AccessRelation, ...]) -> tuple[int, ...]:
     )
 
 
-def _instruction_schema(
+def instruction_schema(
     op: Op, operand_count: int | None = None
 ) -> tuple[tuple[ParamDef, ...], ...]:
     schema = getattr(type(op), "_op_schema", None)
@@ -127,52 +159,34 @@ def _instruction_schema(
     if any(param.effect is None for param in params):
         raise ValueError(f"{type(op).__name__} does not declare every operand's memory effect")
     if operand_count is not None:
-        required_reads = sum(
-            bool(param.effect & MemoryEffect.READ)
-            for param in params
-            if not param.optional
-        )
-        optional_reads = tuple(
-            param for param in params if param.optional and param.effect & MemoryEffect.READ
-        )
-        supplied_optional = operand_count - required_reads
-        included = {id(param) for param in optional_reads[: max(0, supplied_optional)]}
-        params = tuple(
-            param for param in params if not param.optional or id(param) in included
-        )
-    reads = tuple(param for param in params if param.effect & MemoryEffect.READ)
+        required = sum(not param.optional for param in params)
+        optional = tuple(param for param in params if param.optional)
+        supplied_optional = operand_count - required
+        included = {id(param) for param in optional[: max(0, supplied_optional)]}
+        params = tuple(param for param in params if not param.optional or id(param) in included)
     writes = tuple(param for param in params if param.effect & MemoryEffect.WRITE)
     if not writes:
         raise ValueError(f"{type(op).__name__} writes no result operand")
-    return params, reads, writes
+    return params, writes
 
 
-def _instruction_view(call: Call, ctx, *, fragments: bool = True):
+def _instruction_view(call: Call, ctx, *, fragments: bool = True, bindings=None):
     schedule = call.target
     op = schedule.op
-    params, reads, writes = _instruction_schema(op, len(call.args))
-    if len(call.args) != len(reads):
-        raise ValueError(f"{type(op).__name__} reads {len(reads)} operands, got {len(call.args)}")
-    bindings = dict(getattr(getattr(op, "atom", None), "bindings", {}))
-    patterns = tuple(_operand_pattern(param, op, bindings) for param in params)
-    whole = {param.name: ctx.type_of(arg) for param, arg in zip(reads, call.args, strict=True)}
-    if not all(isinstance(type_, TensorType) for type_ in whole.values()):
-        raise ValueError(f"{type(op).__name__} schedule operands must be tensors")
-    for param, pattern in zip(params, patterns, strict=True):
-        if param.effect == MemoryEffect.WRITE and pattern is None:
-            raise ValueError(
-                f"{type(op).__name__} {param.name} is write-only and declares no result shape"
-            )
-    whole_relations = operand_relations(
-        op, tuple(whole.get(param.name, UnitType()) for param in params)
+    params, writes = instruction_schema(op, len(call.args))
+    bindings = (
+        dict(getattr(getattr(op, "atom", None), "bindings", {}))
+        if bindings is None
+        else dict(bindings)
     )
+    patterns = tuple(_operand_pattern(param, op, bindings) for param in params)
+    whole = {param.name: ctx.type_of(arg) for param, arg in zip(params, call.args, strict=True)}
+    try:
+        whole_relations = operand_relations(op, tuple(whole[param.name] for param in params))
+    except ValueError as error:
+        raise ScheduleRefusal(str(error), path=bindings, op=op) from error
     whole_shape = _iteration_shape(whole_relations)
     operands = whole_relations[: len(params)]
-    read_boundaries = tuple(
-        boundary
-        for param, boundary in zip(params, operands, strict=True)
-        if param.effect & MemoryEffect.READ
-    )
     write_boundaries = tuple(
         boundary
         for param, boundary in zip(params, operands, strict=True)
@@ -182,7 +196,7 @@ def _instruction_view(call: Call, ctx, *, fragments: bool = True):
         *(involved_dims(boundary.relation) for boundary in write_boundaries)
     )
     if fragments and getattr(op, "atom", None) is None:
-        for type_, boundary in zip(whole.values(), read_boundaries, strict=True):
+        for type_, boundary in zip(whole.values(), operands, strict=True):
             layout = shard_layout_of(type_.layout)
             if layout is None:
                 continue
@@ -193,86 +207,81 @@ def _instruction_view(call: Call, ctx, *, fragments: bool = True):
             ):
                 fragments = False
                 break
-    outputs = {}
-    for param, pattern in zip(params, patterns, strict=True):
-        if param.effect & MemoryEffect.WRITE and not param.effect & MemoryEffect.READ:
-            outputs[param.name] = declared_write_type(
-                op,
-                param,
-                pattern,
-                whole,
-                ctx.current_mesh,
-                (*read_boundaries, write_boundaries[writes.index(param)]),
-                collapsed,
-            )
-    whole.update(outputs)
     whole_types = tuple(whole[param.name] for param in params)
     shapes = tuple(
-        _declared_shape(pattern, bindings) or tuple(type_.shape)
+        declared_shape(pattern, bindings) or tuple(type_.shape)
         for pattern, type_ in zip(patterns, whole_types, strict=True)
     )
     provisional = tuple(
         TensorType(shape, type_.dtype, type_.layout, type_.storage)
         for shape, type_ in zip(shapes, whole_types, strict=True)
     )
-    single = operand_relations(op, provisional)
+    try:
+        single = operand_relations(op, provisional)
+    except ValueError as error:
+        raise ScheduleRefusal(str(error), path=bindings, op=op) from error
     single_shape = _iteration_shape(single)
     if len(whole_shape) != len(single_shape):
-        raise ValueError("single-issue and scheduled iteration ranks differ")
+        raise ScheduleRefusal(
+            "single-issue and scheduled iteration ranks differ", path=bindings, op=op
+        )
     inferred = []
     for whole_extent, single_extent in zip(whole_shape, single_shape, strict=True):
         if single_extent < 1 or whole_extent % single_extent:
-            raise ValueError(
+            raise ScheduleRefusal(
                 f"iteration extent {whole_extent} is not divisible by "
-                f"single-issue extent {single_extent}"
+                f"single-issue extent {single_extent}",
+                path=bindings,
+                op=op,
             )
         inferred.append(whole_extent // single_extent)
     inferred = tuple(inferred)
     repeat = inferred if schedule.repeat is None else schedule.repeat
-    fixed = any(_declared_shape(pattern, bindings) is not None for pattern in patterns)
+    fixed = any(declared_shape(pattern, bindings) is not None for pattern in patterns)
     if not fixed and any(count != 1 for count in repeat):
-        raise ValueError("transfer tiling is not yet supported")
+        raise ScheduleRefusal("transfer tiling is not yet supported", path=bindings, op=op)
     if repeat != inferred:
-        raise ValueError(f"repeat {repeat} conflicts with inferred repeat {inferred}")
+        raise ScheduleRefusal(
+            f"repeat {repeat} conflicts with inferred repeat {inferred}", path=bindings, op=op
+        )
     order = tuple(range(len(repeat))) if schedule.order is None else schedule.order
     if sorted(order) != list(range(len(repeat))):
-        raise ValueError(f"order {order} is not a permutation of iteration dimensions")
-    participant = getattr(getattr(op, "atom", None), "required_execution_mesh", None)
-    read_args = dict(zip((param.name for param in reads), call.args, strict=True))
-    inner_types = (
-        tuple(
-            tile_inner_type(
-                (
-                    TensorType(
-                        type_.shape,
-                        type_.dtype,
-                        ctx.type_of(read_args[param.name]).layout,
-                        type_.storage,
-                    )
-                    if param.name in read_args
-                    else type_
-                ),
+        raise ScheduleRefusal(
+            f"order {order} is not a permutation of iteration dimensions", path=bindings, op=op
+        )
+    atom = getattr(op, "atom", None)
+    participant = (
+        atom.execution_mesh
+        if isinstance(atom, type)
+        else getattr(atom, "required_execution_mesh", None)
+    )
+    inner_types = []
+    for type_, shape, pattern, boundary in zip(
+        whole_types, shapes, patterns, single[: len(params)], strict=True
+    ):
+        if not fragments:
+            inner_types.append(TensorType(shape, type_.dtype, type_.layout, type_.storage))
+            continue
+        counts = tuple(1 if axis is None else repeat[axis] for axis in projected_axes(boundary))
+        shard_attrs = (
+            pattern.layout.attrs
+            if pattern is not None and isinstance(pattern.layout, ShardLayoutPattern)
+            else None
+        )
+        try:
+            inner = tile_inner_type(
+                type_,
                 shape,
-                counts=tuple(
-                    1 if axis is None else repeat[axis]
-                    for axis in projected_axes(boundary)
-                ),
+                counts=counts,
                 participant=participant,
                 enclosing=ctx.current_mesh,
-                shard_attrs=(
-                    pattern.layout.attrs
-                    if pattern is not None and isinstance(pattern.layout, ShardLayoutPattern)
-                    else None
-                ),
+                shard_attrs=shard_attrs,
             )
-            for param, type_, shape, pattern, boundary in zip(
-                params, whole_types, shapes, patterns, single[: len(params)], strict=True
-            )
-        )
-        if fragments
-        else provisional
-    )
-    return op, params, reads, writes, patterns, inner_types, repeat, order, single_shape
+        except ValueError as error:
+            raise ScheduleRefusal(str(error), path=bindings, op=op) from error
+        inner_types.append(inner)
+    inner_types = tuple(inner_types)
+    return op, params, writes, patterns, inner_types, repeat, order, single_shape
 
 
 def _outer_band(
@@ -315,18 +324,11 @@ def _outer_band(
 
 @register_access_relation(ScheduleOp)
 def _schedule_access_relation(call: Call, ctx) -> tuple[AccessRelation, ...]:
-    op, params, _reads, _writes, _patterns, inner, repeat, order, shape = _instruction_view(
+    op, params, _writes, _patterns, inner, repeat, order, shape = _instruction_view(
         call, ctx, fragments=False
     )
     scheduled = _outer_band(operand_relations(op, inner), repeat, order, shape)
-    return (
-        *(
-            boundary
-            for param, boundary in zip(params, scheduled[: len(params)], strict=True)
-            if param.effect & MemoryEffect.READ
-        ),
-        *scheduled[len(params) :],
-    )
+    return scheduled
 
 
 @register_cost_evaluator(ScheduleOp)
@@ -334,6 +336,7 @@ def _schedule_cost(call: Call, ctx) -> Cost:
     stated = relations_of(call, ctx)
     local = projected(stated, call, ctx)
     types = (*(ctx.local_type_of(arg) for arg in call.args), ctx.local_output_type(call))
+    params, writes = instruction_schema(call.target.op, len(call.args))
     moved = []
     for index, (type_, boundary) in enumerate(zip(types, local, strict=True)):
         if not isinstance(type_, TensorType):
@@ -343,10 +346,15 @@ def _schedule_cost(call: Call, ctx) -> Cost:
             raise ValueError(f"ScheduleOp boundary {index} has no finite traffic")
         amount = -(-(elements * type_.dtype.bit_width) // 8)
         moved.append(
-            TrafficBytes(write=amount) if index == len(call.args) else TrafficBytes(read=amount)
+            TrafficBytes(
+                read=amount
+                if index < len(params) and params[index].effect & MemoryEffect.READ
+                else 0,
+                write=amount
+                if index < len(params) and params[index].effect & MemoryEffect.WRITE
+                else 0,
+            )
         )
-    op = call.target.op
-    _params, reads, writes = _instruction_schema(op, len(call.args))
     if any(param.effect & MemoryEffect.READ for param in writes):
         iterations = cardinality(iteration_universe(local))
         if iterations is None:
@@ -354,7 +362,7 @@ def _schedule_cost(call: Call, ctx) -> Cost:
         dtype = next(
             (
                 type_.dtype
-                for param, type_ in zip(reads, types, strict=False)
+                for param, type_ in zip(params, types, strict=False)
                 if not param.effect & MemoryEffect.WRITE and isinstance(type_, TensorType)
             ),
             types[-1].dtype,
@@ -363,50 +371,242 @@ def _schedule_cost(call: Call, ctx) -> Cost:
     return Cost({}, tuple(moved))
 
 
-@register_typeinfer(ScheduleOp)
-def _infer_schedule(call: Call, ctx) -> TensorType:
-    try:
-        op, params, reads, writes, patterns, inner, _repeat, _order, _shape = _instruction_view(
-            call, ctx
-        )
-    except (TypeError, ValueError) as error:
-        ctx.error(call, str(error))
+def _pattern_refusal(matcher: PatternMatcher, op, parameter=None) -> ScheduleRefusal:
+    from tilefoundry.inspection.pattern_printer import PatternPrinter  # noqa: PLC0415
+
+    refusal = matcher.refusal
+    path = tuple((refusal.bindings if refusal is not None else matcher.bindings).items())
+    return ScheduleRefusal(PatternPrinter().refusal_reason(refusal, parameter), path=path, op=op)
+
+
+def _instruction_call(op, operand_types, mesh, *, repeat, order, scope):
+    args = tuple(
+        Var(name=f"operand{index}", type=type_) for index, type_ in enumerate(operand_types)
+    )
+    call = Call(ScheduleOp(op=op, repeat=repeat, order=order), args, type=UnitType())
+    ctx = TypeInferContext(
+        scope=scope,
+        current_mesh=mesh,
+        memo={id(arg): (arg, type_) for arg, type_ in zip(args, operand_types, strict=True)},
+    )
+    return call, ctx
+
+
+def _check_instruction(op, operand_types, mesh, *, repeat, order, scope, bindings):
+    matcher = PatternMatcher(
+        {**bindings, **dict(getattr(getattr(op, "atom", None), "bindings", {}))}
+    )
+    call, ctx = _instruction_call(op, operand_types, mesh, repeat=repeat, order=order, scope=scope)
+    op, params, _writes, patterns, inner, _repeat, _order, _shape = _instruction_view(
+        call, ctx, bindings=matcher.bindings
+    )
     handler = verify_stmt_registry.lookup(type(op))
     if handler is None:
-        ctx.error(call, f"{type(op).__name__} has no registered verifier")
-    bindings = dict(getattr(getattr(op, "atom", None), "bindings", {}))
-    matcher = PatternMatcher(bindings)
-    for param, pattern, type_ in zip(params, patterns, inner, strict=True):
-        if pattern is None or matcher.match(pattern, type_):
-            continue
-        from tilefoundry.inspection.pattern_printer import PatternPrinter  # noqa: PLC0415
-
-        ctx.error(
-            call,
-            f"{type(op).__name__} {param.name} single-issue tile does not match: "
-            f"{PatternPrinter().refusal(matcher.refusal)}",
+        raise ScheduleRefusal(
+            f"{type(op).__name__} has no registered verifier", path=matcher.bindings, op=op
         )
+    for param, pattern, type_ in zip(params, patterns, inner, strict=True):
+        if pattern is not None and not matcher.match(pattern, type_):
+            raise _pattern_refusal(matcher, op, param.name)
     if not matcher.solve():
-        from tilefoundry.inspection.pattern_printer import PatternPrinter  # noqa: PLC0415
-
-        ctx.error(call, PatternPrinter().refusal(matcher.refusal))
+        raise _pattern_refusal(matcher, op)
     args = tuple(
         Var(name=param.name, type=type_) for param, type_ in zip(params, inner, strict=True)
     )
     target_call = Call(target=op, args=args, type=UnitType())
     frames = tuple(layout.mesh for type_ in inner if hasattr((layout := type_.layout), "mesh"))
     verify_ctx = VerifyContext(
-        scope=ctx.scope,
-        current_mesh=ctx.current_mesh,
+        scope=scope,
+        current_mesh=mesh,
         memo={id(arg): (arg, type_) for arg, type_ in zip(args, inner, strict=True)},
-        mesh_scope=frames[:1] or (() if ctx.current_mesh is None else (ctx.current_mesh,)),
+        mesh_scope=frames[:1] or (() if mesh is None else (mesh,)),
     )
-    handler(target_call, verify_ctx)
-    verify_between(target_call, verify_ctx)
-    result = writes[0]
-    if result.effect & MemoryEffect.READ:
-        return ctx.type_of(call.args[reads.index(result)])
-    return inner[params.index(result)]
+    try:
+        handler(target_call, verify_ctx)
+        verify_between(target_call, verify_ctx)
+    except VerifyError as error:
+        raise ScheduleRefusal(str(error), path=matcher.bindings, op=op) from error
+    return InstructionMatch(op, tuple(matcher.bindings.items()))
 
 
-__all__ = ["ScheduleOp", "operand_relations"]
+def match_instruction(
+    op_type, attributes, operand_types, mesh, *, scope, repeat=None, order=None
+) -> tuple[InstructionMatch, ...]:
+    """Return every instruction instance implementing these types and execution scope.
+
+    Read layout forks for each projectable tile, then validate the constructed
+    instance with the same closed-instruction checks.
+    """
+    op = op_type(**attributes)
+    params, _writes = instruction_schema(op, len(operand_types))
+    if len(params) != len(operand_types):
+        raise ScheduleRefusal(
+            f"{op_type.__name__} expects operands {tuple(param.name for param in params)}, got {len(operand_types)}",
+            op=op,
+        )
+    if not all(isinstance(type_, TensorType) for type_ in operand_types):
+        raise ScheduleRefusal(f"{op_type.__name__} schedule operands must be tensors", op=op)
+    atom = getattr(op, "atom", None)
+    initial = {} if isinstance(atom, type) else dict(getattr(atom, "bindings", {}))
+    matcher = PatternMatcher(initial)
+    if not matcher.match(declared_execution_mesh(op), mesh):
+        raise _pattern_refusal(matcher, op, "mesh")
+    from tilefoundry.visitor_registry.typeinfer import input_scope_refusal  # noqa: PLC0415
+
+    refusal = input_scope_refusal(operand_types, mesh)
+    if refusal is not None:
+        raise ScheduleRefusal(refusal, path=matcher.bindings, op=op)
+    initial = dict(matcher.bindings)
+    patterns = tuple(_operand_pattern(param, op, initial) for param in params)
+    for field in ("dtype", "storage"):
+        matcher = PatternMatcher(initial)
+        for param, pattern, type_ in zip(params, patterns, operand_types, strict=True):
+            if pattern is None:
+                continue
+            fields = replace(
+                pattern,
+                shape=None,
+                layout=None,
+                predicates=(),
+                storage=None if field == "dtype" else pattern.storage,
+            )
+            if not matcher.match(fields, type_):
+                raise _pattern_refusal(matcher, op, param.name)
+    if not isinstance(atom, type):
+        return (
+            _check_instruction(
+                op,
+                operand_types,
+                mesh,
+                repeat=repeat,
+                order=order,
+                scope=scope,
+                bindings=matcher.bindings,
+            ),
+        )
+    atom_param = next(param for param in op_type._op_schema.signature if param.name == "atom")
+    if atom not in atom_param.pattern.declarations:
+        raise ScheduleRefusal(
+            f"{atom.__name__} is not a declared atom of {op_type.__name__}",
+            path=matcher.bindings,
+            op=op,
+        )
+    bindings = dict(matcher.bindings)
+    integers = tuple(
+        param for param in atom.parameters if param.annotation is int and param.name not in bindings
+    )
+    largest = max(
+        (extent for type_ in operand_types for extent in type_.shape if type(extent) is int),
+        default=1,
+    )
+    choices = variants(
+        integers, vary_defaulted=True, values=lambda param: tuple(range(1, largest + 1))
+    )
+    choices = tuple(sorted(choices, key=lambda state: tuple(state.values()), reverse=True))
+    call, ctx = _instruction_call(op, operand_types, mesh, repeat=repeat, order=order, scope=scope)
+    first_refusal = None
+    tile_refusal = None
+    divisible_seen = False
+    tile_choices = []
+    for choice in choices:
+        bound = {**bindings, **choice}
+        try:
+            _instruction_view(call, ctx, fragments=False, bindings=bound)
+        except ScheduleRefusal as error:
+            first_refusal = first_refusal or error
+            continue
+        try:
+            view = _instruction_view(call, ctx, bindings=bound)
+        except ScheduleRefusal as error:
+            if not divisible_seen:
+                tile_refusal = error
+            divisible_seen = True
+            continue
+        divisible_seen = True
+        tile_choices.append((choice, view))
+    if not tile_choices:
+        raise (
+            tile_refusal
+            or first_refusal
+            or ScheduleRefusal(
+                f"{atom.reference_name} has no admitted tile parameters", path=bindings, op=op
+            )
+        )
+    parameters = {param.name for param in atom.parameters}
+    integer_names = {param.name for param in integers}
+    accepted = []
+    refusal = None
+    for choice, (_op, _params, _writes, patterns, inner, _repeat, _order, _shape) in tile_choices:
+        matcher = PatternMatcher({**bindings, **choice})
+        try:
+            for param, pattern, type_ in zip(params, patterns, inner, strict=True):
+                if (
+                    pattern is not None
+                    and pattern.layout is not None
+                    and not matcher.match(pattern.layout, type_.layout)
+                ):
+                    raise _pattern_refusal(matcher, op, param.name)
+            if not matcher.solve():
+                raise _pattern_refusal(matcher, op)
+            solved = {
+                name: value
+                for name, value in matcher.bindings.items()
+                if name in parameters and name not in integer_names
+            }
+            instance = op_type(**{**attributes, "atom": atom(**{**solved, **choice})})
+            matched = _check_instruction(
+                instance,
+                operand_types,
+                mesh,
+                repeat=repeat,
+                order=order,
+                scope=scope,
+                bindings=matcher.bindings,
+            )
+        except ScheduleRefusal as error:
+            refusal = refusal or error
+        else:
+            accepted.append(matched)
+    if not accepted:
+        raise refusal
+    return tuple(accepted)
+
+
+@register_typeinfer(ScheduleOp)
+def _infer_schedule(call: Call, ctx) -> TensorType:
+    op = call.target.op
+    attributes = {
+        param.name: getattr(op, param.name)
+        for param in type(op)._op_schema.signature
+        if param.kind == "attribute"
+    }
+    try:
+        match_instruction(
+            type(op),
+            attributes,
+            tuple(ctx.type_of(arg) for arg in call.args),
+            ctx.current_mesh,
+            scope=ctx.scope,
+            repeat=call.target.repeat,
+            order=call.target.order,
+        )
+    except ScheduleRefusal as error:
+        ctx.error(call, str(error))
+    params, writes = instruction_schema(op, len(call.args))
+    return ctx.type_of(call.args[params.index(writes[0])])
+
+
+@register_buffer_alias(ScheduleOp)
+def _schedule_result_operand(call: Call) -> int:
+    params, writes = instruction_schema(call.target.op, len(call.args))
+    return params.index(writes[0])
+
+
+__all__ = [
+    "ScheduleOp",
+    "ScheduleRefusal",
+    "InstructionMatch",
+    "instruction_schema",
+    "match_instruction",
+    "operand_relations",
+]

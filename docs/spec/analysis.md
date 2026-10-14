@@ -1,12 +1,19 @@
 # TileFoundry Spec — analysis (authored-HIR metrics + per-stage target facts)
 
 This spec owns TileFoundry's fact layer: everything a later stage decides
-*over*, and nothing that decides anything itself. It has two surfaces:
+*over*, and nothing that decides anything itself. It has three surfaces:
 
 | Surface | Entry | What it states |
 |---|---|---|
 | Program check | `check_program(module, function, topology_level=..., budget=..., analyzers=...)` | an inlined Function view after validating one authored program, its declared topology, and what each requested analysis needs of it |
+| Iteration context | `build_iteration_scopes(module, function, topology_level=..., dims=..., analyzers=(), options=None)` | an `AnalyzeContext` with resolved execution module and bound root/current scopes, without running an analysis family |
 | Composed measurement | `analyze(module, function, analysis=...)` | one or more root analyses and their union dependency closure, leaving typed Metadata on the IR |
+
+`build_iteration_scopes` resolves dimensions, runs `check_program` with the
+supplied analyzer checkers, and builds the scopes. Its `module` is the execution
+module after binding dimensions. `analyze` passes its dependency closure and
+options through this same entry; its `AnalysisResult.module` remains the
+caller's module.
 
 Per-Op semantic derivation — typeinfer, the forward access relation, shard
 propagation — is owned by [semantic-analysis](./semantic-analysis.md), and the
@@ -314,12 +321,9 @@ class Traffic:
 Every traffic amount is what a boundary's own relation reaches. The Op's
 evaluator says which way each boundary moves and whether it materialises
 anything; it does not say how much, and an Op with no relation fails closed.
-When a boundary axis's coordinate is determined by data (`reached_at`'s `free`
-axes), that boundary is a lookup. Its movement MUST be capped at the number of
-domain coordinates when countable: each coordinate selects at most one element
-from the possible image. If the domain count is unknown, the countable image
-remains the movement upper bound. The footprint MUST retain the full possible
-image. Out-of-bounds
+Movement and footprint counting for data-dependent lookup boundaries follow
+[visitor-registry §4.1](./visitor-registry.md#41-access-relation-service--access_relation).
+Footprint retains the full possible address image for reuse decisions. Out-of-bounds
 IndexSelect indices with `fill_value` are not statically distinguished; traffic
 counts one slice per index as an upper bound.
 
@@ -406,6 +410,8 @@ class Footprint:
 | `RegionMemoryMetadata.footprint` | The union of every Call's reached addresses below the Function in `logical`. For `total`, group Calls by their enclosing loop/mesh chain, union each group per buffer, multiply by its waves and every enclosing loop's trips, and sum the groups. Absent when no wave can be stated. | As above |
 
 - constraints:
+  - May-access footprint counting MUST follow the cap stated in
+    [visitor-registry §4.1](./visitor-registry.md#41-access-relation-service--access_relation).
   - Overlapping ranges into one buffer MUST be unioned before they are counted,
     and the byte count MUST be `ceil(elements * dtype.bit_width / 8)`.
   - Both directions contribute: a load and a store to that level each occupy the
@@ -1496,6 +1502,10 @@ evidence through the same completeness rules as other refused or missing
 boundaries. A mesh scope adds no
 iteration dimension: it keeps its parent's depth and domain, so the first
 `depth` input dimensions of an access relation remain the enclosing loops.
+`IterationScope.execution_mesh()` composes all enclosing MeshRegion meshes
+from outer to inner, matching type inference's current mesh.
+`enclosing_mesh()` returns only the nearest region's mesh.
+
 `IterationScope.domain` is the accumulated authored loop domain;
 `IterationScope.accesses` and `IterationScope.refused` are the shared family
 inputs for movement and footprint conclusions.

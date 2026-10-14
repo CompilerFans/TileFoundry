@@ -692,9 +692,14 @@ pattern node that owns them, so a failed formula can reject an alternative.
 Only unresolved formulas are deferred; after structural matching they are
 compiled into one OR-Tools CP-SAT model. An infeasible model is a mismatch,
 while an `UNKNOWN` solver result remains explicitly unknown rather than being
-reported as false. A refusal records the first failed pattern, its subject,
+reported as false. A refusal records the failed pattern, its subject,
 and a snapshot of the bindings; inspection decides how to render that
-evidence. The hand-written predicates in
+evidence. `TensorPattern` matches fields in the order dtype, storage, shape,
+then layout. When an unbound `SwitchPattern` rejects every branch, the refusal
+records that switch itself rather than a failed pattern inside one branch.
+Structural refusals render the subject and pattern; predicate refusals render
+the predicate that actually failed, including the false conjunct of a formula.
+The hand-written predicates in
 `predicates.py` read the layout itself, including its coalesced runs and
 algebraic properties; `Formula` predicates instead read names bound by
 structural patterns.
@@ -725,7 +730,10 @@ patterns.
 `MeshPattern` rejects any supplied arrangement predicate that exposes
 `per_mode=False`, because each mesh level uses its own numbering space; an
 empty predicate table is allowed. It never changes the supplied pattern
-implicitly.
+implicitly. Predicates on a surrounding `ComposedLayoutPattern` instead
+check the whole matched layout. Execution-mesh declarations may admit leading
+modes with `StarPattern`; operand mesh declarations keep their exact axis
+structure because shard attrs refer to those axes.
 `ShardLayoutPattern` names the same `layout`, `attrs`, and `mesh` fields as
 `ShardLayout`: `layout` and `mesh` are nested patterns, while `attrs` remains
 an exact structural value. Its mesh pattern may use the bare/composed identity

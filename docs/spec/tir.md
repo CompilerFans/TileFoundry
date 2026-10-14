@@ -161,6 +161,9 @@ class PrimFunction(Stmt):
     target: Target = field(default_factory=default_target)
 ```
 
+The DSL spelling `prim_func(output_count=N)` records the trailing output
+parameters; omitting it means one output.
+
 - constraints:
   - itself a `Stmt`, not a separate top-level node; returns no value.
     `verify_prim_function` enforces the rules below.
@@ -570,8 +573,7 @@ class Copy(Op):
     relation walks `src` and reaches `dst` at the row-major reshape of each
     coordinate.
   - `execution_mesh` is the mesh declaration shared by every rmem operand's
-    `ShardLayoutPattern.mesh`. `rmem_layout` and `smem_layout` optionally state
-    the author's landing arrangements.
+    `ShardLayoutPattern.mesh`.
 
 ##### Fill
 ```python
@@ -1048,6 +1050,11 @@ T.tiled_mma(acc, lhs, rhs, atom=T.cuda.sm80.Mma())
 - `rhs` MUST match `atom.role("B")` and is read-only.
 - A, B, and C shapes MUST be `(M,K)`, `(K,N)`, and `(M,N)` respectively;
   operands MUST use the atom's declared dtypes and fragment arrangements.
+- `TiledMma` generates its execution-mesh declaration from the atom's lane
+  shape and strides, preceded by zero or more group modes captured by
+  `StarPattern`. The whole matched layout MUST be forward and injective,
+  and its offset MUST be aligned to the atom's participant count. Operand
+  meshes retain the atom's exact lane axes.
 - The active physical mesh MUST satisfy `atom.execution_mesh_pattern()`. If the atom
   carries `mesh=...`, its affine offset and ordered lanes MUST equal the active
   frame.
@@ -1076,14 +1083,12 @@ class CopyAsync(Op):
         dst: input; smem staging destination.
         index: optional third positional input; rank-1 i32/i64 row indices.
         fill: attribute; optional out-of-range row value.
-        smem_layout: attribute; optional landing arrangement.
     """
 
     src: Tensor
     dst: Tensor
     index: Tensor | None = None
     fill: float | None = None
-    smem_layout: Layout | None = None
     execution_mesh: MeshPattern
 ```
 - constraints:
@@ -1204,7 +1209,6 @@ landed in shared memory, rather than carrying an explicit mbarrier operand.
 class CopyAsyncTensor(Op):
     src: Tensor
     dst: Tensor
-    smem_layout: Layout | None = None
     execution_mesh: Mesh | None = None
 ```
 
@@ -1214,7 +1218,9 @@ class CopyAsyncTensor(Op):
     with one contiguous mode and every other byte stride a multiple of 16.
     The shared end is an at-most-five-dimensional box, each extent at most
     256, optionally using a 32-, 64-, or 128-byte TMA swizzle.
-  - Both ends walk the same tile modes. The execution mesh is one aligned warp.
+  - Both ends walk the same tile modes. The execution mesh is one aligned warp,
+    preceded by zero or more size-one modes with arbitrary strides. The whole
+    matched layout MUST be forward and injective; its offset is a multiple of 32.
   - The declaration requires the target's `tma` capability. CUDA codegen MUST
     reject it until host-encoded tensor-map construction exists; this stage
     does not silently lower it to another copy instruction.
@@ -1234,8 +1240,7 @@ class LdMatrix(Op):
     agree under the ordinary `Copy` verifier.
   - One canonical SM80 warp issues the operation. It requires the target's
     `tensor_core` capability and lowers to `tilefoundry::ops::ldmatrix`.
-  - The destination layout is the atom's declaration, not a caller-selectable
-    `rmem_layout` attribute.
+  - The destination layout is the atom's declaration.
 
 #### Barrier object Ops (`tir.sync.mbarrier_*`)
 

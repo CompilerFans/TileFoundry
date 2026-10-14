@@ -37,6 +37,7 @@ from tilefoundry.ir.hir.tensor.bitcast import Bitcast
 from tilefoundry.ir.hir.tensor.cache_update import CacheUpdate
 from tilefoundry.ir.hir.tensor.cast import Cast
 from tilefoundry.ir.hir.tensor.concat import Concat
+from tilefoundry.ir.hir.tensor.empty import Empty
 from tilefoundry.ir.hir.tensor.full_like import FullLike
 from tilefoundry.ir.hir.tensor.index_add import IndexAdd
 from tilefoundry.ir.hir.tensor.index_copy import IndexCopy
@@ -485,6 +486,12 @@ def _zeros(call: Call, ctx: CostContext) -> Cost:
     """Materialise a tensor of zeros: no arithmetic, one full write."""
     output = output_type(call, ctx)
     return Cost({}, (TrafficBytes(write=tensor_bytes(output)),))
+
+
+@register_cost_evaluator(Empty)
+def _empty(call: Call, ctx: CostContext) -> Cost:
+    """Storage declarations perform no arithmetic or memory traffic."""
+    return Cost({}, idle(call))
 
 
 @register_cost_evaluator(RepeatInterleave)

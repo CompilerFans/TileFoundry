@@ -14,7 +14,9 @@ from tilefoundry.ir.pattern import (
     DistinctConstraint,
     LayoutPattern,
     MeshPattern,
+    OrPattern,
     SameModesConstraint,
+    StarPattern,
     SwitchPattern,
     SwizzlePattern,
     WildcardPattern,
@@ -23,7 +25,7 @@ from tilefoundry.ir.pattern import (
 from tilefoundry.ir.pattern import (
     predicates as P,
 )
-from tilefoundry.ir.types import Layout, Mesh, Swizzle, UnitType
+from tilefoundry.ir.types import Mesh, Swizzle, UnitType
 from tilefoundry.ir.types.storage import StorageKind as S
 from tilefoundry.visitor_registry import register_typeinfer, register_verify_stmt
 from tilefoundry.visitor_registry.access_relation import (
@@ -134,15 +136,14 @@ def TmaOperandPattern(storage: str, dtype: str) -> SwitchPattern:
 
 def _warp_scope() -> MeshPattern:
     layout = LayoutPattern(
-        ((32,),),
-        ((1,),),
-        predicates=(P.Forward(per_mode=True), P.Injective(per_mode=True)),
+        ((StarPattern(OrPattern(1)), 32),),
+        ((StarPattern(WildcardPattern()), 1),),
     )
     sliced = ComposedLayoutPattern(
         inner=None,
         offset=WildcardPattern("p0"),
         outer=layout,
-        predicates=(WildcardPattern("p0") % 32 == 0,),
+        predicates=(WildcardPattern("p0") % 32 == 0, P.Forward(), P.Injective()),
     )
     return MeshPattern(("thread",), sliced)
 
@@ -175,12 +176,6 @@ class CopyAsyncTensor(Op):
     between = (
         DistinctConstraint("storage", "src", "dst"),
         SameModesConstraint("src", "dst"),
-    )
-    smem_layout = ParamDef(
-        kind="attribute",
-        annotation=Layout,
-        optional=True,
-        default=None,
     )
     execution_mesh = ParamDef(
         kind="attribute",

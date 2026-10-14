@@ -437,6 +437,25 @@ shard attrs, and holder mesh. Instruction declarations call the reserved field
 `execution mesh` everywhere, including the standalone facts field and the
 declaration attributes section.
 
+A refusal at a `SwitchPattern` reports its parameter name, actual subject,
+and declared branch values: `param has no matching branch for subject;
+branches: value, ...`. It does not report a predicate from a rejected branch.
+
+Instruction reports use `match_data(paths, reason="")` and
+`match_text(identifier, data)`. JSON provides `path`, an ordered list of
+`{"name": ..., "value": ...}` entries, and `reason`. Values are printable strings.
+All accepted paths merge by the first occurrence of each name; distinct values
+join with `|`. Parameters and internal pattern captures receive the same
+format. The text starts with the instruction identifier, then two spaces and
+`name=value` entries separated by `, `. A refusal places its
+`<parameter>: <failed-node text>` reason on the next indented line. A successful
+candidate has an empty reason. Type inference uses the same rendering.
+Refusal subjects use the same DSL notation as the report operands; dtype and
+storage values use their surface names. Structural patterns use that notation
+as well, rather than mixing Python repr with DSL text.
+Standalone `refusal` renders the path and reason without an instruction id;
+the former `reason (bindings)` spelling is removed.
+
 This report printer is separate from `PythonPrinter`: it does not inherit the
 round-trip source printer, request import or mesh-name registration, or accept
 a `PrintContext`. Pattern IR produces no text; verification may import this
