@@ -6,20 +6,21 @@ orchestration methods. See [core-ir §1](docs/spec/core-ir.md#1-module).
 
 from __future__ import annotations
 
-import copy
 import types
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field
 from dataclasses import replace as _replace
 from typing import Mapping, Union
 
 from tilefoundry import evaluator
 from tilefoundry.evaluator.interpreter import _run_bound
 from tilefoundry.evaluator.value import tensor_type_of
+from tilefoundry.ir.core.expr import Expr
 from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.ir.tir.prim_function import PrimFunction
+from tilefoundry.ir.types.callable_type import callable_type_for
 from tilefoundry.ir.types.mesh import Topology
 from tilefoundry.ir.types.substitute import canonicalize_topology_dims
-from tilefoundry.ir.types.tensor_type import TensorType
+from tilefoundry.ir.types.tensor_type import TensorType, TupleType, UnitType
 from tilefoundry.ir.types.utils import types_compatible
 from tilefoundry.target.base import Target, target_instance
 
@@ -30,114 +31,95 @@ _MISSING_PREPARED_WEIGHT = (
 )
 
 
-def subtree(root: "Module"):
-    """*root* and every Module below it, owners before the children they hold."""
-    yield root
-    for child in root.modules:
-        yield from subtree(child)
+@dataclass(eq=False, init=False)
+class ModuleList(Expr):
+    """An instance slot holding shared definitions, with a lazily projected type.
 
-
-def module_functions(root: "Module") -> tuple[ModuleFunction, ...]:
-    """Return every function owned by *root* or one of its descendants."""
-    return tuple(function for node in subtree(root) for function in node.functions)
-
-
-def owning_module(root: "Module", function: object) -> "Module | None":
-    """The one node of *root*'s subtree that owns *function*, else ``None``.
-
-    A Function carries no execution context and one object is reachable from
-    more than one program, so the question is asked within a supplied tree. It
-    is answered by identity and by recorded origin, never by a name a copy
-    keeps. None covers both no owner and more than one: an unanswerable
-    question states nothing rather than defaulting to the root.
+    ``ModuleList(definition)`` is a single slot; a count or a tuple makes an
+    indexed slot. Its key is assigned when the slot enters ``Module.children``.
     """
-    found: "Module | None" = None
-    for node in subtree(root):
-        if node.owns(function, derived=True):
-            if found is not None:
-                return None
-            found = node
-    return found
 
+    key: str | None
+    elements: tuple[Module | type[RuntimeModule], ...]
+    indexed: bool
 
-def child_module_of(root: "Module", caller: object, callee: object) -> "Module | None":
-    """The direct child of *caller*'s owner that owns *callee*, else ``None``.
+    __hash__ = object.__hash__
+    __eq__ = object.__eq__
 
-    What a collected call no longer carries: the parser's binding record is
-    consumed, so which calls supply activations alone is re-derived from
-    ownership within *root*. It fails closed -- a same-owner call, and one
-    whose ends no single node owns, keeps its exact declared arity.
-    """
-    if not isinstance(callee, HirFunction) or caller is None:
-        return None
-    owner = owning_module(root, caller)
-    called = owning_module(root, callee)
-    if owner is None or called is None or called is owner:
-        return None
-    return called if any(child is called for child in owner.modules) else None
+    def __init__(self, definition, count=MISSING):
+        if count is not MISSING:
+            if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                raise ValueError("ModuleList count must be a positive integer")
+            elements = (definition,) * count
+            indexed = True
+        elif isinstance(definition, tuple):
+            elements = definition
+            indexed = True
+        else:
+            elements = (definition,)
+            indexed = False
+        if not elements:
+            raise TypeError("ModuleList requires a Module or a non-empty tuple of Modules")
+        if not all(isinstance(element, Module) for element in elements):
+            from tilefoundry.runtime.module import RuntimeModule  # noqa: PLC0415
 
+            if not all(
+                isinstance(element, type) and issubclass(element, RuntimeModule)
+                for element in elements
+            ):
+                raise TypeError("ModuleList requires Modules or runtime module classes")
+        self.key = None
+        self.elements = elements
+        self.indexed = indexed
+        self.metadata = ()
 
-def called_functions(function: HirFunction) -> tuple[HirFunction, ...]:
-    """Every HIR Function called directly by *function*, in definition order."""
-    from tilefoundry.ir.core.expr import Call  # noqa: PLC0415 -- cycle
-    from tilefoundry.ir.visitor import collect_exprs  # noqa: PLC0415 -- cycle
+    def __repr__(self) -> str:
+        """Describe the slot without projecting types or expanding definitions."""
+        names = []
+        start = 0
+        while start < len(self.elements):
+            element = self.elements[start]
+            stop = start + 1
+            while stop < len(self.elements) and self.elements[stop] is element:
+                stop += 1
+            count = stop - start
+            name = element.__name__ if isinstance(element, type) else element.name
+            names.append(f"{name}*{count}" if count > 1 else name)
+            start = stop
+        elements = ", ".join(names) + ("," if len(names) == 1 else "")
+        return f"ModuleList(key={self.key!r}, indexed={self.indexed}, elements=({elements}))"
 
-    return tuple(
-        expr.target
-        for expr in collect_exprs(function.body)
-        if isinstance(expr, Call) and isinstance(expr.target, HirFunction)
-    )
+    @property
+    def type(self):
+        signatures = tuple(
+            callable_type_for(
+                (param for param in entry.params if not param.is_const),
+                UnitType() if isinstance(entry, PrimFunction) else entry.return_type
+            )
+            for entry in (element.entry_function() for element in self.elements)
+        )
+        return TupleType(signatures) if self.indexed else signatures[0]
 
+    @type.setter
+    def type(self, value):
+        """Keep the definition-derived signature independent of inferred stamps."""
+        pass
 
-def reachable_functions(root: HirFunction) -> tuple[HirFunction, ...]:
-    """*root* and every HIR Function it calls, callers before callees."""
-    reached: list[HirFunction] = []
-    seen: set[int] = set()
+    def bind(self, key: str) -> None:
+        if self.key is not None and self.key != key:
+            raise ValueError(
+                f"ModuleList is already in slot {self.key!r}; cannot also use slot {key!r}"
+            )
+        self.key = key
 
-    def visit(function: HirFunction) -> None:
-        if id(function) in seen:
-            return
-        seen.add(id(function))
-        reached.append(function)
-        for callee in called_functions(function):
-            visit(callee)
+    def __len__(self):
+        return len(self.elements)
 
-    visit(root)
-    return tuple(reached)
+    def __iter__(self):
+        return iter(self.elements)
 
-
-def _refuse_bare_call(module: "Module", kind: str) -> None:
-    """Refuse bare call.
-
-    Refuse a bare call on a *kind* whose *module* has no default entry, naming
-    what to call instead.
-    """
-    if module.entry is not None:
-        return
-    named = sorted({fn.name for fn in module.functions} | set(module.methods))
-    raise TypeError(
-        f"{kind} {module.name!r} has no entry, so it has no default step; "
-        f"call one by name" + (f" -- {', '.join(named)}" if named else "")
-    )
-
-
-def _owned_by(child: "Module", parent: "Module") -> "Module":
-    """*child* linked back to *parent* as its owner.
-
-    An unowned child is claimed in place, so the authored tree keeps the very
-    objects its class body produced. A child that already belongs to another
-    owner is claimed as a copy instead: the two owners may resolve different
-    effective context, and re-pointing the original would silently change what
-    the first owner's subtree answers.
-    """
-    owner = child._parent
-    if owner is None or owner is parent:
-        child._parent = parent
-        return child
-    clone = copy.copy(child)
-    clone.modules = tuple(_owned_by(node, clone) for node in child.modules)
-    clone._parent = parent
-    return clone
+    def __getitem__(self, index):
+        return self.elements[index]
 
 
 @dataclass(unsafe_hash=True)
@@ -146,27 +128,26 @@ class Module:
 
     A Module is also the execution domain of the functions it owns: it carries
     the hardware ``target`` and the ordered ``topologies`` budget those
-    functions run against. ``topologies=None`` declares nothing and inherits
-    from the owning Module; ``topologies=()`` declares a topology-free Module.
+    functions run against. ``topologies=None`` inherits from the caller's
+    CallFrame; ``topologies=()`` declares a topology-free Module.
     """
 
     name: str = field(hash=False)
     functions: tuple[ModuleFunction, ...]
 
     entry: str | None = None
-    modules: tuple["Module", ...] = field(default_factory=tuple, hash=False)
+    children: dict[str, ModuleList] = field(default_factory=dict, hash=False)
     target: Target | None = None
     topologies: tuple[Topology, ...] | None = field(default=None, hash=False)
     metadata: dict[str, object] = field(default_factory=dict, hash=False)
     methods: Mapping[str, object] = field(default_factory=dict, hash=False)
-    _parent: "Module | None" = field(default=None, compare=False, hash=False, repr=False)
 
     def __post_init__(self) -> None:
         """Post init.
 
         Seal each function against further authoring mutation, reject a
         name shared by two of functions / modules / methods, validate the
-        declared execution context, and link each child to this owner.
+        declared execution context, and assign each instance slot its key.
         """
         if self.target is not None:
             target_instance(self.target)
@@ -174,7 +155,7 @@ class Module:
             seal = getattr(fn, "seal", None)
             if callable(seal):
                 seal()
-        clash = sorted({fn.name for fn in self.functions} & {m.name for m in self.modules})
+        clash = sorted({fn.name for fn in self.functions} & set(self.children))
         if clash:
             raise ValueError(
                 f"Module {self.name!r}: name(s) {clash} used by both a "
@@ -182,7 +163,7 @@ class Module:
             )
         method_clash = sorted(
             set(self.methods)
-            & ({fn.name for fn in self.functions} | {m.name for m in self.modules})
+            & ({fn.name for fn in self.functions} | set(self.children))
         )
         if method_clash:
             raise ValueError(
@@ -200,54 +181,26 @@ class Module:
                     f"Module {self.name!r}: duplicate topology name(s) {dupes}; "
                     f"one name must map to one level of the ordered hierarchy"
                 )
-        for child in self.modules:
-            if child.target is not None:
-                raise ValueError(
-                    f"Module {self.name!r}: child module {child.name!r} declares "
-                    f"its own target {child.target!r}; only the root module "
-                    "declares a target and children inherit it. The rule: "
-                    "tilefoundry spec core-ir target-inheritance"
-                )
-
-        self.modules = tuple(_owned_by(child, self) for child in self.modules)
-
-    def _owner_path(self) -> str:
-        """This Module's dotted path from the outermost declared owner."""
-        names = [self.name]
-        node = self._parent
-        while node is not None:
-            names.append(node.name)
-            node = node._parent
-        return ".".join(reversed(names))
+        for key, slot in self.children.items():
+            slot.bind(key)
+            for child in slot.elements:
+                if not isinstance(child, Module):
+                    raise TypeError(f"Module {self.name!r}: slot {key!r} requires Module definitions")
 
     def resolve_target(self) -> Target:
-        """Resolve this Module's owner-chain target lookup.
-
-        See docs/spec/core-ir.md § Target inheritance.
-        """
-        node: "Module | None" = self
-        while node is not None:
-            if node.target is not None:
-                return node.target
-            node = getattr(node, "_parent", None)
+        """Resolve this definition's own target."""
+        root = self
+        if root.target is not None:
+            return root.target
         raise ValueError(
-            f"Module {self._owner_path()!r}: no target is declared by this "
-            "module or any of its owners; declare a Target instance on the root "
-            "module. The rule: tilefoundry spec core-ir target-inheritance"
+            f"Module {root.name!r}: no target is declared; declare a Target "
+            "instance on the root module. The rule: "
+            "tilefoundry spec core-ir target-inheritance"
         )
 
     def effective_topologies(self) -> tuple[Topology, ...]:
-        """The effective ordered Topology tuple.
-
-        The effective ordered Topology tuple: this Module's declaration,
-        else the nearest owner's, else empty at an undeclared root.
-        """
-        node: "Module | None" = self
-        while node is not None:
-            if node.topologies is not None:
-                return node.topologies
-            node = getattr(node, "_parent", None)
-        return ()
+        """This definition's declared topology hierarchy, or an empty one."""
+        return self.topologies if self.topologies is not None else ()
 
     def resolve_topology(self, name: str) -> Topology:
         """The effective Topology named *name*.
@@ -260,12 +213,12 @@ class Module:
         if not matches:
             available = ", ".join(t.name for t in levels) or "none"
             raise ValueError(
-                f"Module {self._owner_path()!r}: no topology named {name!r}; "
+                f"Module {self.name!r}: no topology named {name!r}; "
                 f"effective topology levels are {available}"
             )
         if len(matches) > 1:
             raise ValueError(
-                f"Module {self._owner_path()!r}: topology {name!r} resolves to "
+                f"Module {self.name!r}: topology {name!r} resolves to "
                 f"{len(matches)} levels; one name must map to one level"
             )
         return matches[0]
@@ -310,14 +263,9 @@ class Module:
                 f"Module {self.name!r}: {name!r} resolves to {len(matches)} "
                 f"entries; one name must map to one function"
             )
-        mod_matches = tuple(m for m in self.modules if m.name == name)
-        if len(mod_matches) == 1:
-            return mod_matches[0]
-        if len(mod_matches) > 1:
-            raise AttributeError(
-                f"Module {self.name!r}: {name!r} resolves to {len(mod_matches)} "
-                f"child modules; one name must map to one module"
-            )
+        slot = self.children.get(name)
+        if slot is not None:
+            return slot if slot.indexed else slot.elements[0]
         method = self.methods.get(name)
         if method is not None:
             return types.MethodType(method, self)
@@ -325,17 +273,9 @@ class Module:
             f"Module {self.name!r} has no function, child module, or method {name!r}"
         )
 
-    def function_named(self, name: str) -> tuple[ModuleFunction, ...]:
-        """The functions whose name matches, in source order (0 or 1 of them in a verified module).
-
-        The functions whose name matches, in source order (0 or 1 of them in
-        a verified module).
-        """
-        return tuple(fn for fn in module_functions(self) if fn.name == name)
-
     def lookup(self, name: str) -> ModuleFunction:
         """The function named *name*; raises unless exactly one matches."""
-        matches = self.function_named(name)
+        matches = tuple(fn for fn in self.functions if fn.name == name)
         if len(matches) != 1:
             raise ValueError(
                 f"Module {self.name!r}: {name!r} must resolve to exactly one "
@@ -377,7 +317,7 @@ class Module:
                 "lookup('<name>') for the node, or <module>.<name>(...) to run "
                 "it. The rule: tilefoundry spec core-ir default-step"
             )
-        matches = self.function_named(self.entry)
+        matches = tuple(fn for fn in self.functions if fn.name == self.entry)
         if not matches:
             raise ValueError(f"Module {self.name!r}: entry {self.entry!r} not in functions")
         if len(matches) > 1:
@@ -399,16 +339,31 @@ class Module:
 
         [runtime §1.3](docs/spec/runtime.md#13-runtimedecoratorpy)
         """
+        return self._load_under(resource, self.target, (), "")
+
+    def _load_under(self, resource, target, topologies, path: str) -> "LoadedModule":
+        target = self.target if self.target is not None else target
+        topologies = self.topologies if self.topologies is not None else topologies
+        children = {}
+        for key, slot in self.children.items():
+            base = resource.subtree(key)
+            child_path = f"{path}.{key}" if path else key
+            if slot.indexed:
+                children[key] = tuple(
+                    child._load_under(base.subtree(str(i)), target, topologies, f"{child_path}.{i}")
+                    for i, child in enumerate(slot.elements)
+                )
+            else:
+                children[key] = slot.elements[0]._load_under(base, target, topologies, child_path)
         return LoadedModule(
-            module=self,
-            resource=resource,
-            modules=tuple(child.load(resource.subtree(child.name)) for child in self.modules),
+            module=self, resource=resource, children=children,
+            target=target, topologies=topologies, path=path,
         )
 
     def prepare(self, raw, out_dir: str, *, device: str = "cpu") -> None:
         """Prepare canonical weights and write the safetensors checkpoint."""
         staged: dict[str, object] = {}
-        self._prepare_into(raw, "", staged, device)
+        self._prepare_into(raw, "", staged, device, target=self.target)
         flat = {name: value.detach().contiguous().cpu() for name, value in staged.items()}
 
         import json  # noqa: PLC0415 -- stdlib, only needed here
@@ -424,7 +379,10 @@ class Module:
             json.dumps({"weight_map": {name: shard for name in flat}})
         )
 
-    def _prepare_into(self, raw, prefix: str, flat: dict, device: str) -> "LoadedModule":
+    def _prepare_into(
+        self, raw, prefix: str, flat: dict, device: str, *,
+        target=None, topologies=(), path: str = "",
+    ) -> "LoadedModule":
         """Stage this node's canonical weights, children before their owner.
 
         Converters are HIR bodies on this offline path, making the local
@@ -436,10 +394,25 @@ class Module:
             DictResource,
         )
 
-        children = tuple(
-            child._prepare_into(raw.subtree(child.name), f"{prefix}{child.name}.", flat, device)
-            for child in self.modules
-        )
+        target = self.target if self.target is not None else target
+        topologies = self.topologies if self.topologies is not None else topologies
+        children = {}
+        for key, slot in self.children.items():
+            base = raw.subtree(key)
+            child_path = f"{path}.{key}" if path else key
+            if slot.indexed:
+                children[key] = tuple(
+                    child._prepare_into(
+                        base.subtree(str(i)), f"{prefix}{key}.{i}.", flat, device,
+                        target=target, topologies=topologies, path=f"{child_path}.{i}",
+                    )
+                    for i, child in enumerate(slot.elements)
+                )
+            else:
+                children[key] = slot.elements[0]._prepare_into(
+                    base, f"{prefix}{key}.", flat, device,
+                    target=target, topologies=topologies, path=child_path,
+                )
         converter_map: dict[str, ModuleFunction] = {}
         for fn in self.functions:
             for weight_name, conv in getattr(fn, "converters", ()):
@@ -457,7 +430,8 @@ class Module:
             return value.to(device)
 
         reading = LoadedModule(
-            module=self, resource=DictResource(flat, prefix=prefix), modules=children
+            module=self, resource=DictResource(flat, prefix=prefix), children=children,
+            target=target, topologies=topologies, path=path,
         )
         for weight_name, decl_type in self.weights.items():
             conv = converter_map.get(weight_name)
@@ -494,26 +468,6 @@ class Module:
             flat[key] = value
         return reading
 
-    def cloned(self) -> "Module":
-        """An independent copy of the IR graph: functions, bodies, children.
-
-        An independent copy of the IR graph: functions, bodies, children, and
-        every internal ``Call.target`` redirected to the copy. Immutable outside
-        context -- owner, ``target``, ``topologies`` -- stays shared.
-        """
-        memo: dict[int, object] = {}
-        for kept in (getattr(self, "_parent", None), self.target, *(self.topologies or ())):
-            if kept is not None:
-                memo[id(kept)] = kept
-        return copy.deepcopy(self, memo)
-
-    def renamed(self, name: str) -> "Module":
-        """An independent copy of this node under a different ``name``."""
-        clone = self.cloned()
-        clone.name = name
-        return clone
-
-
 @dataclass(frozen=True)
 class LoadedModule:
     """An immutable Module binding and the resource from which it reads.
@@ -523,7 +477,10 @@ class LoadedModule:
 
     module: Module
     resource: object
-    modules: tuple["LoadedModule", ...] = field(default_factory=tuple)
+    children: dict[str, LoadedModule | tuple[LoadedModule, ...]] = field(default_factory=dict)
+    target: Target | None = None
+    topologies: tuple[Topology, ...] = ()
+    path: str = ""
 
     @property
     def name(self) -> str:
@@ -536,20 +493,17 @@ class LoadedModule:
         module = self.module
         matches = tuple(fn for fn in module.functions if fn.name == name)
         if len(matches) == 1:
-            return _replace(self, module=_reentered(module, name))
+            return _replace(
+                self, module=_replace(module, entry=name, target=self.target, topologies=self.topologies)
+            )
         if len(matches) > 1:
             raise AttributeError(
                 f"LoadedModule {self.name!r}: {name!r} resolves to "
                 f"{len(matches)} entries; one name must map to one function"
             )
-        children = tuple(child for child in self.modules if child.name == name)
-        if len(children) == 1:
-            return children[0]
-        if len(children) > 1:
-            raise AttributeError(
-                f"LoadedModule {self.name!r}: {name!r} resolves to "
-                f"{len(children)} child modules; one name must map to one module"
-            )
+        child = self.children.get(name)
+        if child is not None:
+            return child
         method = module.methods.get(name)
         if method is not None:
             return types.MethodType(method, self)
@@ -566,88 +520,4 @@ class LoadedModule:
         return self.module.entry_function(), self
 
 
-def _reentered(module: Module, entry: str) -> Module:
-    """*module* re-entried at *entry*.
-
-    ``replace`` rebuilds the value without its owner backlink, so a child
-    selected out of a tree would lose the Target and hierarchy it inherits. The
-    copy therefore carries the context it resolved through.
-    """
-    try:
-        target = module.resolve_target()
-    except ValueError:
-        target = module.target
-    return _replace(
-        module,
-        entry=entry,
-        target=target,
-        topologies=module.effective_topologies(),
-    )
-
-
-def select(module: Module, path: str) -> Module:
-    """The node dotted *path* names below *module*, as a Module.
-
-    Each segment names a child Module, except that the last may instead name one
-    of the reached Module's own functions -- which selects that Module re-entried
-    at it, so what comes back is always something with a Target and a topology
-    hierarchy to be measured against. An empty *path* is *module* itself.
-
-    See [core-ir §1.2](docs/spec/core-ir.md#12-selecting-a-node-by-path).
-    """
-    selected = module
-    segments = path.split(".") if path else []
-    if any(not segment for segment in segments):
-        raise ValueError(
-            f"selector {path!r}: an empty segment names nothing. Dropping it would "
-            f"make two different paths mean the same node"
-        )
-    for index, name in enumerate(segments):
-        children = {child.name: child for child in selected.modules}
-        if name in children:
-            selected = children[name]
-            continue
-        if index != len(segments) - 1:
-            raise ValueError(
-                f"selector {path!r}: Module {selected.name!r} has no child module {name!r}"
-            )
-
-        selected.lookup(name)
-        return _reentered(selected, name)
-    return selected
-
-
-def function_selectors(module: Module, prefix: str = "") -> tuple[tuple[str, HirFunction], ...]:
-    """Every HIR function in *module*'s tree, each with the selector naming it.
-
-    Root-relative and dotted, the same paths :func:`select` resolves, so a leaf's
-    name is qualified by the children it was reached through: two child Modules
-    may each define a ``moe``, and an unqualified name would make them one entry
-    in an inventory meant to be countable.
-
-    A ``PrimFunction`` is not one of these: it is an implementation of a function
-    rather than a function of the model.
-
-    See [core-ir §1.2](docs/spec/core-ir.md#12-selecting-a-node-by-path).
-    """
-    found: list[tuple[str, HirFunction]] = [
-        (f"{prefix}{function.name}", function)
-        for function in module.functions
-        if isinstance(function, HirFunction)
-    ]
-    for child in module.modules:
-        found.extend(function_selectors(child, f"{prefix}{child.name}."))
-    return tuple(found)
-
-
-__all__ = [
-    "LoadedModule",
-    "Module",
-    "ModuleFunction",
-    "called_functions",
-    "function_selectors",
-    "module_functions",
-    "owning_module",
-    "reachable_functions",
-    "select",
-]
+__all__ = ["Module", "ModuleList", "LoadedModule"]

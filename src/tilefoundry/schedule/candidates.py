@@ -17,12 +17,12 @@ from tilefoundry.schedule._reporting import capability_families
 from tilefoundry.target import Target
 from tilefoundry.visitor_registry.access_relation import access_relation_registry
 from tilefoundry.visitor_registry.buffer_alias import aliased_operand
+from tilefoundry.visitor_registry.call_frame import CallFrameVisitor
 from tilefoundry.visitor_registry.candidates import (
     candidate_operands,
     candidate_ops,
     sole_candidate,
 )
-from tilefoundry.visitor_registry.contexts import FunctionScope
 
 
 def _instructions(target: Target) -> tuple[tuple[type, OpCapability], ...]:
@@ -44,10 +44,10 @@ def candidates(
     declared = _instructions(ctx.target)
     type_printer = PythonPrinter()
     pattern_printer = PatternPrinter()
-    function_scope = FunctionScope(ctx.module, ctx.root.owner)
     rows = []
     calls = []
-    for call in collect_exprs(ctx.root.owner.body):
+    frames = CallFrameVisitor.walk_frames(ctx.root.frame)
+    for call in (call for frame in frames for call in collect_exprs(frame.function.body)):
         if (
             not isinstance(call, Call)
             or is_dim_op_call(call)
@@ -73,7 +73,7 @@ def candidates(
                 if capability.attribute is not None:
                     attributes[capability.attribute] = capability.declaration
                 instances = match_instruction(
-                    op_type, attributes, types, mesh, scope=function_scope
+                    op_type, attributes, types, mesh, frame=scope.frame
                 )
             except ScheduleRefusal as error:
                 refused.append(

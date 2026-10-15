@@ -11,6 +11,7 @@ from tilefoundry.analysis import (
     RooflineMetadata,
     analyze,
 )
+from tilefoundry.analysis.iteration_scope import walk_scopes
 from tilefoundry.analysis.metadata import shares
 from tilefoundry.dsl import *
 from tilefoundry.ir.core import Call, Var, VerifyError, get_metadata
@@ -84,7 +85,7 @@ def test_scope_positions_turn_per_unit_cost_into_total_cost() -> None:
 
 
 def test_region_boundaries_price_calls_per_position_and_values_once() -> None:
-    """Inline preserves helper repetition while counting the escaped value once."""
+    """Stepping into occurrences preserves repetition and counts the escaped value once."""
     helper = analyze(
         RegionBoundaries,
         RegionBoundaries.lookup("helper"),
@@ -112,7 +113,7 @@ def test_region_boundaries_price_calls_per_position_and_values_once() -> None:
     } == {"gmem": 384, "smem": 64, "rmem": 720}
     binaries = [
         get_metadata(expr, ComputeCostMetadata)
-        for expr in collect_exprs(result.function.body)
+        for occurrence, expr in ((scope, expr) for scope in walk_scopes(result.scopes) if scope.frame is not None for expr in collect_exprs(scope.frame.function.body))
         if isinstance(expr, Call) and isinstance(expr.target, Binary)
     ]
     binary_flops = sorted(shares(item.flops, item.topologies)["f32"] for item in binaries)

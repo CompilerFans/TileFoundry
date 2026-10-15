@@ -12,12 +12,12 @@ from tilefoundry.ir.core import Call, Constant, binding_name
 from tilefoundry.ir.core.kinds import UnaryKind
 from tilefoundry.ir.hir.math.unary import Unary
 from tilefoundry.ir.hir.mesh_region import MeshRegion
-from tilefoundry.ir.hir.specialize import specialize_concretely
+from tilefoundry.ir.hir.specialize import InstantiateDimensionCloner
 from tilefoundry.ir.visitor import collect_exprs, expr_children
 
 
 def test_gqa_correction_reads_the_old_carry_and_unique_yield() -> None:
-    function = specialize_concretely(GqaOnline.entry_function(), {"ctx_len": 8})
+    function = InstantiateDimensionCloner({"ctx_len": 8}).function(GqaOnline.entry_function())
     printed = as_script(function)
 
     assert printed.count("        m_new = tf.max(m, score)") == 1

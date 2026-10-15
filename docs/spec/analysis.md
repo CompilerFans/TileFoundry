@@ -5,7 +5,7 @@ This spec owns TileFoundry's fact layer: everything a later stage decides
 
 | Surface | Entry | What it states |
 |---|---|---|
-| Program check | `check_program(module, function, topology_level=..., budget=..., analyzers=...)` | an inlined Function view after validating one authored program, its declared topology, and what each requested analysis needs of it |
+| Program check | `check_program(module, function, dims=..., topology_level=..., budget=..., analyzers=...)` | a checked Module and root Function after validating one authored program, its declared topology, and what each requested analysis needs of it |
 | Iteration context | `build_iteration_scopes(module, function, topology_level=..., dims=..., analyzers=(), options=None)` | an `AnalyzeContext` with resolved execution module and bound root/current scopes, without running an analysis family |
 | Composed measurement | `analyze(module, function, analysis=...)` | one or more root analyses and their union dependency closure, leaving typed Metadata on the IR |
 
@@ -67,16 +67,14 @@ cannot spell one value two ways. What the report is about and what was asked of 
 are records of the report rather than of the IR; every other summary line is a
 record of the selected Function.
 
-The JSON report carries the same identity and selection in `target`, `module`,
-`function`, `topology`, `wave`, `requested`, and `executed`. `wave` holds
-`counted` and `declared`.
-Whole-function
-projections are under `function_records`; `calls` is a value-ordered list whose
-entries have a `value` label and one key per selected family. `loops` is the
-corresponding authored-loop list, labelled by induction variable. Memory does not
-attach an empty record to a loop for a conclusion it has not computed. `totals`
-appears when the selected view includes compute cost or roofline's bounded work
-evidence.
+The JSON report carries `target`, `module`, `topology`, `wave`, `requested`,
+and `executed` once. `wave` holds `counted` and `declared`. Its `functions` list
+contains each reached definition once in root-first DFS order. Each entry has
+`function` (`Module.fn`), `function_records`, operand-first `calls`, authored
+`loops`, and `totals` when compute cost or roofline work evidence is selected.
+Call rows carry `value` and selected-family records; loop rows use the induction
+variable. Rows have no call-path field. Memory MUST NOT attach an empty loop
+record for a conclusion it has not computed.
 
 One result is rendered once, and every surface reads that rendering:
 
@@ -158,8 +156,7 @@ layer settles is which type a field holds and what its keys name:
     fact a program branches on, and a key spelled by hand is a key that can drift
     from the field it reports. A field whose projection needs the expression the
     record is attached to MUST be declared as one, and MAY be absent where the
-    program offers no such reading -- `operands` on a Function Call, which charges
-    a callee total no operand position names. A comment over the same record MAY
+    program offers no such reading. A comment over the same record MAY
     state fewer keys, or projected ones
     ([inspection §2.8](./inspection.md#28-record-comment-forms)), and what it
     leaves out MUST stay in the JSON projection.
@@ -193,7 +190,7 @@ class ComputeCostMetadata(IRMetadata):
 | Field | How it is computed | Reads the target |
 |---|---|---|
 | `topologies` | The effective Module topology levels, coarsest first. | No |
-| `flops` | For a primitive Call, run its registered cost evaluator over operand and result Types as written for `logical`; each level's share is the same evaluator over Types projected through authored `Split`s at or coarser than that level, and `total` is the selected unit's share times its executing mesh positions. Function accumulation multiplies `logical` by varying-loop trips, and `per_unit` and `total` by all enclosing loop trips. For a Function Call, take the callee's summed record and apply the call site's factors. | No; projection reads resolved Mesh and effective Module topology extents. |
+| `flops` | For a primitive Call, run its registered cost evaluator over operand and result Types as written for `logical`; each level's share is the same evaluator over Types projected through authored `Split`s at or coarser than that level, and `total` is the selected unit's share times its executing mesh positions. Function accumulation multiplies `logical` by varying-loop trips, and `per_unit` and `total` by all enclosing loop trips. Retained calls carry their callee's one-execution summary. Primitive work accumulates into root totals with full repeats and into each enclosing call with repeats relative to that call scope. | No; projection reads resolved Mesh and effective Module topology extents. |
 | `other_ops` | The evaluator's non-floating-point operation counts (`integer`, `predicate`, `select`, `special`), totalled and shared the same way. These keys map directly to target one-unit operation-throughput keys; target-side service naming is unchanged. | No; projection reads resolved Mesh and effective Module topology extents. |
 | `precision` | One-trip Call work is exact; Function work combines the precision of every enclosing loop's trip count. Coordinate-dependent maximum trip counts yield an upper bound. | No |
 
@@ -220,7 +217,7 @@ Each reported Call's JSON projection is under its `compute-cost` key:
 ```
 
 - constraints:
-  - A record MUST be attached to every reachable `Call` and to the Function.
+  - A record MUST be attached to every reached `Call` and Function.
     The Function record MUST include authored-loop repetition and therefore is
     not the direct sum of the one-occurrence Call records.
   - An op with no registered cost evaluator MUST raise `AnalysisError`.
@@ -1070,7 +1067,7 @@ its full form as defined in that family's section.
     result as one FLOP states a bound the unit cannot meet.
   - Rate-to-duration divisions MUST use exact integer ceiling division. They
     MUST NOT pass through floating-point arithmetic.
-  - Roofline records MUST be attached to every reachable `Call` and `Function`.
+  - Roofline records MUST be attached to reached `Call`s and Functions.
   - Roofline MUST read `ComputeCostMetadata` rather than evaluate the program a
     second time.
   - A recorded compute dtype that is not a `DType` name MUST raise
@@ -1247,7 +1244,7 @@ model.
     An ordering MUST NOT be inferred from an allocation -- which values share
     bytes is a plan's decision and no plan has been made -- and no occurrence is
     held back for a write nobody proved happens in place.
-  - Occurrences MUST be laid out in inline occurrence order. Reordering
+  - Occurrences MUST be laid out in definition-relative order. Reordering
     independent work is a later decision, not an analysis's: what overlaps
     is what the program's own placement made independent, and the reported time
     is the time of the program as written. On a `Function`, the summary's
@@ -1276,10 +1273,11 @@ def check_program(
     module: "Module",
     function: "Function",
     *,
+    dims: "Mapping[str, int] | None" = None,
     topology_level: str | None = None,
-    budget: int = _INLINE_NODES,
+    budget: int = _NODE_BUDGET,
     analyzers: tuple["Analyzer", ...] = (),
-) -> "Function": ...
+) -> tuple["Module", "Function"]: ...
 
 
 class AnalysisCheckContext:
@@ -1301,15 +1299,14 @@ class AnalysisCheckContext:
 - constraints:
   - The operation MUST infer types over the full reachable Function graph and
     validate its caller/callee execution context, and MUST NOT run an analysis
-    or attach derived Metadata to the authored IR. The inlined view it returns
+    or attach derived Metadata to the authored IR. Each derived body it returns
     is its own copy: its types are inferred and stored on it under the
     program's Target and arguments, so analyses read that view's `Expr.type`
     rather than a stamp of a shared child body.
-  - The reachable Function and Mesh geometry and every effective Module
-    topology extent MUST be concrete before this operation runs. A public
-    Analyze call with `dims` MUST resolve all three through one binding pass
-    before calling this gate; a residual dimension expression MUST fail before
-    any consuming algorithm runs.
+  - Dimension binding MUST follow the Analyze constraints below, using
+    [hir §2](./hir.md#2-function-specialization-api)
+    before ordinary type inference with ranges. Remaining symbolic dimensions
+    MUST be named before any consuming algorithm runs.
   - Every effective Module topology MUST name a level the resolved Target
     supports. A resolved static extent MUST be positive and within that level's
     finite hardware limit. A rejection MUST name the level, its extent, and the
@@ -1323,23 +1320,50 @@ class AnalysisCheckContext:
     traversal of the derived non-Function calls, then every `finish`. One
     program MUST be walked once for this however many analyses asked, and the
     first refusal MUST stop the gate before any analysis writes.
-  - The returned Function MUST inline every reachable HIR Function call at its
-    call site while retaining each `LoopRegion` as one loop. Its induction
-    variable, carried values, and yields MUST NOT be replaced with iterations.
-    The authored Module and Function MUST remain unchanged.
-  - The returned Function parameters MUST be the authored entry parameters
-    followed by the `ConstTensor` declarations needed by reachable Module
-    readings. A promoted declaration MUST be named by the clean dot-joined
-    Module path and weight name used by runtime checkpoint keys. Declarations
-    MUST follow the Module tree's owner-before-children order, and within one
-    Module are unioned by name in Function/parameter order. Separate attachment
-    paths MUST remain separate resources. Unequal types for one `(module path,
-    weight name)` MUST fail. No constant value enters the IR.
-  - Every primitive Call in the returned view MUST have a deterministic unique
-    binding.
-  - `budget` MUST be a non-negative integer limiting the number of unique body
-    expression nodes after inlining. An oversized view MUST fail with both its
-    size and the limit and MUST NOT return a partial Function.
+  - The returned Module MUST contain one typed derived function per reached
+    definition, retaining calls and LoopRegions. Entry parameters and implicit
+    child weights retain their names and roles; weights MUST NOT become root
+    parameters. Authored definitions MUST remain unchanged.
+  - Every primitive Call in each derived body MUST have a deterministic unique
+    binding. `budget` MUST be a non-negative integer limiting the sum of unique
+    derived body nodes, independent of occurrence count. Exceeding it MUST fail
+    with the program name, total size, and limit.
+  - At each retained call, analysis MUST step into its derived body through an
+    occurrence `IterationScope` whose owner is that Call, binding activations to arguments and resolving child weights
+    along the current call path. Loop call sites MUST be visited once;
+    enclosing trip counts multiply work and traffic. Recursion and a callee
+    without a body MUST raise `AnalysisError` naming the function and call path.
+  - One definition MUST receive one argument-type signature and one current
+    mesh. Different shape, dtype, layout, storage, or mesh MUST raise
+    `AnalysisError` naming the callee, both call paths, and both signatures.
+  - An occurrence MUST be the owner-Call `IterationScope`, or the owner-Function
+    scope for root. Other scopes point to their occurrence; its `CallFrame`
+    carries the current Module, function, target, and topologies. Diagnostic paths
+    join call binding names with `/`; root has an empty path.
+  - Records MUST live on IR, once per definition, describing its one execution.
+    Each analyzer MUST enter callees during traversal, then write the callee's
+    summary to its Function and call node. Compute-cost and traffic accumulate
+    primitive work into root with full repeats and each enclosing call with
+    repeats relative to that occurrence, preserving root logical totals.
+    Performance MUST schedule each definition once relative to its own origin;
+    call duration is the callee duration, scheduled in the caller's current scope.
+    Callee region peaks MUST take the maximum across occurrences.
+  - Parameters and arguments MUST share storage and extend argument liveness
+    through the callee's last use; callee temporaries occupy the caller timeline.
+    A separately materialized callee result of matching memory level and byte
+    size MUST share the caller destination. A return without an independent
+    material buffer requires a caller destination, which MAY increase peak memory.
+  - Implicit weights MUST be persistent. Their instance index tuples are the
+    union of reached index images clipped to slot bounds; their cardinality
+    scales weight bytes. Unknown indices reach the whole slot. Traffic uses
+    loop trips without this multiplier.
+  - Each internal SSA leaf MUST share one address across its occurrence windows.
+    Callee parameters and results tied to caller destinations use caller pointers
+    and carry no offsets. Internal values MUST NOT reuse parameter storage;
+    a return group's proven reuse of a parameter is applied only at the call,
+    subject to the caller's persistent and last-use checks. Different alias
+    relationships MUST raise `AnalysisError` naming the callee, binding,
+    both binding paths, and relationships.
   - Authored-analysis readiness is not a program-level rejection. Analyze MUST
     NOT reject an authored `where(...)` constraint: it is an input to a later
     decision, and a program carrying one is measured as written. A value whose
@@ -1361,12 +1385,8 @@ dummy-run a plain Python orchestration method.
   - Analyze MUST validate every caller/callee edge the selected query reaches
     against the one-execution-context requirement
     ([hir §1.1](./hir.md#11-function)). Reaching is what is validated, so an
-    attached child no call reaches has no edge here. Of the two resolved values
-    only the topology hierarchy is compared: the `Target` needs no second check,
-    because only a root declares one ([core-ir §1](./core-ir.md#1-module)).
-  - The Module owning a reached `Function` MUST be answered within the supplied
-    tree, by identity and recorded origin rather than by name. No owner, or more
-    than one, is refused rather than assigned to the root.
+    attached child no call reaches has no edge here. Both effective targets
+    and complete topology hierarchies MUST match.
 
 ```python
 class AnalysisResult:
@@ -1380,6 +1400,7 @@ class AnalysisResult:
         topology_level: attribute; Topology level whose unit the per-unit quantities describe, or None.
         executed: attribute; Analyses executed in dependency order.
         metadata_types: attribute; Metadata classes actually written.
+        functions: attribute; Reached derived functions in root-first DFS order.
     """
 
     module: "Module"
@@ -1389,6 +1410,7 @@ class AnalysisResult:
     topology_level: str | None
     executed: tuple[str, ...]
     metadata_types: tuple[type[IRMetadata], ...]
+    functions: tuple["Function", ...]
 
 
 def analyze(
@@ -1433,22 +1455,15 @@ def analyze(
     range in any of those positions, so the program MUST be analysed at a chosen
     size rather than as authored.
   - `dims=None` MUST behave as a call that states no size: the Function is
-    analysed as authored before the shared program check builds the inlined
-    view, and `AnalysisResult.function` MUST be that record-bearing view.
-  - When `dims` is stated it MUST be non-empty; every key MUST name a dimension
-    reached through the Function graph, its Mesh geometry, or the effective
-    Module topology expressions; every value MUST be an integer inside that
-    dimension's declared bounds; every dimension the Function selects a variant
-    on MUST be given a value; and no dimension MAY remain a range after
-    substitution. Each of these MUST fail with an Analysis domain error. A stated
-    `dims` MUST NOT be silently ignored, including when the Function declares no
-    range at all.
-  - Variant resolution and substitution MUST happen after the ownership check and
-    before the shared program check or any algorithm runs. Function types, Mesh
-    geometry, and effective topology extents MUST use the same resolved binding.
-    Exactly one variant MUST cover the stated size; none and more than one MUST
-    both fail.
-  - When `dims` is stated, `AnalysisResult.function` MUST be the inlined view of
+    checked at its authored size; `AnalysisResult.function` MUST be the
+    record-bearing derived root.
+  - Within `check_program`, stated `dims` MUST be a non-empty mapping whose
+    keys name reached dimensions and whose integer extents satisfy their bounds.
+    Every dispatch dimension MUST be supplied, exactly one variant MUST cover
+    it, and no dimension MAY remain symbolic after substitution in types, Meshes,
+    loop bounds, attributes, or effective topologies. Invalid bindings and missing
+    bodies MUST fail with their names before any consuming algorithm runs.
+  - When `dims` is stated, `AnalysisResult.function` MUST be the derived root of
     the concrete Function the records were written onto and MUST retain the
     specialised Function's origin and extents. `AnalysisResult.module` MUST
     remain the Module the caller supplied. A reader given the symbolic input
@@ -1470,7 +1485,7 @@ def analyze(
   - Type inference and validation MUST each run once per call, before any
     analysis. No analysis MAY run once either has rejected the IR, because an
     analysis reads inferred types and assumes a verified function.
-  - Family-specific readiness MUST be checked on that inferred inlined view and
+  - Family-specific readiness MUST be checked on that inferred derived program and
     MUST complete before the first analysis in the dependency closure runs. In
     particular, a performance request that lacks an execution placement MUST
     fail before dependency Metadata is written.
@@ -1519,10 +1534,8 @@ grouped by `(Access.buffer, Access.index)`, and a tuple result's label is
 `<name>[index]`. A refused descendant
 makes its owning scope unknown for that view. Non-affine runtime indices retain
 the widest legal access approximation.
-Normalization clones each reached Function call site independently. Within one
-call site, source expressions shared by identity remain one shared expression
-in the clone; sharing never aliases the independently cloned body of another
-call site.
+Normalization shares one derived body and its records per reached definition
+([§2](#2-composed-analysis)).
 
 `analysis.loop_terms` resolves HIR values to `LoopTerm` without depending on
 isl. `analysis.access` turns those terms into isl constraints and owns access

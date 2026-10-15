@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from tilefoundry.analysis.check import check_program, resolve_program_geometry
+from tilefoundry.analysis.check import check_program
 from tilefoundry.analysis.errors import AnalysisError
 from tilefoundry.analysis.iteration_scope import IterationScope, ScopeBuilder
 from tilefoundry.analysis.registry import Analyzer
@@ -24,9 +24,11 @@ from tilefoundry.ir.core import IRMetadata
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.specialize import SpecializationError
+from tilefoundry.ir.module_utils import list_call_paths
+from tilefoundry.ir.types.substitute import DimSubstitutionError
 from tilefoundry.ir.visitor import function_values
 from tilefoundry.target import Target, UnsupportedCapabilityError
-from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
+from tilefoundry.visitor_registry.call_frame import CallFrameVisitor
 
 
 @dataclass(frozen=True)
@@ -35,7 +37,7 @@ class AnalysisResult:
 
     ``executed`` records dependency order and ``metadata_types`` lists records
     actually written, excluding analyses that matched nothing. ``function`` is
-    the inlined view that carries those records; ``module`` remains the call's
+    the derived root that carries root-occurrence records; ``module`` remains the call's
     execution domain.
     """
 
@@ -46,6 +48,7 @@ class AnalysisResult:
     topology_level: str | None
     executed: tuple[str, ...]
     metadata_types: tuple[type[IRMetadata], ...]
+    functions: tuple[Function, ...]
 
     @property
     def level(self) -> str | None:
@@ -128,23 +131,19 @@ def build_iteration_scopes(
         raise AnalysisError(
             f"analyze: {function.name!r} is not a function of module {module.name!r}"
         )
-    try:
-        module, function = resolve_program_geometry(
-            module,
-            function,
-            dims,
-            TypeInferContext(scope=FunctionScope(module, function)),
-        )
-    except SpecializationError as error:
-        raise AnalysisError(f"analyze: {error}") from None
 
     target = module.resolve_target()
     topologies = module.effective_topologies()
     if topology_level is None:
         topology_level = topologies[0].name if topologies else None
 
-    function = check_program(module, function, topology_level=topology_level, analyzers=analyzers)
-    context = AnalyzeContext(module, target, topology_level, options)
+    try:
+        module, function = check_program(module, function, topology_level=topology_level, analyzers=analyzers, dims=dims)
+    except (SpecializationError, DimSubstitutionError) as error:
+        raise AnalysisError(f"analyze: {error}") from None
+    context = AnalyzeContext(
+        module, target, topology_level, options
+    )
     context.root = context.current = ScopeBuilder(module, function, ctx=context).build()
 
     return context
@@ -165,8 +164,8 @@ def analyze(
     The module supplies target and topology; *topology_level* defaults to its
     coarsest level. *dims* selects a specialization and substitutes concrete
     extents before measurement. The original function must be a prototype or
-    variant owned by the module, and the result identifies the concrete inlined
-    view that received records.
+    variant owned by the module, and the result identifies the concrete derived
+    root that received records.
     """
     if topology_level is not None and level is not None and topology_level != level:
         raise ValueError("analyze: topology_level and level disagree")
@@ -185,29 +184,33 @@ def analyze(
     module = context.module
     topology_level = context.topology_level
     function = context.root.owner
-    functions = (function,)
+    functions = tuple(frame.function for frame in CallFrameVisitor.walk_frames(context.root.frame))
 
     order: list[type[IRMetadata]] = []
-    written_records: set[tuple[int, type]] = set()
+    written_records: set[tuple] = set()
+    authored = tuple(
+        fn for frame in list_call_paths(result_module).values() for owner in (frame.function,) if isinstance(owner, Function) for fn in (owner, *owner.variants)
+    )
+    authored_before = _metadata_snapshot(authored)
     for algorithm in closure:
         before = _metadata_snapshot(functions)
         try:
             algorithm.run(function, context)
         except UnsupportedCapabilityError as error:
             raise AnalysisError(f"{algorithm.selector}: {error}") from None
+        if _metadata_snapshot(authored) != authored_before:
+            raise AnalysisError(f"{algorithm.selector!r} changed authored IR metadata")
         after = _metadata_snapshot(functions)
         records = _require_owned_writes(algorithm, before, after)
         written_records |= records
-        written = {metadata_type for _expr_id, metadata_type in records}
+        written = {key[-1] for key in records}
         for metadata_type in algorithm.produces:
             if metadata_type in written and metadata_type not in order:
                 order.append(metadata_type)
 
     final = _metadata_snapshot(functions)
     surviving = {
-        metadata_type
-        for key in written_records & final.keys()
-        for _expr_id, metadata_type in (key,)
+        metadata_type for key in written_records & final.keys() for metadata_type in (key[-1],)
     }
 
     result = AnalysisResult(
@@ -218,6 +221,7 @@ def analyze(
         topology_level=topology_level,
         executed=tuple(algorithm.selector for algorithm in closure),
         metadata_types=tuple(item for item in order if item in surviving),
+        functions=functions,
     )
     dump(
         "analysis.json",
@@ -229,6 +233,7 @@ def analyze(
                 topology_level=result.topology_level,
                 executed=result.executed,
                 metadata_types=result.metadata_types,
+                functions=result.functions,
             )
         ),
         DumpFlags.ANALYSIS,
@@ -294,7 +299,7 @@ def _require_owned_writes(
     """
     owned = set(algorithm.produces)
     changed, written = _metadata_delta(before, after)
-    trespassed = {metadata_type for _expr_id, metadata_type in changed} - owned
+    trespassed = {key[-1] for key in changed} - owned
     if trespassed:
         raise AnalysisError(
             f"{algorithm.selector!r} changed Metadata it does not declare: "

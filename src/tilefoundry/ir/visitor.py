@@ -60,11 +60,13 @@ def expr_children(expr: Expr) -> tuple[Expr, ...]:
     or substitute bindings must override `visit_LoopRegion` and rebuild
     explicitly.
     """
+    from tilefoundry.ir.core.module import ModuleList  # noqa: PLC0415 -- cycle
+
     match expr:
-        case Var() | Constant() | SymbolRef() | ShapeOf():
+        case Var() | Constant() | SymbolRef() | ShapeOf() | ModuleList():
             return ()
-        case Call(args=args):
-            return args
+        case Call(target=target, args=args):
+            return (target, *args) if isinstance(target, Call) else args
         case MeshRegion(args=args, body=body):
             return (*args, body)
         case LoopRegion(args=args, body=body, yield_values=yield_values):
@@ -82,9 +84,13 @@ def _rebuild_expr(expr: Expr, new_children: tuple[Expr, ...]) -> Expr:
 
     Binding-site fields are carried over untouched.
     """
+    from tilefoundry.ir.core.module import ModuleList  # noqa: PLC0415 -- cycle
+
     match expr:
-        case Var() | Constant() | SymbolRef():
+        case Var() | Constant() | SymbolRef() | ModuleList():
             return expr
+        case Call(target=Call()):
+            return replace(expr, target=new_children[0], args=new_children[1:])
         case Call():
             return replace(expr, args=new_children)
         case MeshRegion(args=args):
@@ -168,6 +174,8 @@ def _stmt_expr_fields(stmt: Stmt) -> tuple[str, ...]:
     (For.induction_var, LetStmt.var, MeshScope.binding) are intentionally
     excluded — a rewrite must not turn a binding site into a non-Var.
     """
+    from tilefoundry.ir.core.module import ModuleList  # noqa: PLC0415 -- cycle
+
     match stmt:
         case LetStmt():
             return ("value",)
@@ -175,7 +183,7 @@ def _stmt_expr_fields(stmt: Stmt) -> tuple[str, ...]:
             return ("start", "stop", "step")
         case While() | If():
             return ("cond",)
-        case Evaluate(callable=SymbolRef()):
+        case Evaluate(callable=SymbolRef() | Call() | ModuleList()):
             return ("callable", "args")
         case Evaluate():
             return ("args",)
@@ -449,6 +457,7 @@ class BindingSubstitutionCloner(ExprCloner):
     def visit_Call(self, expr: Call, ctx: Mapping[int, Expr]) -> Expr:
         return replace(
             expr,
+            target=self.visit(expr.target, ctx) if isinstance(expr.target, Call) else expr.target,
             args=tuple(
                 self.visit(arg, ctx) if isinstance(arg, Expr) else arg for arg in expr.args
             ),

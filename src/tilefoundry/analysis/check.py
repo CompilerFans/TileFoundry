@@ -7,7 +7,7 @@ per family, so no family can be the one that forgot.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
 from tilefoundry.ir.core import (
@@ -15,38 +15,26 @@ from tilefoundry.ir.core import (
     Call,
     Expr,
     RangeMetadata,
-    Var,
+    binding_name,
 )
-from tilefoundry.ir.core.module import (
-    Module,
-    called_functions,
-    child_module_of,
-    owning_module,
-    reachable_functions,
-    subtree,
-)
+from tilefoundry.ir.core.module import Module, ModuleList
 from tilefoundry.ir.hir.function import Function
+from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.specialize import (
+    InstantiateDimensionCloner,
     SpecializationError,
-    _record_complete_bindings,
+    _DimVarCollector,
     dim_vars_reached,
-    is_concrete,
-    specialize_concretely,
 )
-from tilefoundry.ir.pattern import RangePattern
 from tilefoundry.ir.types import Topology, callable_type_for
-from tilefoundry.ir.types.substitute import (
-    DimSubstitutionError,
-    dim_vars_by_name,
-    substitute_shape_dim,
-    substitute_topology_dims,
-)
-from tilefoundry.ir.types.utils import static_dim_value
-from tilefoundry.ir.visitor import BindingSubstitutionCloner, collect_exprs
+from tilefoundry.ir.types.mesh import make_mesh
+from tilefoundry.ir.types.substitute import dim_vars_by_name, substitute_shape_dim
+from tilefoundry.ir.visitor import collect_exprs, expr_children
 from tilefoundry.target import UnsupportedCapabilityError
 from tilefoundry.target.facts import TopologyFacts
-from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
+from tilefoundry.visitor_registry.call_frame import CallFrame, CallFrameVisitor
+from tilefoundry.visitor_registry.contexts import TypeInferContext
 from tilefoundry.visitor_registry.typeinfer import TypeInferVisitor
 
 from .errors import AnalysisError
@@ -60,7 +48,7 @@ from .metadata import (
     RooflineMetadata,
 )
 
-_INLINE_NODES = 10_000
+_NODE_BUDGET = 10_000
 _DERIVED_METADATA = {
     ComputeCostMetadata,
     MemoryMetadata,
@@ -70,7 +58,6 @@ _DERIVED_METADATA = {
     RegionMemoryMetadata,
     RooflineMetadata,
 }
-_ResourceKey = tuple[str, str]
 
 
 @dataclass
@@ -156,412 +143,79 @@ class PerformanceChecker:
 
 
 def program_dim_vars(module: Module, function: Function) -> dict[str, object]:
-    """Dimension declarations reached through program values and execution geometry."""
-    found: dict[str, object] = dict(dim_vars_reached(function))
-    for owner in _reached_owners(module, function):
-        found.update(dim_vars_by_name(owner.effective_topologies()))
-    return found
+    """Dimension declarations in reachable values and effective execution geometry."""
+    return dim_vars_reached(function, _required_frame(module, function))
 
 
-def resolve_program_geometry(
-    module: Module,
-    function: Function,
-    dims: Mapping[str, int] | None,
-    ctx: TypeInferContext | None = None,
-) -> tuple[Module, Function]:
-    """Resolve one call's Function, Mesh, and Module topology dimensions."""
-    if dims is None:
-        _require_concrete_function_geometry(function, error_type=SpecializationError)
-        return module, function
-    if not isinstance(dims, Mapping) or not dims:
-        raise SpecializationError(
-            f"specialising {function.name!r} needs a non-empty mapping of dimension "
-            f"names to extents, got {dims!r}"
-        )
-    for name, extent in dims.items():
-        if not isinstance(name, str) or not name:
-            raise SpecializationError(
-                f"specialising {function.name!r}: {name!r} is not a dimension name"
-            )
-        if isinstance(extent, bool) or not isinstance(extent, int):
-            raise SpecializationError(
-                f"specialising {function.name!r}: dimension {name!r} takes an "
-                f"integer extent, got {extent!r}"
-            )
-
-    declared = program_dim_vars(module, function)
-    function_names = _function_dimension_names(function)
-    geometry_only = set(declared) - function_names
-    try:
-        for name in geometry_only & dims.keys():
-            variable = declared[name]
-            if name in dims:
-                substitute_shape_dim(variable, dims)
-    except DimSubstitutionError as error:
-        raise SpecializationError(str(error)) from None
-
-    function_bindings = {name: extent for name, extent in dims.items() if name not in geometry_only}
-    try:
-        if function_bindings:
-            function = specialize_concretely(function, function_bindings, ctx)
-        function = _record_complete_bindings(function, dims)
-        execution_module = _substitute_module_tree(module, dims)
-    except DimSubstitutionError as error:
-        raise SpecializationError(str(error)) from None
-    _require_concrete_geometry(execution_module, function, error_type=SpecializationError)
-    return execution_module, function
-
-
-def _function_dimension_names(function: Function) -> set[str]:
-    return set(dim_vars_reached(function)) | _pattern_dimension_names(function)
-
-
-def _pattern_dimension_names(function: Function) -> set[str]:
-    found: set[str] = set()
-    seen: set[int] = set()
-
-    def visit(fn: Function) -> None:
-        if id(fn) in seen:
-            return
-        seen.add(id(fn))
-        for pattern in fn.specializations:
-            if isinstance(pattern, RangePattern):
-                found.add(pattern.dim_var)
-        for variant in fn.variants:
-            visit(variant)
-        for callee in reachable_functions(fn)[1:]:
-            visit(callee)
-
-    visit(function)
-    return found
-
-
-def _reached_owners(module: Module, function: Function) -> tuple[Module, ...]:
-    owners: list[Module] = [module]
-    seen = {id(module)}
-    for reached in reachable_functions(function):
-        owner = owning_module(module, reached)
-        if owner is not None and id(owner) not in seen:
-            owners.append(owner)
-            seen.add(id(owner))
-    return tuple(owners)
-
-
-def _required_owner(module: Module, function: Function) -> Module:
-    """Resolve *function*'s owner or retain analysis's actionable failure."""
-    owner = owning_module(module, function)
-    if owner is None:
-        raise AnalysisError(
-            f"function {function.name!r} is owned by no single node of module "
-            f"{module.name!r}; analysis answers ownership within the tree it was "
-            "given, never by name"
-        )
-    return owner
-
-
-def _substitute_module_tree(module: Module, dims: Mapping[str, int]) -> Module:
-    effective = tuple(
-        substitute_topology_dims(topology, dims) for topology in module.effective_topologies()
+def _required_frame(module: Module, function: Function):
+    """Read a function directly from its supplied owning definition."""
+    if module.owns(function, derived=True):
+        return CallFrame(module, function)
+    raise AnalysisError(
+        f"function {function.name!r} is owned by no single node of module "
+        f"{module.name!r}; supply its owning module directly"
     )
-
-    def declared(node: Module) -> Module:
-        children = tuple(declared(child) for child in node.modules)
-        topologies = (
-            None
-            if node.topologies is None
-            else tuple(substitute_topology_dims(topology, dims) for topology in node.topologies)
-        )
-        if children == node.modules and topologies == node.topologies:
-            return node
-        return replace(node, modules=children, topologies=topologies)
-
-    children = tuple(declared(child) for child in module.modules)
-    if children == module.modules and effective == module.effective_topologies():
-        return module
-    try:
-        target = module.resolve_target()
-    except ValueError:
-        target = module.target
-    return replace(module, modules=children, target=target, topologies=effective)
-
-
-def _require_concrete_geometry(
-    module: Module,
-    function: Function,
-    *,
-    error_type: type[ValueError],
-) -> None:
-    for owner in _reached_owners(module, function):
-        for topology in owner.effective_topologies():
-            if static_dim_value(topology.size) is None:
-                raise error_type(
-                    f"program topology level {topology.name!r} still states "
-                    f"symbolic extent {topology.size!r}; bind every dimension "
-                    "before analysis"
-                )
-    _require_concrete_function_geometry(function, error_type=error_type)
-
-
-def _require_concrete_function_geometry(
-    function: Function,
-    *,
-    error_type: type[ValueError],
-) -> None:
-    if not is_concrete(function):
-        raise error_type(
-            f"{function.name!r} still states symbolic dimensions in its reachable "
-            "Function or Mesh geometry; bind every dimension before analysis"
-        )
-
-
-def _module_paths(module: Module) -> dict[int, str]:
-    paths = {id(module): ""}
-
-    def visit(owner: Module, prefix: str) -> None:
-        for child in owner.modules:
-            path = f"{prefix}.{child.name}" if prefix else child.name
-            paths[id(child)] = path
-            visit(child, path)
-
-    visit(module, "")
-    return paths
-
-
-def _call_reading(module: Module, caller: Function, call: Call) -> Module | None:
-    owner = child_module_of(module, caller, call.target)
-    if owner is None:
-        return None
-    return owner
-
-
-def _resource_parameters(
-    module: Module, function: Function
-) -> tuple[tuple[_ResourceKey, Var], ...]:
-    """ConstTensor declarations needed by reached Module readings."""
-    paths = _module_paths(module)
-    needed: dict[_ResourceKey, Var] = {}
-    for caller in reachable_functions(function):
-        for expr in collect_exprs(caller.body):
-            if not isinstance(expr, Call) or not isinstance(expr.target, Function):
-                continue
-            owner = _call_reading(module, caller, expr)
-            if owner is None:
-                continue
-            for param in expr.target.params:
-                if not param.is_const:
-                    continue
-                key = (paths[id(owner)], param.name)
-                previous = needed.get(key)
-                if previous is not None and previous.type != param.type:
-                    raise AnalysisError(
-                        f"reachable ConstTensor {param.name!r} in Module "
-                        f"{owner._owner_path()!r} has conflicting types "
-                        f"{previous.type!r} and {param.type!r}"
-                    )
-                needed.setdefault(key, param)
-
-    ordered: list[tuple[_ResourceKey, Var]] = []
-    emitted: set[_ResourceKey] = set()
-    for owner in subtree(module):
-        for owned in owner.functions:
-            if not isinstance(owned, Function):
-                continue
-            for param in owned.params:
-                if not param.is_const:
-                    continue
-                key = (paths[id(owner)], param.name)
-                declaration = needed.get(key)
-                if declaration is not None and key not in emitted:
-                    ordered.append((key, declaration))
-                    emitted.add(key)
-    return tuple(ordered)
 
 
 def _view_metadata(expr: Expr) -> tuple:
     """Authored metadata carried into a fresh analysis view."""
-    return tuple(
-        item
-        for item in expr.metadata
-        if type(item) not in _DERIVED_METADATA and type(item) is not BindingMetadata
-    )
+    return tuple(item for item in expr.metadata
+                 if type(item) not in _DERIVED_METADATA and type(item) is not BindingMetadata)
 
 
-class _AnalysisViewCloner(BindingSubstitutionCloner):
-    """Clone one inline call site after substituting its parameter bindings.
+def _prepare_function(function):
+    """Clear derived facts and number calls, including authored loop bounds."""
+    seen, number = set(), 0
 
-    ``BindingSubstitutionCloner`` preserves sharing within this call site by
-    memoizing source expressions by identity. ``_Inliner`` creates a fresh
-    instance for every call site, so two calls to the same Function still get
-    independent cloned bodies and derived metadata.
-    """
+    def prepare(node):
+        nonlocal number
+        if isinstance(node, ModuleList) or id(node) in seen:
+            return
+        seen.add(id(node))
+        node.metadata = _view_metadata(node)
+        if isinstance(node, Function):
+            children = (*node.params, node.body)
+        elif isinstance(node, LoopRegion):
+            children = (*node.args, node.induction_var, *node.params,
+                        *(bound for bound in (node.start, node.extent, node.step) if isinstance(bound, Expr)),
+                        node.body, *node.yield_values)
+        elif isinstance(node, MeshRegion):
+            children = (*node.args, *node.params, node.body)
+        else:
+            children = expr_children(node)
+        for child in children:
+            prepare(child)
+        if isinstance(node, Call):
+            node.metadata = (*node.metadata, BindingMetadata(f"v{number}"))
+            number += 1
 
-    def __init__(self, owner, function, path, active) -> None:
-        super().__init__(metadata=_view_metadata)
-        self.owner = owner
-        self.function = function
-        self.path = path
-        self.active = active
-
-    def visit_Call(self, expr: Call, ctx: Mapping[int, Expr]) -> Expr:
-        target = expr.target
-        call_index = None
-        if isinstance(target, Function):
-            call_index = self.owner.function_call_counters[-1]
-            self.owner.function_call_counters[-1] += 1
-        new_args = tuple(self.visit(arg, ctx) for arg in expr.args)
-        if isinstance(target, Function):
-            reading = _call_reading(self.owner.module, self.function, expr)
-            supplied = iter(new_args)
-            callee_env: dict[int, Expr] = {}
-            for param in target.params:
-                if reading is not None and param.is_const:
-                    callee_env[id(param)] = self.owner.resources[
-                        (self.owner.module_paths[id(reading)], param.name)
-                    ]
-                else:
-                    callee_env[id(param)] = next(supplied)
-            rebuilt = self.owner.function_body(
-                target,
-                callee_env,
-                (*self.path, target.name, str(call_index)),
-                self.active,
-            )
-            return rebuilt
-        metadata = (*_view_metadata(expr), BindingMetadata(self.owner._binding()))
-        return replace(expr, args=new_args, metadata=metadata)
-
-    def visit_MeshRegion(self, expr: MeshRegion, ctx: Mapping[int, Expr]) -> MeshRegion:
-        """Inline through a HIR execution region while preserving its boundary."""
-        params = tuple(replace(param, metadata=_view_metadata(param)) for param in expr.params)
-        body_ctx = {**ctx, **{id(old): new for old, new in zip(expr.params, params)}}
-        rebuilt = replace(
-            expr,
-            params=params,
-            args=tuple(self.visit(arg, ctx) for arg in expr.args),
-            body=self.visit(expr.body, body_ctx),
-            metadata=_view_metadata(expr),
-        )
-        from tilefoundry.visitor_registry.verify import verify_region_isolated  # noqa: PLC0415
-
-        verify_region_isolated(rebuilt)
-        return rebuilt
-
-    def default_visit(self, expr: Expr, ctx: Mapping[int, Expr]) -> Expr:
-        raise AnalysisError(f"cannot inline unsupported HIR node {type(expr).__name__}")
+    prepare(function)
 
 
-class _Inliner:
-    def __init__(
-        self,
-        module: Module,
-        resources: Mapping[_ResourceKey, Var],
-        module_paths: Mapping[int, str],
-        used_names: set[str],
-    ) -> None:
-        self.module = module
-        self.resources = resources
-        self.module_paths = module_paths
-        self.used_names = used_names
-        self.next_binding = 0
-        self.function_call_counters: list[int] = []
+class _CheckCalls(CallFrameVisitor[None]):
+    def __init__(self, frame, derive, label):
+        super().__init__()
+        self.frame, self.derive, self.label = frame, derive, label
 
-    def _binding(self) -> str:
-        while True:
-            name = f"v{self.next_binding}"
-            self.next_binding += 1
-            if name not in self.used_names:
-                self.used_names.add(name)
-                return name
+    def default_visit_leaf(self, expr, operands, mesh):
+        return None
 
-    def function_body(
-        self,
-        function: Function,
-        env: Mapping[int, Expr],
-        path: tuple[str, ...],
-        active: frozenset[int],
-    ) -> Expr:
-        identity = id(function)
-        if identity in active:
-            raise AnalysisError(
-                f"cannot inline recursive Function call path through {function.name!r}"
-            )
-        if function.body is None:
-            raise AnalysisError(f"cannot inline Function {function.name!r} without a body")
-        self.function_call_counters.append(0)
-        try:
-            return self.expr(
-                function.body,
-                env,
-                function,
-                path,
-                active | {identity},
-            )
-        finally:
-            self.function_call_counters.pop()
+    def visit_MeshRegion(self, region, mesh=None):
+        for arg in region.args:
+            self.visit(arg, mesh)
+        self.visit(region.body, make_mesh(mesh, region.mesh) if mesh else region.mesh)
 
-    def expr(
-        self,
-        expr: Expr,
-        env: Mapping[int, Expr],
-        function: Function,
-        path: tuple[str, ...],
-        active: frozenset[int],
-    ) -> Expr:
-        return _AnalysisViewCloner(self, function, path, active).visit(expr, env)
-
-
-def _inline_view(module: Module, function: Function, budget: int) -> Function:
-    declared_resources = _resource_parameters(module, function)
-    paths = _module_paths(module)
-    params = tuple(replace(param, metadata=_view_metadata(param)) for param in function.params)
-    resources: dict[_ResourceKey, Var] = {}
-    appended: list[Var] = []
-    for key, declaration in declared_resources:
-        prefix, name = key
-        qualified = f"{prefix}.{name}" if prefix else name
-        promoted = replace(
-            declaration,
-            name=qualified,
-            metadata=_view_metadata(declaration),
-        )
-        resources[key] = promoted
-        appended.append(promoted)
-
-    view_params = (*params, *appended)
-    env = {id(old): new for old, new in zip(function.params, params)}
-    inliner = _Inliner(module, resources, paths, {param.name for param in view_params})
-    body = inliner.function_body(function, env, (function.name,), frozenset())
-    size = len(collect_exprs(body))
-    if size > budget:
-        raise AnalysisError(
-            f"inlining {function.name!r} produces {size} body nodes, exceeding "
-            f"the node budget {budget}"
-        )
-    view = replace(
-        function,
-        type=callable_type_for(view_params, body.type),
-        metadata=_view_metadata(function),
-        params=view_params,
-        body=body,
-        return_type=body.type,
-        variants=(),
-        converters=(),
-    )
-    view._specialized_from = function
-    return view
-
-
-class InlineCloner:
-    """Clone and inline one authored Function into an analysis view."""
-
-    def __init__(self, module: Module, function: Function, budget: int = _INLINE_NODES) -> None:
-        self.module = module
-        self.function = function
-        self.budget = budget
-
-    def clone(self) -> Function:
-        """Return a fresh single-function view with every call site inlined."""
-        return _inline_view(self.module, self.function, self.budget)
+    def visit_Call(self, call, mesh=None):
+        self.visit_operands(call, mesh)
+        inner = self.callee_frame(call, self.frame)
+        if inner is None:
+            return
+        callee = inner.function
+        implicit = not isinstance(call.target, Function)
+        given = iter(call.args)
+        types = tuple(param.type if implicit and param.is_const else next(given).type
+                      for param in callee.params)
+        self.derive(inner, types, mesh, f"{self.label}/{binding_name(call)}")
 
 
 def check_program(
@@ -569,13 +223,14 @@ def check_program(
     function: Function,
     *,
     topology_level: str | None = None,
-    budget: int = _INLINE_NODES,
+    budget: int = _NODE_BUDGET,
     analyzers: tuple[object, ...] = (),
-) -> Function:
+    dims: Mapping[str, int] | None = None,
+) -> tuple[Module, Function]:
     """Prove one program holds together, then return the view analysis will read.
 
-    The returned Function has no Function-call wrapper. LoopRegion survives
-    unchanged: a loop stays a loop. The authored Module and Function are untouched.
+    The returned Module retains calls and has one typed derived body per definition.
+    LoopRegion survives unchanged. The authored Module and Function are untouched.
 
     Each analysis states what it needs of the program through its own checker,
     and every one of them answers before any of them writes. A checker that
@@ -583,13 +238,81 @@ def check_program(
     """
     if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
         raise AnalysisError(
-            f"inlining {function.name!r} needs a non-negative integer node budget, got {budget!r}"
+            f"checking {function.name!r} needs a non-negative integer node budget, got {budget!r}"
         )
-    derived = InlineCloner(module, function, budget).clone()
-    TypeInferVisitor(ranges=True).visit(
-        derived, TypeInferContext(scope=FunctionScope(module, derived))
-    )
-    _require_concrete_geometry(module, derived, error_type=AnalysisError)
+    if dims is not None:
+        if not isinstance(dims, Mapping) or not dims:
+            raise SpecializationError(
+                f"specialising {function.name!r} needs a non-empty mapping of dimension names to extents, got {dims!r}"
+            )
+        for name, extent in dims.items():
+            if not isinstance(name, str) or not name:
+                raise SpecializationError(f"specialising {function.name!r}: {name!r} is not a dimension name")
+            if isinstance(extent, bool) or not isinstance(extent, int):
+                raise SpecializationError(
+                    f"specialising {function.name!r}: dimension {name!r} takes an integer extent, got {extent!r}"
+                )
+    supplied = {} if dims is None else dict(dims)
+    original_frame = _required_frame(module, function)
+    declared = {}
+    collector = _DimVarCollector(declared, supplied)
+    collector.visit_function(function, original_frame)
+    if collector.cycles:
+        raise AnalysisError(f"recursive call path through {collector.cycles[0]!r}")
+    if collector.missing_bodies:
+        name, path = collector.missing_bodies[0]
+        raise AnalysisError(f"cannot analyze Function {name!r} without a body at {path!r}")
+    unknown = sorted(set(supplied) - declared.keys())
+    if unknown:
+        raise SpecializationError(f"{function.name!r} has no dimension named {unknown!r}; it states {sorted(declared)}")
+    for name, extent in supplied.items():
+        substitute_shape_dim(declared[name], {name: extent})
+    cloner = InstantiateDimensionCloner(dims)
+    for reached, _frame in collector.functions:
+        cloner.function(reached)
+    bound_root = cloner.function(function)
+    bound_module = cloner.module(module)
+    initial = CallFrame(bound_module, bound_root)
+    residual = set(dim_vars_reached(bound_root, initial))
+    for owner in cloner.modules.values():
+        residual.update(dim_vars_by_name(owner.topologies))
+    if residual:
+        raise SpecializationError(
+            f"{function.name!r} still states {sorted(residual)} as ranges after binding {sorted(supplied)}; every dimension has to be given an extent"
+        )
+    signatures = {}
+
+    def derive(frame, types, mesh, label):
+        definition = frame.function
+        identity = id(definition)
+        signature = (types, mesh)
+        if identity in signatures:
+            previous, path = signatures[identity]
+            if previous != signature:
+                raise AnalysisError(
+                    f"callee {definition.name!r} has incompatible signatures at {path!r} and "
+                    f"{label!r}: {previous!r} versus {signature!r}"
+                )
+            return
+        signatures[identity] = signature, label
+        for param, type_ in zip(definition.params, types, strict=True):
+            param.type = type_
+        _prepare_function(definition)
+        TypeInferVisitor(ranges=True).visit(definition, TypeInferContext(frame=frame, current_mesh=mesh))
+        definition.return_type = definition.body.type
+        definition.type = callable_type_for(definition.params, definition.return_type)
+        _CheckCalls(frame, derive, label).visit(definition.body, mesh)
+
+    root, module = bound_root, bound_module
+    derive(initial, tuple(p.type for p in root.params), None, function.name)
+
+    frames = tuple(CallFrameVisitor.walk_frames(CallFrame(module, root)))
+    functions = tuple(frame.function for frame in frames)
+    size = sum(len(collect_exprs(body.body)) for body in functions)
+    if size > budget:
+        raise AnalysisError(
+            f"analysis program {function.name!r} has {size} derived body nodes, exceeding the node budget {budget}"
+        )
     target = module.resolve_target()
     for topology in module.effective_topologies():
         try:
@@ -607,52 +330,26 @@ def check_program(
                 f"program topology level {topology_level!r} is invalid: {error}"
             ) from None
 
-    validate_call_context(module, reachable_functions(function))
-    ctx = analysis_check_context(module, derived, topology_level)
+    for frame in frames:
+        for call in collect_exprs(frame.function.body):
+            if not isinstance(call, Call) or (inner := CallFrameVisitor.callee_frame(call, frame)) is None:
+                continue
+            for field, noun in (("target", "target"), ("topologies", "topology hierarchy")):
+                expected, actual = getattr(frame, field), getattr(inner, field)
+                if expected != actual:
+                    suffix = "one kernel invocation runs one target" if field == "target" else (
+                        "one kernel invocation runs one hierarchy -- declare none on the child and inherit"
+                    )
+                    raise AnalysisError(
+                        f"{frame.module.name!r} calls {inner.module.name!r}, which resolves "
+                        f"a different {noun} {actual!r} against {expected!r}; {suffix}"
+                    )
+    ctx = analysis_check_context(module, root, topology_level)
     for analyzer in analyzers:
         checker = analyzer.get_checker()
         if checker is None:
             continue
         checker.check_target_facts(ctx)
-        checker.visit(derived.body, ctx)
-    return derived
-
-
-def validate_call_context(module: Module, functions: Iterable[Function]) -> None:
-    """Reject a reached call whose two ends do not share one execution context.
-
-    Checked over what the selected query reaches, not at construction: an
-    attached child no call reaches has no edge to validate. Inheritance is the
-    canonical spelling, so a child declaring the caller's hierarchy explicitly
-    passes and any other value is a different context, not a nested launch.
-    """
-    for caller in functions:
-        caller_owner = _required_owner(module, caller)
-        for callee in called_functions(caller):
-            callee_owner = _required_owner(module, callee)
-            if callee_owner is caller_owner:
-                continue
-            if not any(child is callee_owner for child in caller_owner.modules):
-                raise AnalysisError(
-                    f"{caller.name!r} calls {callee.name!r} of module "
-                    f"{callee_owner.name!r}, which is not a child of "
-                    f"{caller_owner.name!r}; a call reaches a child of its own module"
-                )
-            if callee_owner.effective_topologies() != caller_owner.effective_topologies():
-                raise AnalysisError(
-                    f"{caller_owner.name!r} calls {callee_owner.name!r}, which "
-                    f"resolves a different topology hierarchy "
-                    f"{callee_owner.effective_topologies()} against "
-                    f"{caller_owner.effective_topologies()}; one kernel invocation "
-                    "runs one hierarchy -- declare none on the child and inherit"
-                )
-
-
-__all__ = [
-    "AnalysisCheckContext",
-    "InlineCloner",
-    "PerformanceChecker",
-    "check_program",
-    "program_dim_vars",
-    "validate_call_context",
-]
+        for body in functions:
+            checker.visit(body.body, replace(ctx, function=body))
+    return module, root

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 _BAD_MODULE = (
@@ -50,7 +51,7 @@ def test_logical_analyses_run(tf, cmine, tmp_path) -> None:
         assert conclusion in report, conclusion
 
 
-def test_mega_kernel_reports_four_families_on_one_expanded_program(tf, tmp_path) -> None:
+def test_mega_kernel_reports_four_families_with_retained_occurrences(tf, tmp_path) -> None:
     source = Path(__file__).resolve().parents[1] / "fixtures" / "placed" / "moe_mega_kernel.py"
     done = tf(
         "analyze",
@@ -65,7 +66,12 @@ def test_mega_kernel_reports_four_families_on_one_expanded_program(tf, tmp_path)
     assert done.returncode == 0, done.stderr
     assert done.stdout == ""
     payload = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
-    source_lines = payload["source"].splitlines()
+    rendered = payload["source"]
+    sources = {
+        function["function"]: block.rstrip().splitlines()
+        for function, block in zip(payload["functions"],
+            re.split(r"(?m)(?=^from __future__ import annotations$)", rendered)[1:], strict=True)
+    }
 
     as_text = tf(
         "analyze",
@@ -83,21 +89,27 @@ def test_mega_kernel_reports_four_families_on_one_expanded_program(tf, tmp_path)
 
     families = ["compute-cost", "memory", "roofline", "performance"]
     assert payload["requested"] == payload["executed"] == families
-    assert set(payload["function_records"]) == set(families)
-    assert len(payload["calls"]) == 7
-    for row in payload["calls"]:
+    assert set(payload["functions"][0]['function_records']) == set(families)
+    rows = [row for function in payload["functions"] for row in function["calls"]]
+    assert len(rows) == 9
+    cost_rows = [row for row in rows if "compute-cost" in row]
+    assert len(cost_rows) == 9
+    for function, row in ((function, row) for function in payload["functions"] for row in function["calls"]):
+        source_lines = sources[function["function"]]
         name, line_text = row["value"].rsplit(":", 1)
         line = int(line_text)
         assert 1 <= line <= len(source_lines)
         assert f"{name} =" in source_lines[line - 1]
     assert all(
         set(row) - {"performance"} == {"value", "compute-cost", "memory", "roofline"}
-        for row in payload["calls"]
+        for row in cost_rows
     )
-    assert [index for index, row in enumerate(payload["calls"]) if "performance" in row] == [
+    assert [index for index, row in enumerate(rows) if "performance" in row] == [
+        0,
         1,
+        2,
         4,
-        6,
+        7,
     ]
     assert text.startswith(
         "# analysis target=nvidia.h200_sxm module=MoEMegaKernel function=experts"
@@ -191,7 +203,7 @@ def test_performance_resolves_derived_execution_geometry(tf, derived_prefill, tm
     assert bound.returncode == 0, bound.stderr
     assert bound.stdout == ""
     payload = json.loads((tmp_path / "bound.json").read_text(encoding="utf-8"))
-    record = payload["function_records"]["performance"]
+    record = payload["functions"][0]['function_records']["performance"]
     assert record == {
         "timeline": {
             "start_ns": 0,
@@ -305,7 +317,7 @@ def test_a_dim_that_is_not_understood_is_refused(tf, cmine, tmp_path) -> None:
 
 
 def test_analyze_names_an_open_dimension_and_suggests_extents(tf, shipped, tmp_path) -> None:
-    model = f"{Path(shipped['models']) / 'qwen3_5_35b_a3b' / 'model.py'}:Qwen3_5_35B_A3B.layer3.mixer.full_attention"
+    model = f"{Path(shipped['models']) / 'qwen3_5_35b_a3b' / 'model.py'}:Qwen3_5FullAttention.full_attention"
     done = tf("analyze", model, str(tmp_path / "open.py"), "--memory")
     assert done.returncode == 1
     assert done.stdout == ""
@@ -315,7 +327,7 @@ def test_analyze_names_an_open_dimension_and_suggests_extents(tf, shipped, tmp_p
 
 
 def test_analyze_rejects_several_extents_for_one_dimension(tf, shipped, tmp_path) -> None:
-    model = f"{Path(shipped['models']) / 'qwen3_5_35b_a3b' / 'model.py'}:Qwen3_5_35B_A3B.layer3.mixer.full_attention"
+    model = f"{Path(shipped['models']) / 'qwen3_5_35b_a3b' / 'model.py'}:Qwen3_5FullAttention.full_attention"
     done = tf("analyze", model, str(tmp_path / "several.py"), "--dim", "ctx_len=0,1")
     assert done.returncode == 1
     assert done.stdout == ""

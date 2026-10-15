@@ -27,72 +27,30 @@ class TypeInferResults:
     value_range: tuple[int, int] | None = None
 
 
-@dataclass(frozen=True)
-class FunctionScope:
-    """Where a walk is reading: one Module tree, and whose body it is in.
-
-    A `Function` carries no execution context and one object is reachable from
-    more than one program, so anything answered about the function being read --
-    which Module owns it, what it may reach -- is answered within the tree the
-    walk was given rather than globally.
-    """
-
-    module: Module
-    function: Function
-
-
 @dataclass
 class TypeInferContext:
     """Track walk location and route type-inference queries.
 
-    Derivation lives in ``TypeInferVisitor``. ``scope`` says where the walk is
+    Derivation lives in ``TypeInferVisitor``. ``frame`` says where the walk is
     reading. ``current_mesh`` is the composed HIR execution domain.
     See [visitor-registry §4](docs/spec/visitor-registry.md#4-instance-1--typeinfer).
     """
 
-    scope: FunctionScope | None = None
+    frame: CallFrame | None = None
     current_mesh: Mesh | None = None
     memo: dict[int, tuple[Expr, Type]] = field(default_factory=dict, repr=False, compare=False)
-    instantiated_memo: dict[tuple[int, tuple[Type, ...], Mesh | None], Type] = field(
+    instantiated_memo: dict[tuple, Type] = field(
         default_factory=dict, repr=False, compare=False
     )
 
-    def child_for(self, callee: object):
-        """Return the direct child module that owns *callee*, if any."""
-        if self.scope is None or self.scope.module is None:
-            return None
-        from tilefoundry.ir.core.module import child_module_of  # noqa: PLC0415
-
-        return child_module_of(self.scope.module, self.scope.function, callee)
-
-    def scope_for(self, callee: object) -> FunctionScope | None:
-        """Return the runtime scope in which *callee*'s body is read."""
-        if self.scope is None:
-            child = self.child_for(callee)
-            return None if child is None else FunctionScope(child, callee)
-        child = self.child_for(callee)
-        return FunctionScope(child or self.scope.module, callee)
-
     def resolve_target(self):
-        """The Target whose rules apply here, or None where no Module in scope declares one."""
-        if self.scope is None:
-            return None
-        try:
-            return self.scope.module.resolve_target()
-        except ValueError:
-            return None
+        """The target carried by this visitor's current call frame."""
+        return None if self.frame is None else self.frame.target
 
     def for_callee(self, callee: object) -> TypeInferContext:
-        """Move to *callee* with a fresh scope memo and the shared call cache.
-
-        The callee inherits the call site's mesh. A MeshRegion in its body
-        composes that scope using the same rules as an authored nested region.
-        """
-        return replace(
-            self,
-            scope=self.scope_for(callee),
-            memo={},
-        )
+        """Enter a same-module function with fresh type bindings."""
+        frame = None if self.frame is None else replace(self.frame, function=callee)
+        return replace(self, frame=frame, memo={})
 
     def type_of(self, expr: Expr) -> Type:
         """The type this inference derived or bound for *expr*.
@@ -246,7 +204,6 @@ class Cost:
 
 
 __all__ = [
-    "FunctionScope",
     "TypeInferContext",
     "VerifyContext",
     "CostContext",

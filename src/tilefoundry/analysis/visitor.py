@@ -31,6 +31,8 @@ class AnalyzeContext:
 
     @property
     def topologies(self):
+        if self.current is not None and self.current.occurrence is not None:
+            return self.current.occurrence.frame.topologies
         return self.module.effective_topologies()
 
     def type_of(self, expr):

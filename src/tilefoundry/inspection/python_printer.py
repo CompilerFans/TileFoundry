@@ -30,7 +30,7 @@ from tilefoundry.ir.core import (
     get_metadata,
 )
 from tilefoundry.ir.core.kinds import BinaryKind, UnaryKind
-from tilefoundry.ir.core.module import Module
+from tilefoundry.ir.core.module import Module, ModuleList
 from tilefoundry.ir.core.param_def import variadic_item_annotation
 from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.ir.hir.loop_region import LoopRegion
@@ -106,6 +106,14 @@ class HirPrinter(PythonPrinter):
 
     def reference(self, expr: Expr) -> str:
         """Return the binding that denotes one value in the current definition."""
+        if isinstance(expr, ModuleList):
+            return expr.key
+        if (
+            isinstance(expr, Call)
+            and isinstance(expr.target, TupleGetItem)
+            and isinstance(expr.args[0], ModuleList)
+        ):
+            return self._tuple_get_item_text(expr)
         if isinstance(expr, Tuple):
             return self.tuple_reference(expr.elements)
         if id(expr) in self._param_alias:
@@ -142,6 +150,10 @@ class HirPrinter(PythonPrinter):
         """Render one HIR call after expression-level dispatch selected it."""
         target = expr.target
         args_text = ", ".join(self.reference(arg) for arg in expr.args)
+        if isinstance(target, ModuleList):
+            return f"{target.key}({args_text})"
+        if isinstance(target, Call):
+            return f"{self.reference(target)}({args_text})"
         if isinstance(target, HirFunction):
             binding = _module_callee_binding(target, self._child_entries)
             return f"{binding or target.name}({args_text})"
@@ -580,6 +592,11 @@ def _emit_def(
             value = _param_alias[id(value)]
         return value
 
+    _instance_targets = {
+        id(expr.target)
+        for expr in _order
+        if isinstance(expr, Call) and isinstance(expr.target, Call)
+    }
     _op_names_set: set[str] = set()
     for expr in _order:
         if isinstance(expr, Call):
@@ -811,6 +828,11 @@ def _emit_def(
         key = id(expr)
         if key in printed:
             return
+        if key in _instance_targets:
+            for operand in expr_children(expr):
+                _emit_expr(operand, level)
+            printed.add(key)
+            return
         if key in _inlined_start_ids:
             printed.add(key)
             return
@@ -922,7 +944,8 @@ def _emit_def(
 
     for expr in _order:
         if (
-            isinstance(expr, Var)
+            isinstance(expr, (Var, ModuleList))
+            or id(expr) in _instance_targets
             or id(expr) in _grid_internal_ids
             or id(expr) in _mesh_region_internal_ids
         ):
@@ -1133,11 +1156,6 @@ def module_to_python(fn: HirFunction, module_name: str = "M") -> str:
     return as_script(fn, module=module_name)
 
 
-def _module_hir_functions(mod: Module) -> tuple[HirFunction, ...]:
-    """The Module's HIR functions."""
-    return tuple(fn for fn in _emission_order(mod) if isinstance(fn, HirFunction))
-
-
 def _emission_order(mod: Module) -> tuple:
     """A Module's functions in the order the printed class body binds them.
 
@@ -1152,12 +1170,52 @@ def _emission_order(mod: Module) -> tuple:
     return ordered + (entry,) if entry is not None else ordered
 
 
-def _module_tree_functions(mod: Module) -> tuple[HirFunction, ...]:
-    """Every HIR function owned by *mod* or any Module beneath it."""
-    functions = list(_module_hir_functions(mod))
-    for child in mod.modules:
-        functions.extend(_module_tree_functions(child))
-    return tuple(functions)
+def _module_definition_order(root, *, before_children=False):
+    """Definitions once, children before the slots that reference them."""
+    seen = set()
+    ordered = []
+
+    def visit(node):
+        if id(node) in seen:
+            return
+        seen.add(id(node))
+        if before_children:
+            ordered.append(node)
+        for slot in node.children.values():
+            for child in slot.elements:
+                visit(child)
+        if not before_children:
+            ordered.append(node)
+
+    visit(root)
+    return ordered
+
+
+def _definition_names(root, root_name):
+    names = {id(root): root_name}
+    taken = {root_name}
+    for node in _module_definition_order(root, before_children=True):
+        if node is root:
+            continue
+        name = node.name
+        suffix = 2
+        while name in taken:
+            name = f"{node.name}_{suffix}"
+            suffix += 1
+        taken.add(name)
+        names[id(node)] = name
+    return names
+
+
+def _slot_binding(key, slot, names):
+    definitions = [names[id(element)] for element in slot.elements]
+    if not slot.indexed:
+        value = definitions[0]
+    elif all(element is slot.elements[0] for element in slot.elements):
+        value = f"ModuleList({definitions[0]}, {len(slot)})"
+    else:
+        value = f"ModuleList(({', '.join(definitions)},))"
+    return f"{key} = {value}"
 
 
 def _module_decorator_line(mod: Module, entry_name: str | None, ctx: HirPrintContext) -> str:
@@ -1185,8 +1243,9 @@ def _emit_module_class(
     ctx: HirPrintContext,
     indent: str,
     options: PythonPrintOptions,
+    definition_names,
 ) -> list[str]:
-    """One ``@module`` class block: its nested Modules, then its functions.
+    """One ``@module`` class block: its instance slots, then its functions.
 
     Children first, because a body calling one names the attribute it is bound
     to and a class body binds in the order it is written.
@@ -1195,19 +1254,16 @@ def _emit_module_class(
     ctx.topologies = mod.topologies if mod.topologies is not None else previous_topologies
     lines = [_module_decorator_line(mod, mod.entry, ctx), f"class {module_name}:"]
     ordered = _emission_order(mod)
-    child_entries = {
-        id(child.entry_function()): child.name
-        for child in mod.modules
-        if child.entry is not None and isinstance(child.entry_function(), HirFunction)
-    }
-    blocks: list[list[str]] = [
-        _emit_module_class(child, child.name, ctx, indent, options) for child in mod.modules
-    ]
+    child_entries = {}
+    bindings = [_slot_binding(key, slot, definition_names) for key, slot in mod.children.items()]
+    blocks: list[list[str]] = [bindings] if bindings else []
     for fn in ordered:
         if isinstance(fn, HirFunction):
             blocks.append(_emit_decorated_defs(fn, ctx, indent, options, child_entries))
         elif isinstance(fn, PrimFunction):
-            tir_block = _tir_function_block(fn)
+            from .tir_printer import _module_symbol_bindings  # noqa: PLC0415
+
+            tir_block = _tir_function_block(fn, symbol_bindings=_module_symbol_bindings(mod))
             ctx.imports.update(tir_block.imports)
             blocks.append(tir_block)
         else:
@@ -1237,27 +1293,33 @@ def _module_to_python(
             entry=fn_or_module.name,
         )
         module_name = root.name
-    functions = _module_tree_functions(root)
+    functions = tuple(fn for node in _module_definition_order(root) for fn in node.functions)
     if not functions:
-        raise TypeError("HIR Module printer requires at least one HIR function")
+        raise TypeError("Module printer requires at least one function")
     entry = root.entry_function() if root.entry is not None else None
     if entry is not None and not isinstance(entry, (HirFunction, PrimFunction)):
         raise TypeError("Module printer requires a function entry")
 
     indent4 = "    "
     ctx = _new_hir_context(target=root.target)
-    lines = _emit_module_class(
-        root,
-        module_name,
-        ctx,
-        indent4,
-        options or PythonPrintOptions(),
-    )
+    names = _definition_names(root, module_name)
+    lines = []
+    for node in _module_definition_order(root):
+        if lines:
+            lines.append("")
+        lines.extend(
+            _emit_module_class(
+                node, names[id(node)], ctx, indent4, options or PythonPrintOptions(), names
+            )
+        )
+        if node is not root and names[id(node)] != node.name:
+            lines.append(f"{names[id(node)]}.name = {node.name!r}")
+    if root.children:
+        lines.extend(
+            (
+                "",
+                f"del {', '.join(names[id(node)] for node in _module_definition_order(root) if node is not root)}",
+            )
+        )
     header = ctx.header()
     return "\n".join(header + lines) + "\n"
-
-
-def _module_tree(root: Module) -> Iterator[Module]:
-    yield root
-    for child in root.modules:
-        yield from _module_tree(child)

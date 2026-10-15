@@ -11,7 +11,8 @@ Authored DSL source imports its authoring surface with `from tilefoundry.dsl imp
 child Modules, and ordinary methods. Module authoring is two-phase: class execution records
 Function, specialization, and converter declarations; finalization attaches all child Modules
 and puts them in parser scope before parsing Functions in source order. `@func` produces an HIR
-Function; `@prim_func` produces a TIR PrimFunction.
+Function; `@prim_func` produces TIR ([tir §1.3](./tir.md#13-primfunction)).
+Explicit PrimFunction targets survive deferred parsing.
 `specialize` and `converter` register variants and weight converters on an existing HIR Function.
 
 ```python
@@ -62,11 +63,17 @@ statement span and their carry binding name.
 optional base/key for one parse. Call types inferred while parsing use that target's rules
 ([visitor-registry §4](./visitor-registry.md#4-instance-1--typeinfer)), so in a Module that
 declares its Target a type the parser records is the type the built Module later infers. A
-callee's own owner chain answers first; a child the Module being built will hold has no
-Target of its own yet, so it is typed with the Target that Module declares, and any other
-scope without a Target is typed with none. `FunctionRole` is `ROOT`, `VARIANT`, or `CONVERTER`.
+pending Module supplies its declared Target to the parser's current call frame.
+`FunctionRole` is `ROOT`, `VARIANT`, or `CONVERTER`.
 `ParseError` is the single authored-source diagnostic type and includes source location and
 recursive parse situation. These are the only public parser symbols.
+
+Instance authoring and call contracts follow
+[core-ir §1.3](./core-ir.md#13-modulelist) and [§2.1](./core-ir.md#21-call).
+Numeric subscripts become Constant expressions; static index checks run only
+in type inference. Call construction MUST NOT project an indexed slot's return
+type before validation. Retained TIR calls produce unit-valued statements
+checked in the enclosing Module context.
 
 ### 1.5 Mesh declarations and region captures
 
@@ -250,8 +257,8 @@ variadic-inputs       ::= '[' (runtime-expression (',' runtime-expression)*)? ']
                           | expression
 op-value              ::= primary '(' ((expression | keyword-name '=' expression) (',' (expression |
                           keyword-name '=' expression))*)? ')'
-op-call               ::= primary '(' ((expression | keyword-name '=' expression) (',' (expression |
-                          keyword-name '=' expression))*)? ')'
+op-call               ::= (primary | expression '[' expression ']') '(' ((expression | keyword-name
+                          '=' expression) (',' (expression | keyword-name '=' expression))*)? ')'
 launch                ::= callee '(' ')'
 slice-endpoint-binary ::= index-endpoint dim-op index-endpoint
 mesh-coordinate       ::= identifier '.' string-literal

@@ -9,13 +9,16 @@ from __future__ import annotations
 import dataclasses
 from typing import Iterable
 
+from tilefoundry.inspection.tir_printer import TirPrinter
 from tilefoundry.ir.core import Expr, Var, VerifyError
 from tilefoundry.ir.core.expr import Call, Constant
+from tilefoundry.ir.core.module import Module, ModuleList
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
 from tilefoundry.ir.hir.specialize import canonical_specialization_signature
+from tilefoundry.ir.module_utils import list_call_paths
 from tilefoundry.ir.pattern import PatternMatcher, RangePattern, between_rules, locate_dim_var
 from tilefoundry.ir.tir.launch import Launch
 from tilefoundry.ir.tir.memory import AllocTensor as AllocTensorOp
@@ -55,7 +58,9 @@ from tilefoundry.ir.visitor import ExprVisitor, collect_exprs, expr_children
 from tilefoundry.target import CudaTarget
 from tilefoundry.utils.spec_ref import spec_ref_render
 from tilefoundry.visitor_registry import verify_stmt_registry
-from tilefoundry.visitor_registry.contexts import VerifyContext
+from tilefoundry.visitor_registry.call_frame import CallFrameVisitor
+from tilefoundry.visitor_registry.contexts import TypeInferContext, VerifyContext
+from tilefoundry.visitor_registry.typeinfer import inference_type
 
 _PRIM_FUNCTION = "[tir §1.3](docs/spec/tir.md#13-primfunction)"
 
@@ -375,22 +380,19 @@ def verify_prim_function(
     ctx = VerifyContext()
     scope: list[Mesh] = []
 
-    from tilefoundry.ir.core.module import (  # noqa: PLC0415
-        Module,
-        function_selectors,
-        module_functions,
-    )
-
     module_fn_map: dict[str, tuple[PrimFunction | Function, ...]] = {}
     if isinstance(module_fns, Module):
-        module_fn_map.update({selector: (f,) for selector, f in function_selectors(module_fns)})
+        ctx.frame = next((frame for frame in list_call_paths(module_fns).values() if frame.function is fn), None)
+        module_fn_map.update({path: (frame.function,) for path, frame in list_call_paths(module_fns).items() if isinstance(frame.function, Function)})
         module_fns = (
             function
-            for function in module_functions(module_fns)
+            for frame in list_call_paths(module_fns).values() for function in (frame.function,)
             if isinstance(function, PrimFunction)
         )
     for f in module_fns:
-        module_fn_map[f.name] = (*module_fn_map.get(f.name, ()), f)
+        prior = module_fn_map.get(f.name, ())
+        if all(candidate is not f for candidate in prior):
+            module_fn_map[f.name] = (*prior, f)
 
     bound_var_ids: set[int] = {id(p) for p in fn.params}
     _walk_stmt(fn.body, ctx, scope, fn, module_fn_map, bound_var_ids)
@@ -484,6 +486,8 @@ def _walk_stmt(stmt, ctx, scope, fn, module_fn_map, bound_var_ids: set[int]):
                 _verify_launch(stmt, fn, module_fn_map, ctx)
             elif isinstance(stmt.callable, SymbolRef):
                 _verify_symbol_call(stmt, fn, module_fn_map, ctx)
+            elif isinstance(stmt.callable, (PrimFunction, ModuleList, Call)):
+                _verify_retained_call(stmt, fn, module_fn_map, ctx)
             else:
                 op = stmt.callable
                 op_cls = type(op)
@@ -675,24 +679,59 @@ def _verify_symbol_call(stmt: Evaluate, fn, module_fn_map, ctx):
     if callee is fn:
         raise VerifyError("Evaluate(SymbolRef): recursion not allowed")
     _assert_no_path_back(callee, fn, module_fn_map, visited=set())
-    if len(stmt.args) != len(callee.params):
+    _verify_call_arguments(stmt, callee.params, f"Evaluate(SymbolRef {ref.name!r})", ctx)
+
+
+def _verify_call_arguments(stmt, params, label, ctx):
+    if len(stmt.args) != len(params):
         raise VerifyError(
-            f"Evaluate(SymbolRef {ref.name!r}): arg count {len(stmt.args)} != "
-            f"param count {len(callee.params)}"
+            f"{label}: arg count {len(stmt.args)} != "
+            f"param count {len(params)}"
         )
-    for i, (arg, param) in enumerate(zip(stmt.args, callee.params)):
+    for i, (arg, param) in enumerate(zip(stmt.args, params)):
         arg_ty = ctx.type_of(arg)
         param_ty = param.type
         if type(arg_ty) is not type(param_ty):
             raise VerifyError(
-                f"Evaluate(SymbolRef {ref.name!r}): arg[{i}] type kind "
+                f"{label}: arg[{i}] type kind "
                 f"{type(arg_ty).__name__} != param type kind {type(param_ty).__name__}"
             )
         if arg_ty != param_ty:
             raise VerifyError(
-                f"Evaluate(SymbolRef {ref.name!r}): arg[{i}] type {arg_ty} != "
+                f"{label}: arg[{i}] type {arg_ty} != "
                 f"param {param.name!r} type {param_ty}"
             )
+
+
+def _retained_callee(target, frame):
+    if not isinstance(target, (PrimFunction, ModuleList, Call)):
+        raise VerifyError(f"unsupported TIR call target {type(target).__name__}")
+    if not isinstance(target, PrimFunction):
+        if frame is None:
+            raise VerifyError("instance TIR call requires module context")
+        inference_type(target, TypeInferContext(frame=frame))
+    inner = CallFrameVisitor.callee_frame(Call(target, (), type=UnitType()), frame)
+    callee = inner.function if inner is not None else target
+    if not isinstance(callee, PrimFunction):
+        raise VerifyError(f"TIR instance entry {callee.name!r} is not a PrimFunction")
+    return callee, inner
+
+
+def _verify_retained_call(stmt, fn, module_fn_map, ctx):
+    target = stmt.callable
+    callee, frame = _retained_callee(target, ctx.frame)
+    direct = isinstance(target, PrimFunction)
+    label = target.name if direct else (
+        target.key if isinstance(target, ModuleList)
+        else f"{target.args[0].key}[{TirPrinter().visit(target.args[1])}]"
+    )
+    prefix = f"Evaluate({label})"
+    _assert_no_path_back(
+        callee, fn, module_fn_map, visited=set(), frame=frame,
+        recursion=f"{prefix}: recursion not allowed",
+    )
+    params = tuple(param for param in callee.params if direct or not param.is_const)
+    _verify_call_arguments(stmt, params, prefix, ctx)
 
 
 _LAUNCH_EXTENT_OPS = (DimAdd, DimSub, DimMul, DimFloorDiv, DimMod, DimMin, DimMax)
@@ -816,17 +855,26 @@ def _verify_launch(stmt: Evaluate, fn, module_fn_map, ctx):
             )
 
 
-def _assert_no_path_back(callee, root, module_fn_map, visited):
+def _assert_no_path_back(callee, root, module_fn_map, visited, frame=None, recursion=None):
     if callee is root:
-        raise VerifyError(f"call DAG violation: {callee.name!r} calls back into {root.name!r}")
-    if callee.name in visited:
+        raise VerifyError(recursion or f"call DAG violation: {callee.name!r} calls back into {root.name!r}")
+    key = (id(callee), id(frame.module) if frame is not None else None)
+    if key in visited:
         return
-    visited.add(callee.name)
-    for s in _iter_all_stmts(callee.body):
-        if isinstance(s, Evaluate) and isinstance(s.callable, SymbolRef):
-            matches = module_fn_map.get(s.callable.name, ())
+    visited.add(key)
+    for stmt in _iter_all_stmts(callee.body):
+        if not isinstance(stmt, Evaluate):
+            continue
+        target = stmt.callable
+        reached, inner = None, frame
+        if isinstance(target, SymbolRef):
+            matches = module_fn_map.get(target.name, ())
             if len(matches) == 1:
-                _assert_no_path_back(matches[0], root, module_fn_map, visited)
+                reached = matches[0]
+        elif isinstance(target, (PrimFunction, ModuleList, Call)):
+            reached, inner = _retained_callee(target, frame)
+        if reached is not None:
+            _assert_no_path_back(reached, root, module_fn_map, visited, inner, recursion)
 
 
 def _iter_all_stmts(body):
@@ -854,10 +902,15 @@ def verify_module(fns) -> None:
     is never a variant, and every entry is callable (``body is None`` only when
     it carries variants).
     """
-    from tilefoundry.ir.core.module import Module, module_functions  # noqa: PLC0415
-
-    if isinstance(fns, Module):
-        fns = module_functions(fns)
+    root = fns if isinstance(fns, Module) else None
+    if root is not None:
+        frames = list_call_paths(root)
+        owners = {id(root): root, **{id(frame.module): frame.module for frame in frames.values()}}
+        groups = tuple(node.functions for node in owners.values())
+        fns = tuple(frame.function for frame in frames.values())
+    else:
+        groups = (tuple(fns),)
+        fns = groups[0]
     prim_fns = [f for f in fns if isinstance(f, PrimFunction)]
     prim_fns_with_variants = [variant for f in prim_fns for variant in (f, *f.variants)]
     for f in fns:
@@ -875,20 +928,21 @@ def verify_module(fns) -> None:
                     f"module function must be callable"
                 )
         elif isinstance(f, PrimFunction):
-            verify_prim_function(f, module_fns=prim_fns_with_variants)
+            verify_prim_function(f, module_fns=root if root is not None else prim_fns_with_variants)
         else:
             raise VerifyError(f"verify_module: unknown function type {type(f).__name__}")
 
-    by_name: dict[str, list] = {}
-    for f in fns:
-        by_name.setdefault(f.name, []).append(f)
-    for name, group in by_name.items():
-        if len(group) > 1:
-            raise VerifyError(
-                f"verify_module: {name!r} appears {len(group)} times; one name "
-                f"maps to one function (specialization variants live on "
-                f"Function.variants)"
-            )
+    for functions in groups:
+        by_name: dict[str, list] = {}
+        for f in functions:
+            by_name.setdefault(f.name, []).append(f)
+        for name, group in by_name.items():
+            if len(group) > 1:
+                raise VerifyError(
+                    f"verify_module: {name!r} appears {len(group)} times; one name "
+                    f"maps to one local function (specialization variants live on "
+                    f"Function.variants)"
+                )
 
 
 __all__ = [

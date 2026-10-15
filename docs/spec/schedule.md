@@ -62,7 +62,7 @@ logical Split axes when that projection is possible; if factored splits have
 no local logical box, it compares whole types instead.
 
 Each single-issue operand MUST match the corresponding instruction parameter
-pattern. `match_instruction(op_type, attributes, operand_types, mesh, *, scope,
+pattern. `match_instruction(op_type, attributes, operand_types, mesh, *, frame,
 repeat=None, order=None)` returns a tuple of frozen `InstructionMatch(op, path)`
 records. Each op uses the existing constructor; its path contains every binding
 from the closed matcher in binding order. A `ScheduleRefusal` carries the
@@ -80,9 +80,9 @@ For each projectable extent it separately matches layout major, solves the
 bindings, constructs an instance, and performs the closed instruction checks.
 A rejected extent does not stop other extents from matching. If none match,
 the refusal comes from the largest projectable extent.
-`scope` is required and reaches the verifier unchanged, including its target
+`frame` is required and reaches the verifier unchanged, including its target
 capability checks. Explicit schedule inference uses this same matcher with
-the authored instruction attributes, scope, repeat, and order.
+the authored instruction attributes, frame, repeat, and order.
 
 Operand, tiling, pattern, and verifier rejections raise `ScheduleRefusal`.
 Errors from implementation code, including `TypeError` and ISL errors,

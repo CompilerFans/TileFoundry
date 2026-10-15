@@ -25,6 +25,8 @@ from tilefoundry.ir.core import Call, IRMetadata, binding_name, get_metadata
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
+from tilefoundry.ir.hir.specialize import origin_of
+from tilefoundry.ir.module_utils import list_call_paths
 from tilefoundry.ir.types.utils import tensor_types
 from tilefoundry.ir.visitor import collect_exprs
 
@@ -197,7 +199,9 @@ def _not_reported(_record: MemoryMetadata, _expr: object) -> None:
 expr_field(MemoryMetadata, "alias", _not_reported)
 
 
-def _records_of(expr: object, selected: frozenset[type[IRMetadata]]) -> dict[str, object]:
+def _records_of(
+    expr: object, selected: frozenset[type[IRMetadata]]
+) -> dict[str, object]:
     """Every selected record on *expr*, keyed by the family that owns it."""
     result: dict[str, object] = {}
     for metadata_type in declared_records():
@@ -234,73 +238,46 @@ def report_data(
     topology_level: str | None,
     executed: tuple[str, ...],
     metadata_types: tuple[type[IRMetadata], ...],
-    call_labels: Mapping[int, str] | None = None,
+    labels: Mapping[int, str] | None = None,
+    functions: tuple[Function, ...] = (),
 ) -> dict[str, object]:
-    """Project one completed analysis into stable, serializable report data."""
-    selected_types_ = selected_types(module, analyses, metadata_types)
-    selected = frozenset(selected_types_)
+    """Project every definition once, in root-first order."""
+    selected = frozenset(selected_types(module, analyses, metadata_types))
     target = module.resolve_target()
     wave = wave_of(module, target, topology_level)
-    function_records = _records_of(function, selected)
-    data = {
-        "target": target.identity,
-        "module": module.name,
-        "function": function.name,
-        "topology": topology_level,
-        "wave": {
-            "counted": 0 if wave is None else wave[0],
-            "declared": 0 if wave is None else wave[1],
-        },
-        "requested": list(analyses),
-        "executed": list(executed),
-        "function_records": function_records,
-        "calls": _call_records(function, selected, call_labels),
-        "loops": _loop_records(function, selected),
+    owners = {
+        id(candidate): frame.module.name
+        for frame in list_call_paths(module).values()
+        for candidate in (frame.function, *getattr(frame.function, "variants", ()))
     }
-    available = set(metadata_types)
-    asked = {ComputeCostMetadata, MemoryMetadata, RegionMemoryMetadata}
-    if asked & selected or ("roofline" in analyses and asked & available):
-        data["totals"] = _work_totals(function)
-    return data
-
-
-def _call_records(
-    function: Function,
-    selected: frozenset[type[IRMetadata]],
-    call_labels: Mapping[int, str] | None,
-) -> list[dict[str, object]]:
-    """Every selected record attached to a Call, in program order."""
-    rows: list[dict[str, object]] = []
-    for expr in collect_exprs(function.body):
-        if not isinstance(expr, Call):
-            continue
-        records = _records_of(expr, selected)
-        if not records:
-            continue
-        if call_labels is not None:
-            value = call_labels.get(id(expr))
-            if value is None:
+    rows = []
+    for body in functions or (function,):
+        row = {
+            "function": f"{owners.get(id(origin_of(body) or body), module.name)}.{body.name}",
+            "function_records": _records_of(body, selected),
+            "calls": [], "loops": [],
+        }
+        for expr in collect_exprs(body.body):
+            if not isinstance(expr, (Call, LoopRegion)):
                 continue
-        else:
-            value = binding_name(expr) or type(expr.target).__name__.lower()
-        rows.append({"value": value, **records})
-    return rows
-
-
-def _loop_records(
-    function: Function,
-    selected: frozenset[type[IRMetadata]],
-) -> list[dict[str, object]]:
-    """Every selected record attached to an authored loop."""
-    rows: list[dict[str, object]] = []
-    for expr in collect_exprs(function.body):
-        if not isinstance(expr, LoopRegion):
-            continue
-        records = _records_of(expr, selected)
-        if not records:
-            continue
-        rows.append({"value": expr.induction_var.name, **records})
-    return rows
+            held = _records_of(expr, selected)
+            if not held:
+                continue
+            value = (labels.get(id(expr)) if labels is not None else None) or (
+                expr.induction_var.name if isinstance(expr, LoopRegion)
+                else binding_name(expr) or type(expr.target).__name__.lower()
+            )
+            row["loops" if isinstance(expr, LoopRegion) else "calls"].append({"value": value, **held})
+        asked = {ComputeCostMetadata, MemoryMetadata, RegionMemoryMetadata}
+        if asked & selected or ("roofline" in analyses and asked & set(metadata_types)):
+            row["totals"] = _work_totals(body)
+        rows.append(row)
+    return {
+        "target": target.identity, "module": module.name, "topology": topology_level,
+        "wave": {"counted": 0 if wave is None else wave[0],
+                 "declared": 0 if wave is None else wave[1]},
+        "requested": list(analyses), "executed": list(executed), "functions": rows,
+    }
 
 
 def _totals_of(held: "Breakdown | Spread | None") -> dict[str, object]:

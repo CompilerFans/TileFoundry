@@ -37,14 +37,13 @@ from tilefoundry.analysis.access import Access
 from tilefoundry.analysis.allocation import AllocationConstraintVisitor, aligned
 from tilefoundry.analysis.compute_cost import local_duration_ns
 from tilefoundry.analysis.errors import AnalysisError
-from tilefoundry.analysis.iteration_scope import IterationScope, build_scopes, walk_scopes
+from tilefoundry.analysis.iteration_scope import IterationScope, walk_scopes
 from tilefoundry.analysis.liveness import analyze_liveness
 from tilefoundry.analysis.report import render_json, report_data
 from tilefoundry.cli import main as cli_main
 from tilefoundry.cli.source import load_namespace
 from tilefoundry.dsl import *
 from tilefoundry.ir.core import Call, describe_expr, get_metadata
-from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.nn.rms_norm import RMSNorm
@@ -111,16 +110,6 @@ EXPECTED_MEMORY_PEAKS = {
         "rmem": 64 * 32 * 4,
         "smem": 64 * 16 * 2 + 16 * 32 * 2,
     },
-    "child_matmul_target.ChildMatmulRoot.child.run[static]": {
-        "gmem": 64 * 64 * 2 + 64 * 32 * 2 + 64 * 32 * 4,
-        "rmem": 64 * 32 * 4,
-        "smem": 64 * 16 * 2 + 16 * 32 * 2,
-    },
-    "child_matmul_target.ChildMatmulRoot.direct.direct[static]": {
-        "gmem": 64 * 64 * 2 + 64 * 32 * 2,
-        "rmem": 64 * 32 * 4,
-        "smem": 64 * 16 * 2 + 16 * 32 * 2,
-    },
     "child_matmul_target.ChildMatmulRoot.gemm[static]": {
         "gmem": 64 * 64 * 2 + 64 * 32 * 2 + 64 * 32 * 4,
         "rmem": 64 * 32 * 4,
@@ -132,11 +121,6 @@ EXPECTED_MEMORY_PEAKS = {
         "smem": 64 * 16 * 2 + 16 * 32 * 2,
     },
     "child_matmul_target.ChildMatmulRoot.gemm_staged[k_len=64]": {
-        "gmem": 64 * 64 * 2 + 64 * 32 * 2 + 64 * 32 * 4,
-        "rmem": 64 * 32 * 4,
-        "smem": 64 * 16 * 2 + 16 * 32 * 2,
-    },
-    "child_matmul_target.ChildMatmulRoot.staged.staged[k_len=64]": {
         "gmem": 64 * 64 * 2 + 64 * 32 * 2 + 64 * 32 * 4,
         "rmem": 64 * 32 * 4,
         "smem": 64 * 16 * 2 + 16 * 32 * 2,
@@ -156,8 +140,8 @@ EXPECTED_MEMORY_PEAKS = {
         "rmem": 128 * 4 + 8,
         "smem": 2 * 128 * 64 * 2 + 1_044,
     },
-    "fused_boundary.FusedBoundary.inner.run[static]": {"rmem": 8 * 2 + 8 * 2},
-    "fused_boundary.FusedBoundary.inner.scale[static]": {"rmem": 256},
+    "fused_boundary.Inner.run[static]": {"rmem": 8 * 2 + 8 * 2},
+    "fused_boundary.Inner.scale[static]": {"rmem": 256},
     "fused_boundary.FusedBoundary.root[static]": {
         "gmem": 512,
         "rmem": 8 * 2 + 8 * 4,
@@ -276,7 +260,6 @@ EXPECTED_MEMORY_PEAKS = {
     "moe_mega_kernel.MoEMegaKernel.experts[static]": {"gmem": 64_000},
     "moe_mega_kernel.MoEMegaKernel.routed_expert[static]": {"gmem": 61_696},
     "moe_mega_kernel.MoEMegaKernel.shared_expert[static]": {"gmem": 64_000},
-    "nested_twin.Weighted.scaled[static]": {"gmem": 1_348, "rmem": 4},
     "performance_findings.Compare.kernel[static]": {"gmem": 136_192},
     "performance_findings.GmemSquare.kernel[static]": {"gmem": 68_096},
     "performance_findings.Levels.kernel[static]": {
@@ -323,12 +306,12 @@ EXPECTED_MEMORY_PEAKS = {
         "smem": 3 * 128 * 128 * 2,
     },
     "qwen3_1_7b_pd.PrefillLayer.model[ctx_len=4608,seq=1]": {
-        "gmem": 4_611_690_528,
+        "gmem": 4_611_690_784,
         "rmem": 1_036,
         "smem": 65_792,
     },
     "qwen3_1_7b_pd.PrefillLayer.model[ctx_len=512,seq=1]": {
-        "gmem": 4_611_690_528,
+        "gmem": 4_611_690_784,
         "rmem": 1_036,
         "smem": 65_792,
     },
@@ -359,8 +342,6 @@ EXPECTED_MEMORY_PEAKS = {
     "square_cuda.Model.main[static]": {"gmem": 676, "rmem": 4},
     "tiny_tp_decoder.DecoderLayer.decode[static]": {"gmem": 48, "rmem": 16},
     "tiny_tp_decoder.DecoderLayer.project[static]": {"gmem": 128},
-    "tiny_tp_decoder.TinyTPDecoderLM.layer.decode[static]": {"gmem": 48, "rmem": 16},
-    "tiny_tp_decoder.TinyTPDecoderLM.layer.project[static]": {"gmem": 128},
     "tp_all_to_all.TransposeShard.transpose_shard[static]": {"gmem": 256},
     "weighted_twin.Weighted.scaled[static]": {"gmem": 1_348, "rmem": 4},
 }
@@ -442,7 +423,7 @@ def assert_reported_contract(report: dict) -> None:
     written once, and its last trip still lands inside the prediction that
     contains it. A loop is not an occurrence and carries no timeline of its own.
     """
-    records = report["function_records"]
+    records = report["functions"][0]['function_records']
     summary = records["performance"]
     timeline = summary["timeline"]
     assert 0 <= timeline["start_ns"] <= timeline["end_ns"]
@@ -452,7 +433,7 @@ def assert_reported_contract(report: dict) -> None:
     assert records["roofline"]["ideal_ns"] <= predicted_ns
 
     timed = 0
-    for call in report["calls"]:
+    for call in report["functions"][0]['calls']:
         record = call.get("performance")
         if record is None:
             continue
@@ -465,7 +446,7 @@ def assert_reported_contract(report: dict) -> None:
         assert (stride == 0) if trips == 1 else (stride >= end - start), call["value"]
         assert end + (trips - 1) * stride <= timeline["end_ns"], call["value"]
     assert bool(timed) is bool(predicted_ns)
-    for loop in report["loops"]:
+    for loop in report["functions"][0]['loops']:
         assert "performance" not in loop, loop["value"]
 
     def nonnegative(value: object) -> None:
@@ -504,8 +485,8 @@ def assert_internal_contract(
     module_target = result.module.resolve_target()
     throughput = module_target.get_facts(ThroughputFacts)
     services = module_target.get_facts(PerformanceServiceFacts, result.level)
-    for expr in collect_exprs(result.function.body):
-        if not isinstance(expr, Call) or isinstance(expr.target, Function):
+    for occurrence, expr in ((scope, expr) for scope in walk_scopes(result.scopes) if scope.frame is not None for expr in collect_exprs(scope.frame.function.body)):
+        if not isinstance(expr, Call) or any(scope.owner is expr for scope in occurrence.children):
             continue
         cost = get_metadata(expr, ComputeCostMetadata)
         assert cost is not None
@@ -526,7 +507,11 @@ def assert_internal_contract(
         runs = span // duration
         available = 1
         owner = next(
-            (scope for scope in scopes if id(expr) in scope.accesses.get("narrow", {})),
+            (
+                scope
+                for scope in scopes
+                if scope.occurrence is occurrence and id(expr) in scope.accesses.get("narrow", {})
+            ),
             None,
         )
         if owner is not None:
@@ -595,7 +580,7 @@ def _assert_reported(case: ConcreteCase, report: dict) -> None:
     """
     assert set(report["executed"]) == set(FAMILIES)
     assert_reported_contract(report)
-    reported = report["function_records"]["memory"]
+    reported = report["functions"][0]['function_records']["memory"]
     if case.id == "qwen3_1_7b_pd.PrefillLayer.layer_decode[ctx_len=128,seq=128]":
         gmem = reported["traffic"]["storage"]["gmem"]
         assert gmem["logical"]["read"] + gmem["logical"]["write"] == 102_172_180
@@ -691,7 +676,7 @@ def test_every_internal_record_agrees(case: ConcreteCase, monkeypatch: pytest.Mo
         metadata_types=result.metadata_types,
     )
     _assert_reported(case, json.loads(render_json(report)))
-    scopes = tuple(walk_scopes(build_scopes(result.module, result.function)))
+    scopes = tuple(walk_scopes(result.scopes))
     assert_internal_contract(result, scopes)
     if case.id == "qwen3_1_7b_pd.PrefillLayer.layer_decode[ctx_len=128,seq=128]":
         rms_scopes = [
@@ -826,7 +811,10 @@ def test_the_result_names_the_function_that_carries_the_records(family: str) -> 
 
     assert result.function is not authored
     assert result.function.name == authored.name
-    assert residual_dims(result.function) == ()
+    assert all(
+        residual_dims(occurrence.frame.function, occurrence.frame) == ()
+        for occurrence in (scope for scope in walk_scopes(result.scopes) if scope.frame is not None)
+    )
 
 
 def test_without_a_size_the_result_names_the_record_bearing_view() -> None:

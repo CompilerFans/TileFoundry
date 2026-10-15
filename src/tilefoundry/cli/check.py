@@ -16,7 +16,6 @@ from tilefoundry.cli.source import load_namespace, parse_dims
 from tilefoundry.evaluator import evaluate
 from tilefoundry.evaluator.value import from_torch_dtype
 from tilefoundry.ir.core.module import Module
-from tilefoundry.ir.core.module import select as select_module
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.specialize import (
     canonical_specialization_signature,
@@ -34,6 +33,7 @@ from tilefoundry.runtime.resource import (
     SafetensorsResource,
     draw_tensor,
 )
+from tilefoundry.visitor_registry.call_frame import CallFrame
 
 SEED = 0
 
@@ -223,21 +223,15 @@ def _refuse_orchestration(module: Module, method: str) -> None:
 
 
 def _module_selection(root: Module, path: Sequence[str]) -> tuple[Module, tuple[str, ...]]:
-    node = root
-    children: list[str] = []
-    for index, segment in enumerate(path):
-        child = next((item for item in node.modules if item.name == segment), None)
-        if child is not None:
-            node = child
-            children.append(segment)
-            continue
-        if index != len(path) - 1:
-            raise ValueError(f"selector {'.'.join(path)!r}: {segment!r} is not a child module")
-        if segment in node.methods:
-            _refuse_orchestration(node, segment)
-        node.lookup(segment)
-        return select_module(root, ".".join(path)), tuple(children)
-    return node, tuple(children)
+    if len(path) > 1:
+        raise ValueError("use Module.function; child module paths are unsupported")
+    if not path:
+        return root, ()
+    name = path[0]
+    if name in root.methods:
+        _refuse_orchestration(root, name)
+    root.lookup(name)
+    return replace(root, entry=name), ()
 
 
 def select(source: str) -> Selection:
@@ -273,7 +267,7 @@ def read_inputs(paths: Sequence[str], device: str) -> tuple[Any, ...]:
 
 def draw_inputs(module: Module, dims: dict[str, int], seed: int, device: str):
     function = module.entry_function()
-    residual_dims(function)
+    residual_dims(function, CallFrame(module, function))
     concrete = replace(
         function,
         params=tuple(
@@ -327,31 +321,21 @@ def _walk_twin(
 ) -> tuple[RuntimeModule, Module, Module, tuple[str, ...]]:
     """Resolve a runtime twin and a dotted path into it."""
     top = root()
+    authored = _authored(top)
+    chosen, children = _module_selection(authored, segments[1:])
     node = top
-    children: list[str] = []
-    for index, segment in enumerate(segments[1:]):
-        try:
-            found = getattr(node, segment)
-        except AttributeError as error:
-            raise ValueError(f"selector {'.'.join(segments)!r}: {error}") from None
-        if isinstance(found, RuntimeModule):
-            node = found
-            children.append(segment)
-            continue
-        if index != len(segments) - 2:
-            raise ValueError(
-                f"selector {'.'.join(segments)!r}: {segment!r} is a function, so it "
-                "can only be the last segment"
-            )
-        module = _authored(node)
-        if segment in module.methods:
-            _refuse_orchestration(module, segment)
-        chosen = select_module(module, segment)
-        return type(node)(ir=chosen), _authored(top), chosen, tuple(children)
-    module = _authored(node)
-    if module.methods.get("forward") is not None:
-        _refuse_orchestration(module, "forward")
-    return node, _authored(top), module, tuple(children)
+    position = 0
+    while position < len(children):
+        child = node.children[children[position]]
+        position += 1
+        if isinstance(child, tuple):
+            node = child[int(children[position])]
+            position += 1
+        else:
+            node = child
+    if len(children) == len(segments) - 1 and chosen.methods.get("forward") is not None:
+        _refuse_orchestration(chosen, "forward")
+    return type(node)(ir=chosen), authored, chosen, children
 
 
 def _authored(node: RuntimeModule) -> Module:
@@ -642,25 +626,30 @@ def run_check(arguments: argparse.Namespace) -> int:
             reference = f"evaluator on {qualified}"
         else:
             reference = "none — the candidate alone"
-        runs.append({
-            "passed": report.passed,
-            "outputs": [_output_dict(output) for output in report.outputs],
-            "dims": dims,
-            "reference": reference,
-            "variant": selected_variant,
-            "inputs": {
-                "activations": {
-                    "source": f"{arguments.inputs} (seed {SEED})" if arguments.inputs == "random" else arguments.inputs,
-                    "actual_dtypes": [
-                        from_torch_dtype(tensor.dtype).name
-                        for _path, tensor in flatten_outputs(inputs)
-                    ],
-                    "declared_dtypes": list(declared),
-                    "files": _input_files(arguments.inputs[6:].split(","), inputs)
-                    if arguments.inputs.startswith("files:") else [],
+        runs.append(
+            {
+                "passed": report.passed,
+                "outputs": [_output_dict(output) for output in report.outputs],
+                "dims": dims,
+                "reference": reference,
+                "variant": selected_variant,
+                "inputs": {
+                    "activations": {
+                        "source": f"{arguments.inputs} (seed {SEED})"
+                        if arguments.inputs == "random"
+                        else arguments.inputs,
+                        "actual_dtypes": [
+                            from_torch_dtype(tensor.dtype).name
+                            for _path, tensor in flatten_outputs(inputs)
+                        ],
+                        "declared_dtypes": list(declared),
+                        "files": _input_files(arguments.inputs[6:].split(","), inputs)
+                        if arguments.inputs.startswith("files:")
+                        else [],
+                    },
                 },
-            },
-        })
+            }
+        )
     warnings = _failure_warnings(runs, arguments.inputs)
     passed = all(run["passed"] for run in runs)
     if arguments.json:

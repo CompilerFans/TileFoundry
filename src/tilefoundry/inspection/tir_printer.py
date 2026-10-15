@@ -8,9 +8,10 @@ from tilefoundry.inspection.print_context import TirPrintContext
 from tilefoundry.inspection.printer_base import PythonPrinter
 from tilefoundry.ir.core import Call, Constant, Op, Tuple, Var, get_metadata
 from tilefoundry.ir.core.kinds import BinaryKind
-from tilefoundry.ir.core.module import Module
+from tilefoundry.ir.core.module import Module, ModuleList
 from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.ir.hir.tensor.slice import Slice
+from tilefoundry.ir.module_utils import list_call_paths
 from tilefoundry.ir.tir.launch import Launch
 from tilefoundry.ir.tir.memory import AllocTensor
 from tilefoundry.ir.tir.prim_function import PrimFunction
@@ -19,9 +20,10 @@ from tilefoundry.ir.tir.stmts import (
     Evaluate,
 )
 from tilefoundry.ir.tir.symbol_ref import SymbolRef
-from tilefoundry.ir.types import DType, LayoutBase, PointerType, TensorType
+from tilefoundry.ir.types import DType, LayoutBase, PointerType, TensorType, UnitType
 from tilefoundry.ir.types.dim import is_dim_op_call
 from tilefoundry.ir.visitor import StmtVisitor
+from tilefoundry.visitor_registry.call_frame import CallFrame, CallFrameVisitor
 
 _LINE_LENGTH = 100
 
@@ -63,7 +65,7 @@ class _RenderedLines(list):
         self.imports = imports
 
 
-class TirPrinter(PythonPrinter, StmtVisitor[list[str]]):
+class TirPrinter(PythonPrinter, StmtVisitor[list[str]], CallFrameVisitor[str]):
     """TIR statement printer with explicit statement-visitor entry points.
 
     The legacy helpers below remain as the formatting implementation while the
@@ -99,7 +101,7 @@ class TirPrinter(PythonPrinter, StmtVisitor[list[str]]):
         return f"(\n{elements}\n{self.indent})"
 
     def visit_SymbolRef(self, expr: SymbolRef, ctx=None) -> str:
-        return _binding_name(expr.name)
+        return getattr(self.context, "symbol_bindings", {}).get(expr.name, _binding_name(expr.name))
 
     def visit_ShapeOf(self, expr: ShapeOf, ctx=None) -> str:
         return f"shape_of({expr.param.name}, axis={expr.axis})"
@@ -268,6 +270,17 @@ class TirPrinter(PythonPrinter, StmtVisitor[list[str]]):
         return ", ".join(self.visit(arg) for arg in args)
 
     def _emit_evaluate(self, stmt):
+        target = stmt.callable
+        if isinstance(target, (PrimFunction, ModuleList, Call)):
+            frame = getattr(self.context, "frame", None)
+            frame = self.callee_frame(Call(target, stmt.args, type=UnitType()), frame) if frame is not None else None
+            callee = target if frame is None else frame.function
+            head = callee.name if isinstance(target, PrimFunction) else (
+                target.key if isinstance(target, ModuleList) else target.args[0].key
+            )
+            if isinstance(target, Call):
+                head += f"[{self.visit(target.args[1])}]"
+            return [f"{self.indent}{head}({', '.join(self.visit(arg) for arg in stmt.args)})"]
         handler = _STMT_PRINTERS.get(type(stmt.callable)) or (
             _STMT_PRINTERS.get(Op) if isinstance(stmt.callable, Op) else None
         )
@@ -334,8 +347,10 @@ def _print_op_evaluate(stmt: Evaluate, printer: TirPrinter) -> list[str]:
     ]
 
 
-def _function_block(fn: PrimFunction) -> list[str]:
+def _function_block(fn: PrimFunction, *, symbol_bindings=None, frame=None) -> list[str]:
     ctx = TirPrintContext()
+    ctx.frame = frame
+    ctx.symbol_bindings = symbol_bindings or {}
     target_expr = fn.target.to_python()
     ctx.imports.update(target_expr.imports)
     target = target_expr.text
@@ -351,10 +366,16 @@ def _function_block(fn: PrimFunction) -> list[str]:
     if fn.output_count != 1:
         attrs.append(f"output_count={fn.output_count}")
     lines.append(f"@prim_func({', '.join(attrs)})")
-    params = ", ".join(
-        f"{p.name}: {TirPrinter(context=ctx).visit(p.type, ctx) if isinstance(p.type, (TensorType, PointerType)) else repr(p.type)}"
-        for p in fn.params
-    )
+    parameters = []
+    for param in fn.params:
+        printer = TirPrinter(context=ctx)
+        with printer.type_surface(const=param.is_const):
+            annotation = (
+                printer.visit(param.type, ctx)
+                if isinstance(param.type, (TensorType, PointerType)) else repr(param.type)
+            )
+        parameters.append(f"{param.name}: {annotation}")
+    params = ", ".join(parameters)
     definition = f"def {_binding_name(fn.name)}({params}):"
     if len(definition) + 4 <= _LINE_LENGTH:
         lines.append(definition)
@@ -414,7 +435,16 @@ def _function_comments(fn: PrimFunction, options) -> list[str]:
     return render_summary(records, opt_in=options.comment_opt_in).splitlines()
 
 
-def tir_module_to_python(mod: Module, module_name: str | None = None, *, options=None) -> str:
+def _module_symbol_bindings(mod: Module) -> dict[str, str]:
+    """Render unique subtree PrimFunction bare names through their slot bindings."""
+    candidates = {}
+    for selector, frame in list_call_paths(mod).items():
+        if isinstance(frame.function, PrimFunction):
+            candidates.setdefault(frame.function.name, []).append(selector)
+    return {name: paths[0] for name, paths in candidates.items() if len(paths) == 1}
+
+
+def _single_module_to_python(mod: Module, module_name: str, names, *, options=None) -> str:
     name = module_name or mod.name
     lines: list[str] = []
     ctx = TirPrintContext()
@@ -439,16 +469,17 @@ def tir_module_to_python(mod: Module, module_name: str | None = None, *, options
         lines.append(decorator)
     lines.append(f"class {name}:")
     blocks: list[list[str]] = []
-    for child in mod.modules:
-        child_source = tir_module_to_python(child, child.name, options=options).splitlines()
-        class_at = next(i for i, line in enumerate(child_source) if line.startswith("@module"))
-        blocks.append(child_source[class_at:])
+    from .python_printer import _slot_binding  # noqa: PLC0415 -- printer cycle
+
+    bindings = [_slot_binding(key, slot, names) for key, slot in mod.children.items()]
+    if bindings:
+        blocks.append(bindings)
     for fn in mod.functions:
         if not isinstance(fn, PrimFunction):
             if isinstance(fn, HirFunction):
                 raise NotImplementedError("mixed HIR/TIR module printing is not yet supported")
             raise TypeError(f"TIR printer cannot serialize {type(fn).__name__}")
-        block = _function_block(fn)
+        block = _function_block(fn, symbol_bindings=_module_symbol_bindings(mod), frame=CallFrame(mod, fn))
         ctx.imports.update(block.imports)
         blocks.append([*_function_comments(fn, options), *block])
     for index, block in enumerate(blocks):
@@ -467,3 +498,46 @@ def tir_module_to_python(mod: Module, module_name: str | None = None, *, options
     if not declarations:
         header.append("")
     return "\n".join(header + lines) + "\n"
+
+
+def tir_module_to_python(mod: Module, module_name: str | None = None, *, options=None) -> str:
+    """Print shared TIR definitions once, with slots referring to those definitions."""
+    from .python_printer import (  # noqa: PLC0415 -- printer cycle
+        _definition_names,
+        _module_definition_order,
+    )
+
+    names = _definition_names(mod, module_name or mod.name)
+    ctx = TirPrintContext()
+    declarations = []
+    lines = []
+    for node in _module_definition_order(mod):
+        source = _single_module_to_python(
+            node, names[id(node)], names, options=options
+        ).splitlines()
+        start = next(index for index, line in enumerate(source) if line.startswith("@module"))
+        for line in source[:start]:
+            if line.startswith(("from ", "import ")) and line not in (
+                "from __future__ import annotations",
+                "from tilefoundry.dsl import *",
+            ):
+                ctx.imports.add(line)
+            elif " = DimVar(" in line and line not in declarations:
+                declarations.append(line)
+        if lines:
+            lines.append("")
+        lines.extend(source[start:])
+        if node is not mod and names[id(node)] != node.name:
+            lines.append(f"{names[id(node)]}.name = {node.name!r}")
+    if mod.children:
+        lines.extend(
+            (
+                "",
+                f"del {', '.join(names[id(node)] for node in _module_definition_order(mod) if node is not mod)}",
+            )
+        )
+    header = ctx.header()
+    if declarations:
+        header.extend([*declarations, ""])
+    header.append("")
+    return "\n".join([*header, *lines]) + "\n"

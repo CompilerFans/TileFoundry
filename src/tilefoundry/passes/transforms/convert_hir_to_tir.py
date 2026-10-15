@@ -1,6 +1,6 @@
 """Lower scheduled HIR to effect-form TIR.
 
-The pass consumes the checked, inlined view produced by ``analyze(memory)``.
+The pass consumes the checked, retained-call program produced by ``analyze(memory)``.
 Memory metadata owns storage addresses; registered access relations own
 instruction issue geometry. This file only turns those two facts into statements.
 """
@@ -8,14 +8,14 @@ instruction issue geometry. This file only turns those two facts into statements
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from math import prod
 
 import isl
 
 from tilefoundry.analysis import AnalysisResult, MemoryMetadata, analyze
 from tilefoundry.analysis.access import BufferAlias
-from tilefoundry.analysis.iteration_scope import IterationScope, walk_scopes
+from tilefoundry.analysis.iteration_scope import IterationScope, occurrence_path, walk_scopes
 from tilefoundry.inspection.analysis_report import render_analysis
 from tilefoundry.inspection.values import ReportIdentity, ReportSelection
 from tilefoundry.ir.core import (
@@ -39,6 +39,7 @@ from tilefoundry.ir.hir.math.binary import Binary as HirBinary
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.schedule import ScheduleOp, instruction_schema, operand_relations
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
+from tilefoundry.ir.hir.specialize import origin_of
 from tilefoundry.ir.hir.tensor._view_layout import derive_view_layout
 from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
@@ -86,8 +87,9 @@ from tilefoundry.visitor_registry.access_relation import (
     projected_axes,
 )
 from tilefoundry.visitor_registry.buffer_alias import aliased_operand
+from tilefoundry.visitor_registry.call_frame import CallFrameVisitor
 from tilefoundry.visitor_registry.candidates import candidate_ops, sole_candidate
-from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
+from tilefoundry.visitor_registry.contexts import TypeInferContext
 from tilefoundry.visitor_registry.registries import typeinfer_registry
 from tilefoundry.visitor_registry.shard_propagate import derive_output_shard_layout
 
@@ -205,7 +207,7 @@ def _scope_names(root: IterationScope, names: Names) -> dict[int, str]:
     found = {}
     for scope in walk_scopes(root):
         region = scope.owner
-        if not isinstance(region, MeshRegion) or region is root.owner.body:
+        if scope.occurrence is not root.occurrence or not isinstance(region, MeshRegion) or region is root.occurrence.frame.function.body:
             continue
         if not (isinstance(region.body, Call) and isinstance(region.body.target, Zeros)):
             found[id(region)] = names.fresh("scope")
@@ -228,6 +230,15 @@ def _storage_type(type_: TensorType) -> TensorType:
     return replace(type_, layout=_plain_layout(type_))
 
 
+def _callee_tensor_type(type_: TensorType) -> TensorType:
+    physical = _storage_type(type_)
+    if physical.storage is StorageKind.GMEM and physical.layout is None:
+        physical = replace(
+            physical, layout=Layout(tuple(physical.shape), tuple(compact_row_major(tuple(physical.shape))))
+        )
+    return physical
+
+
 def _with_frame(type_: TensorType, frame: Mesh) -> TensorType:
     layout = type_.layout
     if isinstance(layout, ShardLayout):
@@ -243,16 +254,19 @@ def _label(call: Expr) -> str:
 
 
 @dataclass
-class Lowering(ExprVisitor[Expr]):
+class Lowering(CallFrameVisitor[Expr]):
     """Mechanical lowering of one analyzed HIR function."""
 
     result: AnalysisResult
     authored: Function
+    occurrence: IterationScope | None = None
+    callees: dict[int, Lowering] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         ExprVisitor.__init__(self)
-        self.module = self.result.module
-        self.function = self.result.function
+        self.module = self.result.scopes.frame.module
+        self.occurrence = self.result.scopes.occurrence if self.occurrence is None else self.occurrence
+        self.function = self.occurrence.frame.function
         self.names = Names(self.authored)
         self.logical: dict[int, TensorType] = {}
         self.staged: dict[int, tuple[Var, LoopRegion | None]] = {}
@@ -272,16 +286,20 @@ class Lowering(ExprVisitor[Expr]):
         self.authored_values: dict[int, Expr] = {}
         if self.function.body is not None and self.authored.body is not None:
             self.authored_values[id(self.function.body)] = self.authored.body
-        self.scopes = self.result.scopes
+        self.scopes = self.occurrence
         self.scope_for_call = {
             expr_id: scope
             for scope in walk_scopes(self.scopes)
+            if scope.occurrence is self.occurrence
             for expr_id, (call, _relations) in scope.relations.items()
             if id(call) == expr_id
         }
-        self.type_ctx = TypeInferContext(scope=FunctionScope(self.module, self.function))
+        self.type_ctx = TypeInferContext(frame=self.occurrence.frame)
         for param in self.function.params:
-            physical = Var(param.name, type=param.type, is_const=param.is_const)
+            type_ = param.type
+            if self.occurrence.parent is not None and isinstance(type_, TensorType):
+                type_ = _callee_tensor_type(type_)
+            physical = Var(param.name, type=type_, is_const=param.is_const)
             self._memo[id(param)] = (param, physical)
             if isinstance(param.type, TensorType):
                 self.logical[id(physical)] = param.type
@@ -294,7 +312,10 @@ class Lowering(ExprVisitor[Expr]):
 
         self.scope_names = _scope_names(self.scopes, self.names)
         result_type = self.function.return_type
-        out_type = TensorType(tuple(result_type.shape), result_type.dtype, None, StorageKind.GMEM)
+        storage = StorageKind.GMEM if self.occurrence.parent is None else result_type.storage
+        out_type = TensorType(tuple(result_type.shape), result_type.dtype, None, storage)
+        if self.occurrence.parent is not None:
+            out_type = _callee_tensor_type(result_type)
         self.output = Var(self.names.fresh("out"), type=out_type)
         body = self.function.body
         inner = _Cursor()
@@ -336,7 +357,7 @@ class Lowering(ExprVisitor[Expr]):
 
     def _staging_loop(self, expr: Call) -> LoopRegion | None:
         scope = self.scope_for_call.get(id(expr))
-        while scope is not None:
+        while scope is not None and scope.occurrence is self.occurrence:
             if isinstance(scope.owner, LoopRegion):
                 return scope.owner
             scope = scope.parent
@@ -361,6 +382,11 @@ class Lowering(ExprVisitor[Expr]):
     ) -> Expr:
         if not isinstance(type_, TensorType):
             raise LoweringError(f"{_label(expr)} has non-tensor material result {type_!r}")
+        memory = get_metadata(expr, MemoryMetadata)
+        if (self.occurrence.parent is not None and memory is not None
+                and memory.buffer_bytes is not None and not memory.offsets):
+            self.logical[id(self.output)] = type_
+            return self.output
         storage_type = _storage_type(type_)
         stem = self.names.binding(
             self.authored_values.get(id(expr)), expr.name if isinstance(expr, Var) else "value"
@@ -394,6 +420,8 @@ class Lowering(ExprVisitor[Expr]):
                 raise LoweringError(f"{_label(expr)} uses staged internal gmem")
             elements = prod(tuple(storage_type.shape))
             scratch_type = TensorType((elements,), storage_type.dtype, None, StorageKind.GMEM)
+            if self.occurrence.parent is not None:
+                scratch_type = _callee_tensor_type(scratch_type)
             scratch = Var(self.names.fresh("scratch"), type=scratch_type)
             self.scratch.append(scratch)
             desired = replace(
@@ -592,6 +620,8 @@ class Lowering(ExprVisitor[Expr]):
 
     def visit_Call(self, call: Call, cursor: _Cursor) -> Expr:
         target = call.target
+        if self.callee_frame(call, self.occurrence.frame) is not None:
+            return self._lower_call(call, cursor)
         if is_dim_op_call(call):
             result = self._dim(call)
         else:
@@ -601,6 +631,37 @@ class Lowering(ExprVisitor[Expr]):
             else:
                 result = visitor(call, cursor)
         return result
+
+    def _lower_call(self, call: Call, cursor: _Cursor) -> Expr:
+        frame = self.callee_frame(call, self.occurrence.frame)
+        lowering = self.callees[id(frame.function)]
+        args = tuple(self.visit(arg, cursor) for arg in call.args)
+        destination = self._declare(call, call.type, 1, cursor)
+        scratch = []
+        for param in lowering.scratch:
+            forwarded = Var(self.names.fresh(param.name), type=param.type)
+            self.scratch.append(forwarded)
+            scratch.append(forwarded)
+        target = call.target
+        if isinstance(target, Function):
+            target = lowering.lowered
+        elif isinstance(target, Call):
+            target = replace(target, args=(target.args[0], self._dim(target.args[1])))
+        params = tuple(
+            param for param in lowering.lowered.params
+            if isinstance(call.target, Function) or not param.is_const
+        )
+        supplied = (*args, *scratch, destination)
+        passed = []
+        for value, param in zip(supplied, params, strict=True):
+            if isinstance(param.type, TensorType) and value.type != param.type:
+                value = self._window(
+                    value, tuple(i64_const(0) for _ in value.type.shape), tuple(value.type.shape),
+                    param.type, cursor, "argument", whole_tensor=True,
+                )
+            passed.append(value)
+        cursor.add(Evaluate(target, tuple(passed)))
+        return destination
 
     def _lower_automatic_instruction(self, call: Call, cursor: _Cursor) -> Expr:
         target = call.target
@@ -1322,15 +1383,40 @@ class ConvertHIRToTIR(ModulePass):
         if not isinstance(authored, Function):
             raise LoweringError(f"{getattr(authored, 'name', self.entry)!r} is not an HIR function")
         result = analyze(module, authored, analysis=("memory",), dims=self.dims)
-        lowered = Lowering(result, authored).run()
-        lowered.metadata = result.function.metadata
+        occurrences = tuple(scope for scope in walk_scopes(result.scopes) if scope.frame is not None)
+        lowered = {}
+        for frame in CallFrameVisitor.walk_frames(result.scopes.frame, postorder=True):
+            body = frame.function
+            occurrence = next(scope for scope in occurrences if scope.frame.function is body)
+            memory = get_metadata(body.body, MemoryMetadata)
+            tied = memory is not None and memory.buffer_bytes is not None and not memory.offsets
+            if occurrence.parent is not None and not tied and body.return_type.storage is not StorageKind.SMEM:
+                raise LoweringError(
+                    f"callee {body.name!r} at {occurrence_path(occurrence)!r} has no return bound to its "
+                    "caller destination; write an explicit tf.schedule copy in HIR"
+                )
+            lowering = Lowering(result, origin_of(body) or body, occurrence, lowered)
+            lowering.lowered = lowering.run()
+            lowered[id(body)] = lowering
+        root = lowered[id(result.function)].lowered
+        root.metadata = result.function.metadata
         for record in render_analysis(result).summary:
             if isinstance(record, (ReportIdentity, ReportSelection)):
-                attach_metadata(lowered, record)
-        functions = tuple(
-            lowered if function is authored else function for function in module.functions
-        )
-        return replace(module, functions=functions)
+                attach_metadata(root, record)
+        modules = {}
+
+        def lower_module(node):
+            if id(node) in modules:
+                return
+            modules[id(node)] = node
+            for slot in node.children.values():
+                for child in slot.elements:
+                    lower_module(child)
+            node.functions = tuple(lowered[id(fn)].lowered if id(fn) in lowered else fn
+                                   for fn in node.functions)
+
+        lower_module(result.scopes.frame.module)
+        return result.scopes.frame.module
 
 
 __all__ = ["ConvertHIRToTIR", "LoweringError"]

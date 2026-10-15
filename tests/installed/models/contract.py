@@ -43,10 +43,9 @@ def model_cases(model: str) -> tuple[ModelCase, ...]:
 def static(source: Path, case: ModelCase, selector: str) -> str:
     """The ``path:selector`` the command is given, from the non-empty segments.
 
-    The root the source declares, the domain the case scopes to, and the function
-    the case names. A case whose domain is the root itself contributes no segment.
+    The case names a definition directly and selects one of its functions.
     """
-    reached = ".".join(part for part in (case.prototype.name, case.scope, selector) if part)
+    reached = ".".join((case.prototype.name, selector))
     return f"{source / 'model.py'}:{reached}"
 
 
@@ -117,7 +116,7 @@ def reported(
 
 def _compute_cost_evidence(report: dict) -> str | None:
     """What `compute-cost` must have counted: flops, bucketed by dtype."""
-    flops = report["totals"]["flops"]
+    flops = report["functions"][0]['totals']["flops"]
     if not flops or not any(count > 0 for count in flops.values()):
         return f"reported no flops at all ({flops!r})"
     return None
@@ -130,11 +129,11 @@ def _memory_evidence(report: dict) -> str | None:
     what a program moves and what it must hold at once are two answers, reported
     as two.
     """
-    record = report["function_records"]["memory"]
+    record = report["functions"][0]['function_records']["memory"]
     solver_status = record.get("solver_status")
     if solver_status not in ("optimal", "feasible"):
         return f"solver status is {solver_status!r}"
-    gmem = report["totals"]["traffic"]["gmem"]
+    gmem = report["functions"][0]['totals']["traffic"]["gmem"]
     if not gmem.get("read", 0) > 0:
         return f"reported no gmem read ({gmem!r})"
     if not record["lifetimes"]:
@@ -144,7 +143,7 @@ def _memory_evidence(report: dict) -> str | None:
 
 def _roofline_evidence(report: dict) -> str | None:
     """What `roofline` must have decided: which side bounds, and the time it implies."""
-    record = report["function_records"]["roofline"]
+    record = report["functions"][0]['function_records']["roofline"]
     if record["bound_by"] not in ("compute", "memory", "balanced"):
         return f"bound_by is {record['bound_by']!r}, no rated resource"
     if not record["ideal_ns"] > 0:
@@ -154,7 +153,7 @@ def _roofline_evidence(report: dict) -> str | None:
 
 def _performance_evidence(report: dict) -> str | None:
     """What `performance` must have laid out and scaled by physical capacity."""
-    record = report["function_records"]["performance"]
+    record = report["functions"][0]['function_records']["performance"]
     envelope = record["timeline"]
     if envelope["start_ns"] != 0 or not envelope["end_ns"] > 0:
         return f"predicted interval is {envelope!r}"
@@ -208,14 +207,14 @@ def lifetimes(
     """What the memory analysis says each binding of one function costs."""
     report = reported(tf, source, case, selector, ("memory",), dims)
     return {
-        item["binding"]: item["bytes"] for item in report["function_records"]["memory"]["lifetimes"]
+        item["binding"]: item["bytes"] for item in report["functions"][0]['function_records']["memory"]["lifetimes"]
     }
 
 
 def traffic_read(tf, source: Path, case: ModelCase, selector: str, dims: Mapping[str, int]) -> int:
     """How many bytes the memory analysis says one function reads from gmem."""
     report = reported(tf, source, case, selector, ("memory",), dims)
-    return report["totals"]["traffic"]["gmem"]["read"]
+    return report["functions"][0]['totals']["traffic"]["gmem"]["read"]
 
 
 def one_rounding(want) -> tuple[str, dict[str, float]]:
@@ -235,17 +234,6 @@ def three_roundings(want) -> tuple[str, dict[str, float]]:
 def exactly() -> tuple[str, dict[str, float]]:
     """No tolerance. A gather or a copy reassociates nothing."""
     return "equal", {}
-
-
-def _reached_through(case: ModelCase, selector: str) -> str:
-    """The Modules between the root and the function, as the checkpoint keys them.
-
-    ``check`` scopes the weights it reads to the child Modules the selector passes
-    through, so a checkpoint written for one of them has to key its tensors the same
-    way -- a bare weight name is not found at all.
-    """
-    inner = [part for part in (*case.scope.split("."), *selector.split(".")[:-1]) if part]
-    return f"{'.'.join(inner)}." if inner else ""
 
 
 def split_by_declaration(case: ModelCase, selector: str, args: Sequence):
@@ -273,8 +261,12 @@ def nested_constants(loaded, prefix: str = "") -> dict:
     by the path they are reached through, or the child is loaded with nothing.
     """
     found = {f"{prefix}{name}": loaded.resource.load(name) for name in loaded.module.weights}
-    for child in loaded.modules:
-        found.update(nested_constants(child, f"{prefix}{child.module.name}."))
+    for key, child in loaded.children.items():
+        if isinstance(child, tuple):
+            for index, instance in enumerate(child):
+                found.update(nested_constants(instance, f"{prefix}{key}.{index}."))
+        else:
+            found.update(nested_constants(child, f"{prefix}{key}."))
     return found
 
 
@@ -392,7 +384,7 @@ def compared(
 
     if weights:
         checkpoint = {
-            f"{_reached_through(case, selector)}{name}": value
+            name: value
             for name, value in weights.items()
         }
         argv += ["--weights", f"ckpt:{_materialize_weights(checkpoint, cache)}"]

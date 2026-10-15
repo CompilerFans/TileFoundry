@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import MISSING, replace
 
 from tilefoundry.ir.core.expr import Call, Constant, Expr, Tuple, Var
 from tilefoundry.ir.core.metadata import (
@@ -10,22 +10,26 @@ from tilefoundry.ir.core.metadata import (
     attach_metadata,
     detach_metadata,
 )
+from tilefoundry.ir.core.module import ModuleList
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.sharding.reshard import Reshard as HirReshard
+from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.mesh_scope import covered_by_scope, storage_reaches
 from tilefoundry.ir.tir.shape import ShapeOf
 from tilefoundry.ir.types.callable_type import callable_type_for
 from tilefoundry.ir.types.dim import DimVar
+from tilefoundry.ir.types.dtype import IntegerDType
 from tilefoundry.ir.types.mesh import make_mesh
 from tilefoundry.ir.types.shard_layout import ShardLayout
 from tilefoundry.ir.types.substitute import canonicalize_dims
 from tilefoundry.ir.types.tensor_type import TensorType, TupleType, Type
 from tilefoundry.ir.types.utils import participant_layout, types_compatible
-from tilefoundry.ir.visitor import ExprVisitor, expr_children
+from tilefoundry.ir.visitor import expr_children
+from tilefoundry.visitor_registry.call_frame import CallFrameVisitor
 
-from .contexts import FunctionScope, TypeInferContext, TypeInferResults
+from .contexts import TypeInferContext, TypeInferResults
 from .registries import typeinfer_registry
 
 
@@ -56,7 +60,42 @@ def input_scope_refusal(operand_types, mesh) -> str | None:
     return None
 
 
-class TypeInferVisitor(ExprVisitor[Type]):
+def _check_module_index(slot: ModuleList, index=MISSING, *, index_type=None):
+    """Validate one entry call or subscript, returning its normalized index.
+
+    Validate the slot from the current CallFrame's module. A dynamic index
+    remains an expression; runtime bounds are checked when it is evaluated.
+    """
+    if index is MISSING:
+        if slot.indexed:
+            raise ValueError(f"ModuleList slot {slot.key!r} must be indexed before calling")
+        return None
+    if not slot.indexed:
+        raise ValueError(f"single slot {slot.key!r} cannot be indexed")
+    if isinstance(index, Expr) or index_type is not None:
+        index_type = index.type if index_type is None else index_type
+
+        if (
+            not isinstance(index_type, TensorType)
+            or index_type.shape != ()
+            or not isinstance(index_type.dtype, IntegerDType)
+        ):
+            raise ValueError(f"ModuleList slot {slot.key!r}: index must be an integer scalar")
+    if isinstance(index, Constant):
+        index = index.value
+    if isinstance(index, bool) or not isinstance(index, (int, Expr)):
+        raise ValueError(f"ModuleList slot {slot.key!r}: index must be an integer scalar")
+    if isinstance(index, int):
+        if not 0 <= index < len(slot):
+            raise ValueError(
+                f"ModuleList slot {slot.key!r}: index {index!r} out of range for N={len(slot)}"
+            )
+    elif any(element is not slot.elements[0] for element in slot.elements[1:]):
+        raise ValueError(f"ModuleList slot {slot.key!r}: variable index requires the same definition")
+    return index
+
+
+class TypeInferVisitor(CallFrameVisitor[Type]):
     """Derive one type for each ``Expr`` kind.
 
     See [hir §1.1](docs/spec/hir.md#11-function) and
@@ -121,6 +160,25 @@ class TypeInferVisitor(ExprVisitor[Type]):
 
     def visit_leaf_Call(self, call: Call, arg_types, ctx: TypeInferContext) -> Type:
         target = call.target
+        if isinstance(target, TupleGetItem) and isinstance(call.args[0], ModuleList):
+            slot = call.args[0]
+            if ctx.frame is not None:
+                slot = ctx.frame.module.children[slot.key]
+            try:
+                index = _check_module_index(slot, call.args[1], index_type=arg_types[1])
+            except ValueError as error:
+                ctx.error(call, str(error))
+            return arg_types[0].fields[index if isinstance(index, int) else 0]
+        if isinstance(target, Call):
+            arg_types = arg_types[1:]
+        try:
+            if isinstance(target, ModuleList) and ctx.frame is not None:
+                _check_module_index(ctx.frame.module.children[target.key])
+            child_frame = self.callee_frame(call, ctx.frame)
+            if child_frame is not None:
+                target = child_frame.function
+        except (KeyError, ValueError) as error:
+            ctx.error(call, str(error))
         from tilefoundry.ir.hir.schedule import ScheduleOp  # noqa: PLC0415
 
         if not isinstance(target, (HirReshard, ScheduleOp)):
@@ -128,7 +186,7 @@ class TypeInferVisitor(ExprVisitor[Type]):
             if refusal is not None:
                 ctx.error(call, refusal)
         if isinstance(target, Function):
-            return self._call_function(call, target, arg_types, ctx)
+            return self._call_function(call, target, arg_types, ctx, child_frame=child_frame)
         op_cls = type(target)
         fn = self._target_rule(op_cls, ctx) or typeinfer_registry.lookup(op_cls)
         if fn is None:
@@ -149,13 +207,15 @@ class TypeInferVisitor(ExprVisitor[Type]):
         callee: Function,
         arg_types: tuple[Type, ...],
         ctx: TypeInferContext,
+        *,
+        child_frame: CallFrame | None = None,
     ) -> Type:
-        child = ctx.child_for(callee)
+        child = child_frame is not None and not isinstance(call.target, Function)
         supplied = tuple(
-            param for param in callee.params if not (child is not None and param.is_const)
+            param for param in callee.params if not (child and param.is_const)
         )
         if len(arg_types) != len(supplied):
-            kind = "activation(s)" if child is not None else "parameter(s)"
+            kind = "activation(s)" if child else "parameter(s)"
             ctx.error(
                 call,
                 f"hir Function call {callee.name!r}: arity mismatch — "
@@ -165,7 +225,7 @@ class TypeInferVisitor(ExprVisitor[Type]):
         given = iter(enumerate(arg_types))
         memo = {}
         for param in callee.params:
-            if child is not None and param.is_const:
+            if child and param.is_const:
                 memo[id(param)] = (param, param.annotation)
                 continue
             index, arg_type = next(given)
@@ -181,15 +241,26 @@ class TypeInferVisitor(ExprVisitor[Type]):
         if callee.body is None or callee.variants:
             return callee.return_type
 
-        key = (id(callee), arg_types, ctx.current_mesh)
+        inner = replace(ctx, frame=child_frame, memo={}) if child else ctx.for_callee(callee)
+        context = None if inner.frame is None else (
+            id(inner.frame.module), inner.frame.target, inner.frame.topologies
+        )
+        key = (id(callee), arg_types, ctx.current_mesh, context)
         cached = ctx.instantiated_memo.get(key)
         if cached is not None:
             return cached
         result = TypeInferVisitor(memo=memo, owns_body=False, ranges=False).visit(
-            callee.body, ctx.for_callee(callee)
+            callee.body, inner
         )
         ctx.instantiated_memo[key] = result
         return result
+
+    def visit_leaf_ModuleList(self, slot, _operands, ctx: TypeInferContext) -> Type:
+        try:
+            current = ctx.frame.module.children[slot.key] if ctx.frame is not None else slot
+            return current.type
+        except (KeyError, ValueError) as error:
+            ctx.error(slot, str(error))
 
     def visit_leaf_Tuple(self, tup: Tuple, operands, ctx: TypeInferContext) -> Type:
         """Visit Tuple.
@@ -279,8 +350,8 @@ class TypeInferVisitor(ExprVisitor[Type]):
 
     def visit_Function(self, fn: Function, ctx: TypeInferContext) -> Type:
         """Refresh one complete function after binding its parameter types."""
-        if ctx.scope is not None and ctx.scope.function is not fn:
-            ctx = replace(ctx, scope=FunctionScope(ctx.scope.module, fn))
+        if ctx.frame is not None and ctx.frame.function is not fn:
+            ctx = replace(ctx, frame=replace(ctx.frame, function=fn))
         memo = {id(param): (param, param.annotation) for param in fn.params}
         if fn.body is not None:
             TypeInferVisitor(

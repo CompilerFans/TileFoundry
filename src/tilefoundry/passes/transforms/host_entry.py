@@ -12,21 +12,16 @@ from __future__ import annotations
 from dataclasses import replace
 
 from tilefoundry.ir.core import Var
-from tilefoundry.ir.core.module import (
-    Module,
-    called_functions,
-    child_module_of,
-    function_selectors,
-    module_functions,
-    owning_module,
-)
+from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
+from tilefoundry.ir.module_utils import list_call_paths
 from tilefoundry.ir.tir.launch import launch_call
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Sequential
 from tilefoundry.ir.types import StorageKind, TensorType, TupleType, UnitType
 from tilefoundry.passes.pass_base import ModulePass
 from tilefoundry.target import CpuTarget, CudaTarget
+from tilefoundry.visitor_registry.call_frame import CallFrameVisitor
 
 _DEFAULT_ENTRY_NAME = "main"
 
@@ -96,7 +91,7 @@ def insert_default_host_entry(module: Module) -> Module:
     runs_on = entry.target if isinstance(entry, PrimFunction) else module.resolve_target()
     if isinstance(runs_on, CpuTarget):
         return module
-    functions = module_functions(module)
+    functions = tuple(frame.function for frame in list_call_paths(module).values())
     if all(isinstance(fn, PrimFunction) for fn in functions):
         return entry_for_one_device_function(module)
     if all(isinstance(fn, Function) for fn in functions):
@@ -123,19 +118,32 @@ def entry_for_one_device_function(module: Module) -> Module:
 
 def reject_omitted_child_weights(module: Module) -> None:
     """Reject device calls that depend on implicit child-owner weight injection."""
-    functions = function_selectors(module)
-    selectors = {id(fn): selector for selector, fn in functions}
-    for selector, fn in functions:
-        for caller in (fn, *fn.variants):
-            for callee in called_functions(caller):
-                if child_module_of(module, caller, callee) is not None:
-                    weights = [param.name for param in callee.params if param.is_const]
-                    if weights:
-                        raise ValueError(
-                            f"CUDA skeleton: {selector} calls "
-                            f"{selectors[id(callee)]} with omitted weights {weights}; "
-                            "declare the weights as parameters or call from orchestration"
-                        )
+    frames = list_call_paths(module)
+    selectors = {id(frame.function): path for path, frame in frames.items()}
+
+    class Check(CallFrameVisitor[None]):
+        def default_visit_leaf(self, expr, operands, frame):
+            return None
+
+        def visit_Call(self, call, frame):
+            self.visit_operands(call, frame)
+            inner = self.callee_frame(call, frame)
+            if inner is None or isinstance(call.target, Function):
+                return
+            callee = inner.function
+            weights = [param.name for param in callee.params if param.is_const]
+            if weights:
+                raise ValueError(
+                    f"CUDA skeleton: {selectors[id(frame.function)]} calls "
+                    f"{selectors[id(callee)]} with omitted weights {weights}; "
+                    "declare the weights as parameters or call from orchestration"
+                )
+
+    for frame in frames.values():
+        if isinstance(frame.function, Function):
+            for function in (frame.function, *frame.function.variants):
+                if function.body is not None:
+                    Check().visit(function.body, frame)
 
 
 def _fresh_name(stem: str, taken: set[str]) -> str:
@@ -175,10 +183,11 @@ def _entry_params(fn: Function) -> tuple[Var, ...]:
     return (*inputs, *destinations(fn.return_type))
 
 
-def host_entry_for(owner: Module, selector: str, fn: Function, taken: set[str]) -> PrimFunction:
+def host_entry_for(frame, selector: str, fn: Function, taken: set[str]) -> PrimFunction:
     """Launch one Module entry with its declared inputs and flattened destinations."""
     params = _entry_params(fn)
-    grid, block = _launch_config_of(owner)
+    grid = (_product(tuple(t.size for t in frame.topologies if t.name == "cta")), 1, 1)
+    block = (_product(tuple(t.size for t in frame.topologies if t.name == "thread")), 1, 1)
     launch = launch_call(fn, params, grid, block, symbol=selector)
     return PrimFunction(
         name=_fresh_name(f"{fn.name}_host", taken),
@@ -203,10 +212,10 @@ def entries_for_hir_functions(module: Module) -> Module:
     reject_omitted_child_weights(module)
     taken = {fn.name for fn in module.functions}
     entries = []
-    for selector, fn in function_selectors(module):
-        owner = owning_module(module, fn)
-        if owner.entry == fn.name:
-            entries.append(host_entry_for(owner, selector, fn, taken))
+    for call_path, frame in list_call_paths(module).items():
+        fn = frame.function
+        if isinstance(fn, Function) and frame.module.entry == fn.name:
+            entries.append(host_entry_for(frame, call_path, fn, taken))
     return replace(module, functions=(*module.functions, *entries))
 
 

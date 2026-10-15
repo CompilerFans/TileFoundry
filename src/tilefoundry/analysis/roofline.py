@@ -8,6 +8,8 @@ different count of the same flops.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from tilefoundry.ir.core import Call, Expr, describe_expr, get_metadata
 from tilefoundry.ir.core import attach_metadata as attach
 from tilefoundry.ir.hir.function import Function
@@ -136,8 +138,39 @@ class RooflineVisitor(ExprVisitor[None]):
         super().__init__()
         self.facts = facts
 
+    def visit_Call(self, call, ctx):
+        child = next((scope for scope in ctx.current.children if scope.owner is call), None)
+        if child is None:
+            return self.default_visit_leaf(call, self.visit_operands(call, ctx), ctx)
+        for arg in call.args:
+            self.visit(arg, ctx)
+        if isinstance(child.index, Expr):
+            self.visit(child.index, ctx)
+        memo, self._memo = self._memo, {}
+        try:
+            self.visit(child.frame.function.body, replace(ctx, current=child))
+        finally:
+            self._memo = memo
+        self.default_visit_leaf(call, (), ctx)
+        attach(child.frame.function, get_metadata(call, RooflineMetadata))
+
+    def visit_MeshRegion(self, expr, ctx):
+        for arg in expr.args:
+            self.visit(arg, ctx)
+        child = next(scope for scope in ctx.current.children if scope.owner is expr)
+        self.visit(expr.body, replace(ctx, current=child))
+
+    def visit_LoopRegion(self, expr, ctx):
+        for arg in expr.args:
+            self.visit(arg, ctx)
+        child = next(scope for scope in ctx.current.children if scope.owner is expr)
+        inner = replace(ctx, current=child)
+        self.visit(expr.body, inner)
+        for arg in expr.yield_values:
+            self.visit(arg, inner)
+
     def default_visit_leaf(
-        self, expr: Expr, _operands: tuple[None, ...], _ctx: AnalyzeContext
+        self, expr: Expr, _operands: tuple[None, ...], ctx: AnalyzeContext
     ) -> None:
         if not isinstance(expr, Call):
             return

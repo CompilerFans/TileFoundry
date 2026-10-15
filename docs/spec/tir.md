@@ -186,6 +186,8 @@ parameters; omitting it means one output.
 - **`For` bound coordinates**. A `MeshCoord` read by `For.start` / `.stop` /
   `.step` MUST name a literal in-range axis of a mesh bound by an enclosing
   `MeshScope`.
+- **Retained function calls** follow [core-ir §2.1](./core-ir.md#21-call).
+  Verification requires strictly equal argument types/counts and rejects recursion.
 - **`Evaluate.callable`**. When `callable` is a `SymbolRef`
   ([§2.1](#21-symbolref)), module-level resolution MUST find exactly one
   `PrimFunction` of that name in the enclosing `Module`, `args` length
@@ -201,7 +203,7 @@ parameters; omitting it means one output.
 
 ```python
 class Evaluate(Stmt):
-    callable: Op | SymbolRef    # an effect-form Op or a SymbolRef callee
+    callable: Op | SymbolRef | PrimFunction | ModuleList | Call
     args: tuple[Expr, ...]      # the callable's operands in ParamDef / parameter order
 ```
 
@@ -222,6 +224,14 @@ The `callable` is one of:
   parameter order, the final `output_count` positions binding output
   buffers; the callee is resolved uniquely at module level
   ([§1.3](#13-primfunction)).
+
+- a retained `PrimFunction`, single-slot `ModuleList`, or computed
+  `Call(TupleGetItem, (ModuleList, index))` target, following the same instance
+  resolution as HIR ([core-ir §2.1](./core-ir.md#21-call)). These device calls
+  remain in one Module tree; they MUST NOT become `SymbolRef` or launches.
+  Printers MUST emit `helper(...)`, `child(...)`, and `layers[i](...)` respectively.
+
+Scheduled lowering follows [passes §7.1](./passes.md#71-converthirtotir).
 
 Per-Op verify and codegen handlers, when present, are keyed by `Op` type and
 receive the Op together with `args`; an `Op` callable carries no result, so its
@@ -906,7 +916,7 @@ block_y, block_z, *forwarded_args)`:
 
 - **callee**: `args[0]` MUST be a `SymbolRef` ([§2.1](#21-symbolref)) resolving to
   a device `PrimFunction` with a CUDA target, or a HIR `Function` by its
-  root-relative selector ([core-ir §1.2](./core-ir.md#12-selecting-a-node-by-path)).
+  root-relative selector ([core-ir §1](./core-ir.md#1-module)).
   The host-entry pass writes and checks a HIR callee's forwarded args
   ([passes §7.3](./passes.md#73-insert_default_host_entry)); verification
   resolves the selector and does not check them again.

@@ -40,10 +40,10 @@ class Module:
     """Contain one execution domain and its owned module tree.
 
     Attributes:
-        name: attribute; Module name within its owner.
+        name: attribute; Definition name, independent of instance slot keys.
         functions: attribute; Heterogeneous HIR and TIR function container.
         entry: attribute; Optional public entry-function name.
-        modules: attribute; Child modules named by their attachment attributes.
+        children: attribute; Slot keys mapped to shared ModuleList objects.
         target: attribute; Declared hardware target, or None to inherit.
         topologies: attribute; Declared hierarchy, None to inherit, or an empty tuple.
         metadata: attribute; Target and compiler-option metadata.
@@ -53,7 +53,7 @@ class Module:
     name: str
     functions: tuple[hir.Function | tir.PrimFunction, ...]
     entry: str | None = None
-    modules: tuple["Module", ...] = field(default_factory=tuple)
+    children: dict[str, "ModuleList"] = field(default_factory=dict)
     target: Target | None = None
     topologies: tuple[Topology, ...] | None = None
     metadata: dict[str, object] = field(default_factory=dict)
@@ -75,18 +75,15 @@ class Module:
     constructing a `Module` seals its functions.
   - a `Module` is the execution domain of the functions it owns: it, not they,
     declares the `Target` and the ordered `Topology` hierarchy.
-  - a `Module` owns its child subtree. Placing a child that already belongs to
-    another owner MUST NOT change what the first owner's subtree resolves.
-  - a child declares no Target, so its bodies are typed without one, and
-    holding it does not type them again. A call of a child function is typed
-    from the callee body under the caller's effective Target with the call's
+  - `children` maps instance slot keys to `ModuleList` objects. Definitions and
+    function bodies remain shared; placing a definition creates no copy and no
+    parent backlink. A class-body `Module` becomes a single-element,
+    non-indexed slot; a class-body `ModuleList` is held as authored.
+  - a child MAY declare its own Target; holding it does not type its bodies
+    again. A call of a child function is typed
+    from the callee body under the callee's effective Target with the call's
     own argument types ([hir §1.1](./hir.md#11-function)); that writes the
     caller's `Call.type` and nothing in the child.
-  - a `@module` class body that places a child another owner already holds
-    places an independent `cloned()` copy, detached from that owner, so its
-    calls reach the copy and the child resolves this owner's Target without
-    changing what the first owner's subtree resolves. The copy keeps the
-    ownership inside its own subtree.
   - `owns(function)` MUST use identity and accept the Module's direct functions
     and their specialization variants. With `derived=True`, it MUST also follow
     a rebuilt function's recorded origin
@@ -94,7 +91,7 @@ class Module:
     only its first edge — a rebuild may itself be rebuilt; equal copies and
     same-name functions from another Module MUST remain unowned.
 
-A `Module` is a static ownership and execution-context container, not a dynamic
+A `Module` is a static definition and execution-context container, not a dynamic
 invocation. Owning a `Function`, attaching a child `Module`, or declaring a
 `Target` or `Topology` hierarchy never itself begins or counts an invocation;
 Python-to-HIR entry and HIR-to-HIR device calls are governed by
@@ -111,33 +108,28 @@ Python-to-HIR entry and HIR-to-HIR device calls are governed by
   effective levels and creates a lexical mesh binding.
 
 **Effective context.** `target` and `topologies` record what a Module
-*declares*, not what it resolves to; resolution is lexical over the owner
-chain and is not copied onto each Module or Function.
+*declares*, not what it resolves to; a visitor carries the effective declarations in its current `CallFrame`,
+without copying them onto shared definitions or Functions.
 
 - constraints:
-  - `topologies = None` declares nothing and inherits the owner's hierarchy;
+  - `topologies = None` declares nothing and inherits the nearest instance declaration;
   `topologies = ()` declares an explicitly topology-free domain; an explicit
   tuple replaces the inherited hierarchy whole rather than extending it. A
   declared tuple MUST NOT repeat a level name.
-  - `resolve_topology(name)` returns the single effective level with that exact
+  - `resolve_topology(name)` returns the single declared level with that exact
   name and MUST fail, naming the levels that are available, when there is
   none.
   - `metadata` carries target / compiler-option configuration, never
   semantic topology / mesh information.
-  - Each entry of `modules` is named by the attribute it is attached under —
-  torch / HuggingFace checkpoint-naming semantics: assigning a child to
-  `self.self_attn` in a class body names that child `self_attn` in the tree,
-  independent of the child's own `name`.
-  - `mod.cloned()` returns an independent copy: its functions, their bodies, its
-  children, and every `Call` targeting one of them are copies, with internal
-  `Call.target`s redirected to the copy. The immutable context around the node —
-  its owner, `target` and `topologies` — MUST stay shared, since those are not
-  part of it. `mod.renamed(name)` is that copy under a different `name`.
-  Copying rather than sharing is required, not an optimisation to skip: an
-  analysis records its result on the IR it measured, in place, so two nodes
-  holding one Function would report one measurement under two names. This is
-  what lets one definition become N distinct instances (N decoder layers, each
-  renamed by index) and one prototype serve any number of independent builds.
+  - A `children` key is the class-body attribute name. `Module.name` remains
+    the definition name. Instance resource paths append that key, followed by
+    the element index for an indexed slot, e.g. `layers.3.input_norm.w`.
+  - Each slot has its own object identity; a definition may occupy several
+    single slots or occur repeatedly in a `ModuleList`, sharing Functions.
+    A `ModuleList` object MUST NOT be attached under two different keys.
+    Rebuilding a Module with the same slot key MUST remain valid.
+  - Lists and tuples of Modules in a class body MUST be refused with guidance
+    to use `ModuleList(definition, N)`.
   - `methods` collects plain Python functions (orchestration methods, e.g.
   `forward` / `init_caches`; full collection rule in
   [parser §3](./parser.md#3-implementation-overview)). A function name,
@@ -160,32 +152,23 @@ chain and is not copied onto each Module or Function.
 #### Target inheritance
 
 A Module's target declaration belongs to its execution domain and is resolved
-through its owner chain.
+by the visitor from the callee declaration or the inherited caller context.
 
 - constraints:
-  - `resolve_target()` MUST return this Module's declared target when it has
-    one; otherwise it MUST return the nearest target declared by an owner.
-  - Only the outermost Module of a tree MAY declare a target. A child Module
-    that declares a target of its own MUST be refused when it is attached, and
-    MUST inherit its owner's target instead.
-  - A Module with no declaration anywhere in its owner chain MUST be refused
+  - `resolve_target()` MUST return this Module's declared target. Inherited
+    context belongs to the visitor's `CallFrame`, not the shared Module.
+  - Callee context inheritance and call compatibility follow
+    [hir §1.1](./hir.md#11-function).
+  - A root Module with no target declaration MUST be refused
     when its target is resolved. Its root Module MUST declare one, for example
     with `target=CudaTarget("nvidia.h200_sxm")`.
   - A Target declaration MUST be a constructed Target instance.
     A string MUST be refused rather than resolved or constructed.
-  - `resolve_target()` MUST return the exact instance the root declared; it MUST
+  - `resolve_target()` MUST return the exact instance this Module declared; it MUST
     NOT reconstruct or replace an equal value.
-  - A Module reused as an owned child and as an independently analysed root
-    declares a target only in the latter role.
-  - A Module published as an independently analysable root MUST declare both
-    its target and the topology levels it is aimed at, so that Analyze answers
-    it as it is published rather than after an edit. Naming the device is
-    enough; the architecture is derived from that device's document
-    ([target §4](./target.md#4-cudatarget)).
-  - Declaring a Module MUST NOT require a target. Whether a Module becomes an
-    owned child is decided by the owner, after the child has been constructed,
-    so a construction-time requirement would refuse trees whose children
-    correctly declare nothing.
+  - Declaring a Module MUST NOT require a target; a shared definition can
+    inherit execution context when a visitor enters it through a caller.
+
 
 #### Default step
 
@@ -206,28 +189,13 @@ step.
   - A bare `@func` / `@prim_func` MUST become an implicit single-function
     Module whose `entry` names that function.
 
-The shared HIR call-graph queries are:
-
-```python
-def called_functions(function: HirFunction) -> tuple[HirFunction, ...]: ...
-def reachable_functions(root: HirFunction) -> tuple[HirFunction, ...]: ...
-```
-
-- constraints:
-  - `called_functions` MUST return each direct Function-call target in the
-    body's operand-before-consumer definition order. Repeated call sites remain
-    repeated entries.
-  - `reachable_functions` MUST return the root followed by its transitively
-    called Functions, callers before callees and deduplicated by Function
-    identity.
-
 ### 1.1 Function access
 
 A `Module` mirrors the model it describes: a caller reaches a kernel, a child
 component, or an orchestration step through the same attribute surface.
 
 Each `name` maps to at most one entry among `Module.functions`,
-`Module.modules`, and `Module.methods`. Within `functions`,
+`Module.children`, and `Module.methods`. Within `functions`,
 shape-specialization variants live inside that entry's `Function.variants`
 ([hir.md §1.1](./hir.md#11-function)), never as separate same-name entries.
 
@@ -236,40 +204,72 @@ shape-specialization variants live inside that entry's `Function.variants`
   disjoint at one Module's own level.
   - `mod.lookup(name)` returns the function named `name`; it raises unless
   exactly one function matches. This is the canonical name-resolution
-  contract (e.g. for a `SymbolRef` callee) and always returns the `Function`
+  contract (e.g. for a `SymbolRef` callee), searches only this Module's own
+  `functions`, and always returns the `Function`
   / `PrimFunction` node itself.
-  - `mod.function_named(name)` returns the entries named `name`. In a verified
-  module this is length 0 or 1 (variants are not separate entries).
   - `mod.entry_function()` returns the function named by `entry`.
   - Python attribute access `mod.<name>` resolves, in order, a function, a
   child module, or a method named `<name>`, and MUST raise `AttributeError`
   when none match or when more than one same-kind entry shares the name. A
   **function** name resolves to the `Function` / `PrimFunction` node itself,
-  like `lookup` and `function_named`; an HIR `Function` is callable as one
+  like `lookup`; an HIR `Function` is callable as one
   `evaluator.evaluate` step. A `Module` is likewise callable when it declares
   an `entry`, with one argument for every declared parameter. A **child module** name resolves to that child
-  `Module`. A **method** name
+  `Module` for a non-indexed slot or its `ModuleList` for an indexed slot.
+  `ModuleList` supports Python iteration and indexing over its shared definitions.
+  A **method** name
   resolves to the class-body function bound like an instance method
   (`m.forward(...)`). Names beginning with `_` are never functions, modules, or
   methods and resolve by normal attribute rules. This lets a module read like
   the model it mirrors — `decoder.layer0.attention`.
 
-### 1.2 Selecting a node by path
+### 1.2 Definition call paths
 
-A caller that names one kernel of a tree needs the kernel *and* the execution
-domain it belongs to: a `Function` carries neither the Target its numbers are
-measured against nor the topology hierarchy they divide over, so a bare function
-is not a thing a cost can be stated about.
+`tilefoundry.ir.module_utils.list_call_paths(root)` enumerates each declared
+function once by identity, in DFS first-instance order. It returns a
+`dict[call_path, CallFrame]`, including HIR Functions and PrimFunctions. A
+call path is a dot-separated string. The frame records the current Module,
+function, effective target, and effective topologies; shared definitions use the first
+path for generated names, including indexed segments such as `layers.0.run`.
+
+### 1.3 `ModuleList`
+
+```python
+class ModuleList(Expr):
+    """Hold one instance slot without copying its definitions.
+
+    Attributes:
+        key: attribute; Attachment key assigned by the containing Module.
+        elements: attribute; Shared definitions in instance order.
+        indexed: attribute; Whether source calls require an element index.
+    """
+
+    key: str | None
+    elements: tuple[Module | type[RuntimeModule], ...]
+    indexed: bool
+
+    def __init__(self, definition, count=MISSING): ...
+```
 
 - constraints:
-  - `select(module, path)` MUST resolve a dotted `path` relative to `module`
-    and return a `Module`. Each segment MUST name a child module, except that
-    the last MAY instead name one of the reached module's own functions and
-    return that module re-entried at it. An empty path is the input module; an
-    empty segment MUST be refused.
-  - `function_selectors(module)` MUST return every HIR function in the module
-    tree paired with its resolving path, in source order and parents before
-    children. It MUST NOT return `PrimFunction` entries.
+  - A `ModuleList` is an Expr leaf carrying `key`, `elements`, and `indexed`.
+    Its key is assigned on attachment; its elements MUST be non-empty.
+    Semantic Module slots MUST contain only Module definitions. Runtime twin
+    declarations use RuntimeModule subclasses through the same list surface
+    ([runtime §1.3](./runtime.md#13-runtimedecoratorpy)).
+    A supplied count MUST be a positive integer, excluding bool.
+    One Module without a count creates a non-indexed slot; a count or a tuple
+    creates an indexed slot, preserving element order and repeated references.
+  - Construction and attachment MUST NOT resolve element entries. A container
+    without an entry MAY occupy a slot. Reading `.type` or type inference
+    projects each entry's signature with ConstTensor parameters omitted:
+    `CallableType` for a single slot, `TupleType(CallableType, ...)` for an
+    indexed slot. Calling a container without an entry MUST report the usual
+    no-entry error.
+  - A constant index MUST be in `[0, N)`. A variable index MUST be an integer
+    scalar and all elements MUST reference the same definition by identity.
+  - A single slot MUST NOT be indexed; an indexed slot MUST NOT be called
+    without an index. Only the instance entry may be called, not other methods.
 
 ## 2. `Expr`
 
@@ -395,15 +395,25 @@ class Call(Expr):
     """Represent an Op invocation.
 
     Attributes:
-        target: attribute; Op being called.
+        target: attribute; Op, Function, instance slot, or computed instance target.
         args: attribute; Input expressions in parameter order.
     """
 
-    target: Op
+    target: Op | hir.Function | ModuleList | Call
     args: tuple[Expr, ...]
 ```
 
 - constraints:
+  - `Call(target=Function)` supplies every parameter in the current instance.
+    A single-slot target is a `ModuleList`; an indexed instance target is
+    `Call(TupleGetItem, (ModuleList, index))`. Instance calls supply only the
+    entry's non-ConstTensor parameters. Implicit constants come from that
+    instance's resource path.
+  - Generic traversal MUST visit a Call-valued target before its args; it MUST
+    NOT traverse Function targets or the definitions held by ModuleList leaves.
+  - Entering an instance call MUST read the definition from the current
+    module's `children[key].elements[index]`. The target supplies only the key
+    and index, so rebuilt module trees remain authoritative.
   - a value-form `Call` is anchored by `LetStmt` in TIR; a Stmt-position effect
     invocation is `Evaluate(op, args)`.
   - A `Call` MUST NOT appear as a top-level Stmt directly.

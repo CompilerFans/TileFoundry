@@ -84,8 +84,7 @@ invocation they are already in.
 | Caller | Callee | Meaning |
 |---|---|---|
 | Python | HIR `Function`, directly or through a `Module` entry | Begin one kernel invocation |
-| HIR `Function` | HIR `Function` with the same owner | Same-kernel device call |
-| HIR `Function` | HIR `Function` with a different owner | Same-kernel device call |
+| HIR `Function` | HIR `Function` | Same-kernel device call |
 | Python | Plain Python `Module` method | Ordinary host orchestration |
 | HIR `Function` | Plain Python method | Invalid |
 
@@ -128,14 +127,15 @@ the function signature and is the result component projected into
 `return_type`. The projection is fixed at construction and stays
 consistent across construction sites.
 
-**Call typing — visitor-scoped inference.** A `Call` keeps its authored
-`Function` template as `target`. Its result type is inferred by seeding a new
+**Call typing — visitor-scoped inference.** A same-module `Call` keeps its authored
+`Function` template as `target`; an instance call keeps its ModuleList slot or
+`TupleGetItem(ModuleList, index)` target ([core-ir §2.1](./core-ir.md#21-call)). Its result type is inferred by seeding a new
 visitor memo with the actual argument types bound to the callee's formal
 parameters, then walking the callee body in a child context that retains the
 call site's mesh. A callee without a mesh declaration runs in that scope;
 a `MeshRegion` in its body composes with it using the usual nested-region rules.
 This is type inference only: it does not rebuild a `Function`, mutate the target,
-or create a per-call instance. The callee body is read under the caller's effective
+or create a per-call instance. The callee body is read under the callee's effective
 Target and none of its nodes is written; only a walk that owns the caller's
 body stores the result on the caller's `Call`.
 Caller-supplied layout (sharding) flowing into a layout-unconstrained
@@ -145,24 +145,14 @@ parameter propagates through the body, including through a `Tuple` or
 Within one inference traversal, repeated calls to the same `Function` object
 with equal argument types and equal call-site mesh scopes MUST reuse the
 previously inferred result type. The cache key uses callee identity, the
-argument-type tuple, and the call-site mesh; the cached value is
+argument-type tuple, call-site mesh, and current Module with its effective target and topologies; the cached value is
 only a `Type`, never a derived `Function` or a replacement `Call.target`.
 
-Argument types bind to supplied parameters in order. A `ConstTensor` parameter
-owned by a direct child module is omitted from `Call.args` and keeps its
-declared type in the callee visitor memo; no value it stands for enters the IR,
-and what fills it comes from outside
-([runtime §1.3](./runtime.md#13-runtimedecoratorpy)). The
-child-module resolver in the walk context
-([visitor-registry §4](./visitor-registry.md#4-instance-1--typeinfer)) decides
-whether this omission is available before collection.
-
-Omitting a parameter is valid only where, within that scope, the callee is
-uniquely owned by a direct child of the caller's owner
-([core-ir §1](./core-ir.md#1-module)); before collection the authored binding
-answers the same question of the child it names. Ownership that is missing,
-ambiguous, or not a direct child supplies every declared parameter, so a
-standalone or low-level call cannot acquire implicit constants.
+Argument types bind to supplied parameters in order, following the target and
+instance-resolution rules in [core-ir §2.1](./core-ir.md#21-call). For an omitted
+ConstTensor parameter, its declared type seeds the callee visitor memo; its
+value comes from the instance's resource
+([runtime §1.3](./runtime.md#13-runtimedecoratorpy)).
 
 Caller and callee MUST resolve one effective `Target` and one effective topology
 hierarchy: a same-kernel call is one execution context, whichever `Module` owns
@@ -1443,7 +1433,7 @@ Consensus torch.nn.functional ops.
   - Where no Target is in reach (`ctx.resolve_target()` is `None`), a `MatMul`
     with an operand in `smem` or `rmem` has `umat` result storage: which
     instruction computes it, and so where it lands, is decided once a Target
-    is known. A child Module is typed this way until a root holds it.
+    is known. A shared child is typed under the visitor's current CallFrame.
   - `Conv2D` requires rank-4 NCHW input and OIHW weight, a rank-1 bias, and one
     common operand dtype. `stride` and `dilation` are positive length-2 tuples,
     `padding` is a non-negative length-2 tuple, and `groups` is positive. Input
@@ -1735,46 +1725,20 @@ def variant_for(fn: Function, dims: Mapping[str, int]) -> Function:
     ...
 
 
-def specialize_function(
-    fn: Function,
-    dims: Mapping[str, int],
-    *,
-    ctx: TypeInferContext | None = None,
-) -> Function:
-    """Bind stated dimensions and rebuild the selected implementation.
+class InstantiateDimensionCloner(ExprCloner):
+    """Clone a reachable program with dimension bindings, without type inference."""
 
-    Args:
-        fn: Function or dispatch prototype.
-        dims: Dimensions to bind.
-        ctx: Optional shared type-inference context.
-
-    Returns:
-        The selected and partially or fully specialized function.
-    """
-    ...
+    def __init__(self, dims: Mapping[str, int] | None): ...
+    def module(self, module: Module) -> Module: ...
+    def function(self, function: Function) -> Function: ...
 
 
-def specialize_concretely(
-    fn: Function, dims: Mapping[str, int], ctx: TypeInferContext | None = None
-) -> Function:
-    """Specialize a function with no residual symbolic dimensions.
-
-    Args:
-        fn: Function or dispatch prototype.
-        dims: Complete concrete dimension bindings.
-        ctx: Optional shared type-inference context.
-
-    Returns:
-        A concrete function.
-    """
-    ...
-
-
-def residual_dims(fn: Function) -> tuple[str, ...]:
+def residual_dims(fn: Function, frame: CallFrame | None = None) -> tuple[str, ...]:
     """Return every dimension still stated as a range.
 
     Args:
         fn: Function to inspect recursively.
+        frame: Current module and effective execution context, required for instance targets.
 
     Returns:
         Residual dimension names.
@@ -1782,11 +1746,12 @@ def residual_dims(fn: Function) -> tuple[str, ...]:
     ...
 
 
-def dim_vars_reached(fn: Function) -> dict[str, object]:
+def dim_vars_reached(fn: Function, frame: CallFrame | None = None) -> dict[str, object]:
     """Return residual dimension declarations by name.
 
     Args:
         fn: Function to inspect recursively.
+        frame: Current module and effective execution context, required for instance targets.
 
     Returns:
         Residual dimension declarations.
@@ -1794,41 +1759,29 @@ def dim_vars_reached(fn: Function) -> dict[str, object]:
     ...
 
 
-def is_concrete(fn: Function) -> bool:
-    """Return whether no required extent remains symbolic.
-
-    Args:
-        fn: Function to inspect.
-
-    Returns:
-        Whether the function is concrete.
-    """
-    ...
 ```
 
 - constraints:
   - `variant_for` MUST return an ordinary function unchanged and otherwise
     MUST select exactly one matching variant. Missing or ambiguous coverage and
     an unstated dimension used by a pattern MUST raise `SpecializationError`.
-  - `specialize_function` MUST reject an empty binding, an unknown dimension,
-    or a selected implementation with no body. It MUST record the chosen
-    implementation and sorted bindings on a rebuilt function so `origin_of`
-    and `bound_dims_of` can recover them. Specialization MUST rebuild called
-    functions affected by the caller's bindings and record their provenance.
-    When a called function is a dispatch prototype, specialization MUST select
-    its implementation from the same bindings by the `variant_for` rule; an
-    unstated dispatch dimension MUST raise `SpecializationError` and name it.
-  - `specialize_concretely` MUST require a non-empty string-to-integer mapping
-    and MUST reject any residual dimension after specialization.
-  - Provenance and bound-dimension records MUST NOT participate in structural
-    equality or hashing; ownership checks use the recorded origin rather than
-    a function name.
-  - The recorded origin MUST be the function actually rebuilt, and nothing may
-    re-point it afterwards. Two call sites reaching two copies of one source
-    function hold two rebuilds recording two origins; one shared instance
-    re-pointed instead would answer both with whichever was written last.
+  - `InstantiateDimensionCloner` MUST select variants by `variant_for` and
+    substitute dimensions in types, Op attributes, loop bounds, and meshes.
+    It MUST replace Function targets with clones deduplicated by identity;
+    one shared definition MUST be cloned once. It MUST preserve ModuleList
+    and TupleGetItem instance targets, except for rebuilding their computed
+    index operand. It MUST NOT perform type inference while cloning.
+  - Each cloned function MUST retain its original name and record the chosen
+    implementation and sorted bindings, recoverable through `origin_of` and
+    `bound_dims_of`. Provenance and bound-dimension records MUST NOT participate
+    in structural equality or hashing. A recorded origin MUST NOT be re-pointed
+    after cloning.
+  - Dimension validation and check errors belong to
+    [analysis §2](./analysis.md#2-composed-analysis).
   - `residual_dims` and `dim_vars_reached` MUST inspect the whole function
     graph, including signatures, bodies, Op attributes, loop bounds, variants,
-    and called functions. `is_concrete` additionally checks the return type and
-    is false exactly when a reachable required extent still contains a `DimVar`;
-    runtime values without a `DimVar` are rejected later by their consumer.
+    and called functions, including return types. Runtime values without a
+    `DimVar` are rejected later by their consumer.
+  - Instance dimension scans MUST receive a `CallFrame` and recurse through
+    element entries using the current frame's children ([core-ir §2.1](./core-ir.md#21-call)).
+    Function-only graphs retain the frame-free query API.

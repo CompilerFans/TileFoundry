@@ -24,12 +24,10 @@ or summary restated in this project's source.
 ## Commands
 
 `SOURCE` is a Python file followed optionally by
-`:Module[.child_module...][.function]`. Without a selector, the source must
-define exactly one top-level HIR Module or Function. A selector chooses the
-named Module, or a Function reached through the chain of child Modules that own
-it: each segment names a child Module of the one before it, and only the last
-MAY name a Function. A leaf selected this way MUST keep resolving the Target and
-hierarchy it inherits from the owners it was reached through.
+`:Module[.function]`. Without a selector, the source must define exactly one
+top-level HIR Module or Function. A selector chooses the named Module and its
+default entry, or one of that Module's own Functions. Child Module path segments
+MUST be refused; a child used independently is named by its own top-level binding.
 
 A selector MAY name a top-level binding that is a bare `Function` — a source
 whose `@func` declares no execution context binds one. Every verb here reads
@@ -223,9 +221,8 @@ bounds the caller stated.
   - Reaching one leaf MUST read only that leaf Module's own weights. A comparison
     of one kernel MUST NOT materialise a whole model. A Module is the unit that
     loads, so what a run binds is everything the selected Module declares, not the
-    subset the selected function names; the selector's child segments MUST scope
-    the checkpoint by the same names they resolve the Module by, so the two cannot
-    be addressed differently.
+    subset the selected function names. A run MUST read the checkpoint relative
+    to the selected Module ([Commands](#commands)).
   - A dimension the target states as a range MUST be bound by `--dim`; a run
     MUST NOT choose an extent on the caller's behalf. Several extents MAY be
     stated for one dimension, and each MUST be run and reported. Where the extents select an implementation,
@@ -294,11 +291,10 @@ that runs before it can be read is a reference that decides what it describes.
     a function — a runtime twin is written per Module and MUST cover all of that
     Module's functions at once, so marking functions would state the work at a
     granularity nobody implements at.
-  - A root MUST be a Module that declares the target its tree runs on, and a
-    Module that declares none MUST NOT be listed as one. Declaring the machine is
-    what makes a Module answerable on its own; a component or layer template
-    reached through the root that owns it would otherwise be offered as a selector
-    that Analyze cannot answer.
+  - A catalog root MUST declare a target and MUST NOT be held, directly or
+    transitively, by another target-declaring Module in the same model package.
+    A layer that declares its own target remains usable on its own, but MUST NOT
+    be listed as another root when a published top-level model holds it.
   - A run of sibling Modules MAY be written once as the range it covers, and only
     when the run is adjacent, identically shaped down its whole subtree, named from
     one stem, and numbered consecutively. Such an entry MUST name every Module it
@@ -306,9 +302,10 @@ that runs before it can be read is a reference that decides what it describes.
     ranges, not a tree with repetition left out. Distinct siblings MUST stay
     separate. Without this a stack states its one layer forty times and the reader
     is back to reading a dump.
-  - The leaf-Module count and the function count MUST come from one traversal, so
-    the numbers cannot disagree with the forest printed beside them, and they MUST
-    count every Module a range stands for rather than the range as one.
+  - The leaf-Module count and function count MUST count definitions by object
+    identity, once per model. Repeated instances of one definition MUST NOT
+    increase either count. The forest MUST still show every instance, including
+    the element count of an indexed slot when its instances are grouped.
   - `--source` MUST print the absolute path of the shipped model directory first,
     followed by one line for every file named in the package data manifest, in
     a stable filename order. Each file line MUST give its filename and the first line of
@@ -390,7 +387,7 @@ explicit analysis; there is no ordinary `--target` option.
     budget is currently fixed and MUST NOT be exposed as a CLI flag or public
     analysis option.
   - `analyze` MUST invoke the public operation once with every requested root,
-    so their union dependency closure runs on one inlined Function view
+    so their union dependency closure runs over one checked Module
     ([analysis §2](./analysis.md#2-composed-analysis)). Each closure member MUST
     run once, and requesting another root MUST NOT let one analyzer change
     Metadata owned by another.
@@ -401,7 +398,8 @@ explicit analysis; there is no ordinary `--target` option.
     Its typed HIR, text report, or JSON report MUST be written to that path, and
     successful execution MUST write none of the report to stdout.
   - `--json` MUST write the report as JSON to the required `PATH` instead of text.
-    Its `source` field MUST carry the annotated HIR rendered alongside that report.
+    Its `source` field MUST carry each reached definition once with its records
+    ([analysis §2](./analysis.md#2-composed-analysis)).
     `--operands` MUST NOT change `source`: it is always the annotated HIR from the
     render without operand annotations.
     It MUST be refused as an argument-combination error when no analysis flag was
@@ -476,9 +474,8 @@ tilefoundry schedule facts [INSTRUCTION] --target TARGET PATH [--json]
 tilefoundry schedule candidates SOURCE PATH [--json] [--dim NAME=EXTENT ...]
 ```
 
-`finalize` checks and inlines the selected entry, runs memory analysis, lowers
-every selected instruction, and writes the verified `PrimFunction` as canonical
-Python TIR. With `--json`, `PATH` instead contains an object whose `source`
+`finalize` checks the selected entry, runs memory analysis, and writes canonical
+TIR following [passes §7.1](./passes.md#71-converthirtotir). With `--json`, `PATH` instead contains an object whose `source`
 field is that same canonical TIR. `facts` describes the instructions admitted
 by the exact `TARGET` identity, optionally narrowed to one fully-qualified
 `INSTRUCTION` name. With no `INSTRUCTION`, it lists every registered TIR Op
