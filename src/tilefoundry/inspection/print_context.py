@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import keyword
+import re
 from contextlib import contextmanager
 
 from tilefoundry.ir.types.layout import ComposedLayout, Layout, flatten
-from tilefoundry.ir.types.mesh import Mesh, axis_keys, make_mesh
+from tilefoundry.ir.types.mesh import Mesh, axis_keys, make_mesh, separate
 from tilefoundry.utils.python_source import PythonExpr, _merge_imports
 
 from .mesh_utils import selection_layout, sub_box
@@ -19,7 +21,6 @@ class PrintContext:
         self._dim_declarations: dict[str, tuple[object, str]] = {}
         self._mesh_bindings: list[tuple[Mesh, str]] = []
         self._used_scope_names: set[str] = set()
-        self._type_annotation_surface = False
         self.topologies = ()
 
     def use(self, rendered: PythonExpr | str) -> str:
@@ -66,16 +67,6 @@ class PrintContext:
     def pop_mesh(self) -> None:
         self._mesh_bindings.pop()
 
-    @contextmanager
-    def type_annotation_surface(self):
-        """Prefer a parent binding when a type refers to a sliced mesh."""
-        previous = self._type_annotation_surface
-        self._type_annotation_surface = True
-        try:
-            yield
-        finally:
-            self._type_annotation_surface = previous
-
     @property
     def current_mesh(self) -> Mesh | None:
         return make_mesh(*(mesh for mesh, _name in self._mesh_bindings)) if self._mesh_bindings else None
@@ -97,12 +88,6 @@ class PrintContext:
         )
         for binding_index in range(len(self._mesh_bindings) - 1, -1, -1):
             bound, alias = self._mesh_bindings[binding_index]
-            if (
-                self._type_annotation_surface
-                and bound is mesh
-                and (mesh.layout.offset if isinstance(mesh.layout, ComposedLayout) else 0) != 0
-            ):
-                continue
             if not bound.names or target_name not in bound.names:
                 continue
             for bound_level, bound_name in axis_keys(bound):
@@ -111,7 +96,16 @@ class PrintContext:
                 bound_topology = next(
                     topology for topology in bound.topologies if topology.name == target_level
                 )
-                if target_topology == bound_topology:
+                target_geometry = next(
+                    part for part in separate(mesh) if part.topologies[0].name == target_level
+                )
+                bound_geometry = next(
+                    part for part in separate(bound) if part.topologies[0].name == target_level
+                )
+                if (
+                    target_topology == bound_topology
+                    and target_geometry.layout == bound_geometry.layout
+                ):
                     return f"{alias}.{bound_name}"
         return None
 
@@ -168,7 +162,53 @@ class HirPrintContext(PrintContext):
 
 
 class TirPrintContext(PrintContext):
-    pass
+    def __init__(self) -> None:
+        super().__init__()
+        self._binding_names = {}
+        self._reserved_names = set()
+
+    @staticmethod
+    def identifier(name: str) -> str:
+        name = re.sub(r"\W", "_", name)
+        if not name or name[0].isdigit() or keyword.iskeyword(name):
+            name = "_" + name
+        return name
+
+    @contextmanager
+    def definition(self, bindings):
+        """Reserve all authored identifiers before naming one independent def.
+
+        Imports stay file-wide; mesh bindings and allocated names belong to this
+        definition. A generated suffix cannot consume a later authored name.
+        """
+        previous = self._mesh_bindings, self._used_scope_names, self._binding_names, self._reserved_names
+        self._mesh_bindings, self._used_scope_names = [], set()
+        self._binding_names = {}
+        self._reserved_names = {
+            binding.name for binding in bindings
+            if binding.name.isidentifier() and not keyword.iskeyword(binding.name)
+        }
+        try:
+            for binding in bindings:
+                self.binding_name(binding)
+            yield
+        finally:
+            self._mesh_bindings, self._used_scope_names, self._binding_names, self._reserved_names = previous
+
+    def binding_name(self, binding) -> str:
+        known = self._binding_names.get(id(binding))
+        if known is not None:
+            return known
+        base = self.identifier(binding.name)
+        name, suffix = base, 2
+        while name in self._used_scope_names or (
+            name in self._reserved_names and name != binding.name
+        ):
+            name = f"{base}_{suffix}"
+            suffix += 1
+        self._used_scope_names.add(name)
+        self._binding_names[id(binding)] = name
+        return name
 
 
 __all__ = ["PrintContext", "HirPrintContext", "TirPrintContext"]

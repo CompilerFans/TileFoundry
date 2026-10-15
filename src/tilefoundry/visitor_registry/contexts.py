@@ -42,6 +42,15 @@ class TypeInferContext:
     instantiated_memo: dict[tuple, Type] = field(
         default_factory=dict, repr=False, compare=False
     )
+    loops: tuple[tuple[Expr, object, object, object], ...] = ()
+    loop_aliases: dict[int, int] = field(default_factory=dict, repr=False, compare=False)
+
+    def with_captures(self, captures):
+        """Keep captured induction parameters in their original loop coordinate."""
+        aliases = dict(self.loop_aliases)
+        for param, arg in captures:
+            aliases[id(param)] = aliases.get(id(arg), id(arg))
+        return replace(self, loop_aliases=aliases)
 
     def resolve_target(self):
         """The target carried by this visitor's current call frame."""
