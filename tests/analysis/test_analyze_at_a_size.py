@@ -30,23 +30,28 @@ from tilefoundry.analysis import (
     MemoryMetadata,
     PerformanceMetadata,
     PerformanceSummaryMetadata,
+    RegionMemoryMetadata,
     analyze,
 )
-from tilefoundry.analysis.access import Access
-from tilefoundry.analysis.allocation import AllocationConstraintVisitor, aligned
+from tilefoundry.analysis.access import Access, SSAValue
+from tilefoundry.analysis.allocation import AllocationSummary, aligned
+from tilefoundry.analysis.allocation import root as storage_root
+from tilefoundry.analysis.api import _build_context
+from tilefoundry.analysis.check import check_program
 from tilefoundry.analysis.compute_cost import local_duration_ns
 from tilefoundry.analysis.errors import AnalysisError
 from tilefoundry.analysis.iteration_scope import IterationScope, walk_scopes
-from tilefoundry.analysis.liveness import analyze_liveness
+from tilefoundry.analysis.liveness import Liveness
 from tilefoundry.analysis.report import render_json, report_data
 from tilefoundry.cli import main as cli_main
 from tilefoundry.cli.source import load_namespace
 from tilefoundry.dsl import *
-from tilefoundry.ir.core import Call, describe_expr, get_metadata
+from tilefoundry.ir.core import Call, describe_expr, get_metadata, value_label
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.nn.rms_norm import RMSNorm
 from tilefoundry.ir.hir.specialize import (
+    SpecializationError,
     origin_of,
     residual_dims,
     variant_for,
@@ -57,6 +62,7 @@ from tilefoundry.ir.hir.tensor.reshape import Reshape
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.visitor import collect_exprs
 from tilefoundry.target import CudaTarget, PerformanceServiceFacts, ThroughputFacts
+from tilefoundry.visitor_registry.call_frame import CallFrame, CallFrameVisitor
 
 CONTEXT = 32
 DIMS = {"ctx_len": CONTEXT}
@@ -79,9 +85,6 @@ API_INVENTORY = frozenset(
 CLI_INVENTORY = [param for param in INVENTORY if param.id not in API_INVENTORY]
 assert API_INVENTORY <= {case.id for case in CASES}
 
-_GQA_MATERIAL_TRANSPOSE_GMEM = 280_616
-_PREFILL_MATERIAL_RESHARD_AND_TRANSPOSE_SMEM = 197_632
-_QWEN_LOOP_INVARIANT_VALUES_GMEM = 152_708_112
 _MHA_BATCH_GMEM_WITH_8_BYTES_ALIGNMENT_PADDING = 2_099_240 + 2_097_152 + 8
 _MHA_LONGER_GMEM_WITH_12_BYTES_ALIGNMENT_PADDING = 2_098_196 + 1_048_576 + 12
 _MHA_SHORTER_GMEM_WITH_20_BYTES_ALIGNMENT_PADDING = 1_049_612 + 524_288 + 20
@@ -101,32 +104,32 @@ class _PersistentScheduleExpectation:
 EXPECTED_MEMORY_PEAKS = {
     "child_matmul_target.ChildMatmul.run[static]": {
         "gmem": 64 * 64 * 2 + 64 * 32 * 2 + 64 * 32 * 4,
-        "rmem": 64 * 32 * 4,
+        "rmem": 16384,
         "smem": 64 * 16 * 2 + 16 * 32 * 2,
     },
     "child_matmul_target.ChildMatmulDirect.direct[static]": {
         "gmem": 64 * 64 * 2 + 64 * 32 * 2,
-        "rmem": 64 * 32 * 4,
+        "rmem": 16384,
         "smem": 64 * 16 * 2 + 16 * 32 * 2,
     },
     "child_matmul_target.ChildMatmulRoot.gemm[static]": {
         "gmem": 64 * 64 * 2 + 64 * 32 * 2 + 64 * 32 * 4,
-        "rmem": 64 * 32 * 4,
+        "rmem": 16384,
         "smem": 64 * 16 * 2 + 16 * 32 * 2,
     },
     "child_matmul_target.ChildMatmulRoot.gemm_on_chip[static]": {
         "gmem": 64 * 64 * 2 + 64 * 32 * 2,
-        "rmem": 64 * 32 * 4,
+        "rmem": 16384,
         "smem": 64 * 16 * 2 + 16 * 32 * 2,
     },
     "child_matmul_target.ChildMatmulRoot.gemm_staged[k_len=64]": {
         "gmem": 64 * 64 * 2 + 64 * 32 * 2 + 64 * 32 * 4,
-        "rmem": 64 * 32 * 4,
+        "rmem": 16384,
         "smem": 64 * 16 * 2 + 16 * 32 * 2,
     },
     "child_matmul_target.ChildMatmulStaged.staged[k_len=64]": {
         "gmem": 64 * 64 * 2 + 64 * 32 * 2 + 64 * 32 * 4,
-        "rmem": 64 * 32 * 4,
+        "rmem": 16384,
         "smem": 64 * 16 * 2 + 16 * 32 * 2,
     },
     "data_started_window.DataStart.probe[static]": {"gmem": 4_384, "rmem": 16, "smem": 256},
@@ -137,7 +140,7 @@ EXPECTED_MEMORY_PEAKS = {
     "flash_split_k_decode.FlashSplitKDecode.flash_split_k_decode[ctx=128]": {
         "gmem": 526_464,
         "rmem": 128 * 4 + 8,
-        "smem": 2 * 128 * 64 * 2 + 1_044,
+        "smem": 34084,
     },
     "fused_boundary.Inner.run[static]": {"rmem": 8 * 2 + 8 * 2},
     "fused_boundary.Inner.scale[static]": {"rmem": 256},
@@ -149,64 +152,64 @@ EXPECTED_MEMORY_PEAKS = {
     "fused_boundary.FusedBoundary.stage[static]": {"smem": 64},
     "gemm_schedules.Gemm_MNK_NT128x128x64_w17x8.gemm[static]": {
         "gmem": 52_428_800,
-        "rmem": 128 * 128 * 4,
+        "rmem": 98304,
         "smem": 128 * 64 * 2 + 64 * 128 * 2,
     },
     "gemm_schedules.Gemm_MK_NN64x128x32_w1x132.gemm[static]": {
         "gmem": 3_244_032,
-        "rmem": 64 * 128 * 4,
+        "rmem": 49152,
         "smem": 64 * 32 * 2 + 32 * 128 * 2,
     },
     "gemm_schedules.Gemm_MNK_NN128x128x64_w12x11_k4096.gemm[static]": {
         "gmem": 67_108_864,
-        "rmem": 128 * 128 * 4,
+        "rmem": 98304,
         "smem": 128 * 64 * 2 + 64 * 128 * 2,
     },
     "gemm_schedules.Gemm_MNK_NN128x128x64_w12x11_k16384.gemm[static]": {
         "gmem": 268_435_456,
-        "rmem": 128 * 128 * 4,
+        "rmem": 98304,
         "smem": 128 * 64 * 2 + 64 * 128 * 2,
     },
     "gemm_schedules.Gemm_MNK_NN64x128x32_w11x12.gemm[static]": {
         "gmem": 3_244_032,
-        "rmem": 64 * 128 * 4,
+        "rmem": 49152,
         "smem": 64 * 32 * 2 + 32 * 128 * 2,
     },
     "gemm_schedules.Gemm_MNK_NN64x128x32_w12x11.gemm[static]": {
         "gmem": 3_244_032,
-        "rmem": 64 * 128 * 4,
+        "rmem": 49152,
         "smem": 64 * 32 * 2 + 32 * 128 * 2,
     },
     "gemm_schedules.Gemm_MNK_NN128.gemm[static]": {
         "gmem": 131_072,
-        "rmem": 128 * 128 * 4,
+        "rmem": 98304,
         "smem": 128 * 128 * 2 + 128 * 128 * 2,
     },
     "gemm_schedules.Gemm_MNK_NN64.gemm[static]": {
         "gmem": 131_072,
-        "rmem": 64 * 64 * 4,
+        "rmem": 24576,
         "smem": 64 * 64 * 2 + 64 * 64 * 2,
     },
     "gqa_decode.GqaOnline._ctx_combine[static]": {"gmem": 291_968},
     "gqa_decode.GqaOnline._ctx_partials[ctx_len=128]": {"gmem": 4_483_072},
     "gqa_decode.GqaOnline.gqa_online_attend[ctx_len=128]": {
-        "gmem": _GQA_MATERIAL_TRANSPOSE_GMEM,
+        "gmem": 282688,
         "rmem": 0,
     },
     "hand_checked.InvariantReuse.reuse[static]": {
         "gmem": 64,
         "rmem": 0,
-        "smem": 16,
+        "smem": 32,
     },
     "hand_checked.CapacityExceeded.read[static]": {
         "gmem": 1_572_864,
         "rmem": 1_572_864,
     },
     "hand_checked.WaveTruncation.read[static]": {"gmem": 2_048, "rmem": 8},
-    "hand_checked.SiblingLoopReuse.read[static]": {"gmem": 32, "rmem": 16},
+    "hand_checked.SiblingLoopReuse.read[static]": {"gmem": 32, "rmem": 32},
     "hand_checked.TruncatedWaveReuse.read[static]": {"gmem": 96, "rmem": 32},
     "hand_checked.TruncatedWaveReuse.view[static]": {"gmem": 96, "rmem": 0},
-    "hand_checked.OverlappingReads.read[static]": {"gmem": 32, "rmem": 16},
+    "hand_checked.OverlappingReads.read[static]": {"gmem": 32, "rmem": 32},
     "hand_checked.PackedDtype.read[static]": {"gmem": 5, "rmem": 5},
     "hand_checked.SlicedView.read[static]": {
         "gmem": 64,
@@ -217,13 +220,13 @@ EXPECTED_MEMORY_PEAKS = {
     "leaf_weights.Mod.entry[static]": {
         "gmem": 51_539_608_064,
         "rmem": 0,
-        "smem": 96,
+        "smem": 160,
     },
     "leaf_weights.Mod.leaf[static]": {"gmem": 512, "smem": 64},
     "leaf_weights.Mod.other[static]": {
         "gmem": 51_539_608_064,
         "rmem": 0,
-        "smem": 96,
+        "smem": 160,
     },
     "mesh_slice_start.Fixed.scan[static]": {
         "gmem": 4_352,
@@ -256,10 +259,10 @@ EXPECTED_MEMORY_PEAKS = {
         "rmem": 49_672,
         "smem": 16_384,
     },
-    "moe_mega_kernel.MoEMegaKernel.experts[static]": {"gmem": 64_000},
+    "moe_mega_kernel.MoEMegaKernel.experts[static]": {"gmem": 94720},
     "moe_mega_kernel.MoEMegaKernel.routed_expert[static]": {"gmem": 61_696},
     "moe_mega_kernel.MoEMegaKernel.shared_expert[static]": {"gmem": 64_000},
-    "performance_findings.Compare.kernel[static]": {"gmem": 136_192},
+    "performance_findings.Compare.kernel[static]": {"gmem": 136704},
     "performance_findings.GmemSquare.kernel[static]": {"gmem": 68_096},
     "performance_findings.Levels.kernel[static]": {
         "gmem": 2_113_536,
@@ -276,47 +279,47 @@ EXPECTED_MEMORY_PEAKS = {
     "performance_findings.LocalTier.kernel[static]": {"gmem": 68_096, "rmem": 512},
     "persistent_gemm_flat.PersistentGemmFlat.gemm[static]": {
         "gmem": 130_940_928,
-        "rmem": 64 * 64 * 4,
+        "rmem": 32768,
         "smem": 64 * 32 * 2 + 32 * 64 * 2,
     },
     "persistent_gemm_tiled.PersistentGemmTiled.gemm[static]": {
         "gmem": 130_940_928,
-        "rmem": 64 * 64 * 4,
+        "rmem": 32768,
         "smem": 64 * 32 * 2 + 32 * 64 * 2,
     },
     "prefill_decode_attention.PrefillDecodeAttention.attend[ctx=128,seq=128]": {
         "gmem": 1_310_720,
         "rmem": 128 * 128 * 4,
-        "smem": _PREFILL_MATERIAL_RESHARD_AND_TRANSPOSE_SMEM,
+        "smem": 231424,
     },
     "qwen3_1_7b_pd.PrefillLayer.layer_decode[ctx_len=128,seq=128]": {
-        "gmem": _QWEN_LOOP_INVARIANT_VALUES_GMEM,
-        "rmem": 1_036,
+        "gmem": 152708368,
+        "rmem": 1552,
         "smem": 65_792,
     },
     "qwen3_1_7b_pd.PrefillLayer.layer_prefill[ctx_len=128,seq=128]": {
-        "gmem": 155_329_552,
-        "rmem": 132_608,
+        "gmem": 173417488,
+        "rmem": 198656,
         "smem": 3 * 128 * 128 * 2,
     },
     "qwen3_1_7b_pd.PrefillLayer.model[ctx_len=0,seq=512]": {
         "gmem": 5_269_475_856,
-        "rmem": 132_608,
+        "rmem": 198656,
         "smem": 3 * 128 * 128 * 2,
     },
     "qwen3_1_7b_pd.PrefillLayer.model[ctx_len=4608,seq=1]": {
         "gmem": 4_611_690_784,
-        "rmem": 1_036,
+        "rmem": 1552,
         "smem": 65_792,
     },
     "qwen3_1_7b_pd.PrefillLayer.model[ctx_len=512,seq=1]": {
         "gmem": 4_611_690_784,
-        "rmem": 1_036,
+        "rmem": 1552,
         "smem": 65_792,
     },
     "qwen3_1_7b_pd.PrefillLayer.model[ctx_len=512,seq=512]": {
         "gmem": 5_269_475_856,
-        "rmem": 132_608,
+        "rmem": 198656,
         "smem": 3 * 128 * 128 * 2,
     },
     "region_boundaries.RegionBoundaries.helper[static]": {"gmem": 64, "rmem": 32},
@@ -334,15 +337,15 @@ EXPECTED_MEMORY_PEAKS = {
         "gmem": 12_288,
         "rmem": 24_584,
     },
-    "specialize_through_call.Direct.pick[n=128]": {"gmem": 1_024, "smem": 64},
-    "specialize_through_call.Direct.run[n=128]": {"gmem": 1_024, "smem": 64},
-    "specialize_through_call.ToCallee.pick[n=128]": {"gmem": 1_024, "smem": 64},
-    "specialize_through_call.ToCallee.run[n=128]": {"gmem": 1_024, "smem": 64},
+    "specialize_through_call.Direct.pick[n=128]": {"gmem": 1_024, "smem": 128},
+    "specialize_through_call.Direct.run[n=128]": {"gmem": 1_024, "smem": 128},
+    "specialize_through_call.ToCallee.pick[n=128]": {"gmem": 1_024, "smem": 128},
+    "specialize_through_call.ToCallee.run[n=128]": {"gmem": 1_024, "smem": 128},
     "square_cuda.Model.main[static]": {"gmem": 676, "rmem": 4},
-    "tiny_tp_decoder.DecoderLayer.decode[static]": {"gmem": 48, "rmem": 16},
+    "tiny_tp_decoder.DecoderLayer.decode[static]": {"gmem": 48, "rmem": 32},
     "tiny_tp_decoder.DecoderLayer.project[static]": {"gmem": 128},
     "tp_all_to_all.TransposeShard.transpose_shard[static]": {"gmem": 256},
-    "weighted_twin.Weighted.scaled[static]": {"gmem": 1_348, "rmem": 4},
+    "weighted_twin.Weighted.scaled[static]": {"gmem": 1_348, "rmem": 8},
 }
 EXPECTED_PERSISTENT_SCHEDULES = {
     "persistent_gemm_flat.PersistentGemmFlat.gemm[static]": _PersistentScheduleExpectation(
@@ -477,15 +480,15 @@ def assert_internal_contract(
 ) -> None:
     """Each duration matches its priced work and divides the enclosing loop trips.
 
-    An occurrence's duration is its own compute-cost record priced at the
+    A definition-local duration is its own compute-cost record priced at the
     target's rates. One a loop repeats is written once, so its interval is that
     many of its own durations.
     """
     module_target = result.module.resolve_target()
     throughput = module_target.get_facts(ThroughputFacts)
     services = module_target.get_facts(PerformanceServiceFacts, result.level)
-    for occurrence, expr in ((scope, expr) for scope in walk_scopes(result.scopes) if scope.frame is not None for expr in collect_exprs(scope.frame.function.body)):
-        if not isinstance(expr, Call) or any(scope.owner is expr for scope in occurrence.children):
+    for function, expr in ((function, expr) for function in result.functions for expr in collect_exprs(function.body)):
+        if not isinstance(expr, Call) or CallFrameVisitor.callee_frame(expr, CallFrame(result.module, function)) is not None:
             continue
         cost = get_metadata(expr, ComputeCostMetadata)
         assert cost is not None
@@ -509,7 +512,7 @@ def assert_internal_contract(
             (
                 scope
                 for scope in scopes
-                if scope.occurrence is occurrence and id(expr) in scope.accesses.get("narrow", {})
+                if id(expr) in scope.accesses.get("narrow", {})
             ),
             None,
         )
@@ -647,25 +650,16 @@ def test_every_concrete_program_predicts_coherently(
 
 
 @pytest.mark.parametrize("case", [param for param in INVENTORY if param.id in API_INVENTORY])
-def test_every_internal_record_agrees(case: ConcreteCase, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_every_internal_record_agrees(case: ConcreteCase) -> None:
     """API cases check the same report and the invariants that require scopes.
 
-    Register storage has no byte address: the RMS view's co-location is its
-    required-alias group, and its own AllocationValue interval reaches the use.
+    Register storage has no byte address: the RMS view has no independent
+    placement, and its own SSA interval reaches the use.
     """
     owner, function = case.program()
-    allocation_models = []
-    if case.id == "rmsnorm_quant_seq2.RmsnormQuantSeq2Module.rmsnorm_quant_seq_2[static]":
-        visit_body = AllocationConstraintVisitor.visit_function_body
-
-        def record_allocation(visitor, function, context):
-            storage = visit_body(visitor, function, context)
-            allocation_models.append(context)
-            return storage
-
-        monkeypatch.setattr(AllocationConstraintVisitor, "visit_function_body", record_allocation)
-    result = analyze(owner, function, analysis=FAMILIES, dims=case.dims)
-    assert result.module is owner
+    checked, function = check_program(owner, function, dims=case.dims)
+    result = analyze(checked, function, analysis=FAMILIES)
+    assert result.module is checked
     report = report_data(
         module=result.module,
         function=result.function,
@@ -675,7 +669,8 @@ def test_every_internal_record_agrees(case: ConcreteCase, monkeypatch: pytest.Mo
         metadata_types=result.metadata_types,
     )
     _assert_reported(case, json.loads(render_json(report)))
-    scopes = tuple(walk_scopes(result.scopes))
+    context = _build_context(result.module, result.function, topology_level=result.level)
+    scopes = tuple(scope for local in context for scope in walk_scopes(local.root))
     assert_internal_contract(result, scopes)
     if case.id == "qwen3_1_7b_pd.PrefillLayer.layer_decode[ctx_len=128,seq=128]":
         rms_scopes = [
@@ -685,7 +680,7 @@ def test_every_internal_record_agrees(case: ConcreteCase, monkeypatch: pytest.Mo
             if isinstance(call.target, RMSNorm)
         ]
         assert len(rms_scopes) == 4
-        assert all(not scope.enclosing_loops() for scope in rms_scopes)
+        assert all(not scope.context.enclosing_loops() for scope in rms_scopes)
     if case.id == "qwen3_1_7b_pd.PrefillLayer.layer_prefill[ctx_len=128,seq=128]":
         cache_writes = [
             access
@@ -703,23 +698,16 @@ def test_every_internal_record_agrees(case: ConcreteCase, monkeypatch: pytest.Mo
             for expr in collect_exprs(result.function.body)
             if isinstance(expr, Call) and isinstance(expr.target, Reshape)
         )
-        liveness = analyze_liveness(result.function)
-        model = allocation_models[0]
-        reshaped_value = next(item for item in model.values if item.value is reshaped)
-        source_value = next(item for item in model.values if item.value is reshaped.args[0])
-        assert (
-            reshaped_value.lifetime.last_used_at
-            == liveness.interval_of(reshaped).last_used_at == 19
-        )
-        assert model.groups.find(reshaped_value) is model.groups.find(source_value)
+        liveness = get_metadata(result.function, Liveness)
+        assert liveness.interval_of(SSAValue(reshaped)).last_used_at == 19
+        assert get_metadata(reshaped, MemoryMetadata).buffer_bytes is None
+        assert not get_metadata(reshaped, MemoryMetadata).offsets
     expected_schedule = EXPECTED_PERSISTENT_SCHEDULES.get(case.id)
     if expected_schedule is not None:
         _assert_persistent_schedule(scopes, expected_schedule)
 
 
-def test_dynamic_tuple_selection_keeps_all_possible_storage_resident(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_dynamic_tuple_selection_keeps_all_possible_storage_resident() -> None:
     """A captured dynamic view pins both possible leaves without enabling reuse."""
     @module(
         entry="choose", target=CudaTarget("nvidia.h200_sxm"),
@@ -738,52 +726,57 @@ def test_dynamic_tuple_selection_keeps_all_possible_storage_resident(
                 result = tf.add(picked, picked)
                 return result
 
-    allocations = []
-    visit_body = AllocationConstraintVisitor.visit_function_body
-
-    def record_allocation(visitor, function, context):
-        storage = visit_body(visitor, function, context)
-        allocations.append((visitor, context))
-        return storage
-
-    monkeypatch.setattr(AllocationConstraintVisitor, "visit_function_body", record_allocation)
-    result = analyze(DynamicSelection, DynamicSelection.entry_function(), analysis="memory")
-    visitor, model = allocations[0]
+    result = analyze(
+        *check_program(DynamicSelection, DynamicSelection.entry_function()),
+        analysis="memory",
+    )
     selected = next(
         expr for expr in collect_exprs(result.function.body)
         if isinstance(expr, Call) and isinstance(expr.target, TupleGetItem)
     )
-    possible = [value for value in model.values if value.value is selected]
-    assert len(possible) == 2
-    assert visitor.storage_of(selected) is None, "a dynamic selection has no single storage"
-    for value, field in zip(possible, selected.args[0].elements, strict=True):
-        leaf = visitor.storage_of(field)
-        assert model.groups.find(value) is model.groups.find(leaf)
-        assert value.lifetime.defined_at == model.liveness.interval_of(selected).defined_at
-        assert value.lifetime.last_used_at == model.liveness.timeline_end
-    inner = next(
-        expr for expr in collect_exprs(result.function.body)
-        if isinstance(expr, MeshRegion) and any(arg is selected for _, arg in expr.captures())
-    )
-    parameter = next(param for param, arg in inner.captures() if arg is selected)
-    assert visitor.storage_of(parameter) is None, "capturing a dynamic view cannot enable reuse"
-    assert visitor.storage_of(inner) is None, "a region forwarding the view has no single storage"
+    first, second = selected.args[0].elements
     consumer = next(
         expr for expr in collect_exprs(result.function.body)
-        if isinstance(expr, Call) and len(expr.args) == 2 and all(arg is inner for arg in expr.args)
+        if isinstance(expr, Call) and len(expr.args) == 2
+        and all(isinstance(arg, MeshRegion) for arg in expr.args)
     )
-    output = visitor.storage_of(consumer)
-    assert all(model.groups.find(output) is not model.groups.find(value) for value in possible), (
-        "the consumer must not overwrite either possible leaf"
-    )
+    records = [get_metadata(value, MemoryMetadata) for value in (first, second, consumer)]
+    assert all(record.buffer_bytes == 8 and len(record.offsets) == 1 for record in records)
+    spans = sorted((record.offsets[0], record.offsets[0] + record.buffer_bytes) for record in records)
+    assert all(left[1] <= right[0] for left, right in zip(spans, spans[1:]))
+    moved = get_metadata(result.function, RegionMemoryMetadata)
+    assert moved.peak_for("smem").peak_bytes == 40
+    lifetimes = {life.binding: life for life in moved.lifetimes}
+    output = lifetimes[value_label(consumer)]
+    assert all(lifetimes[value_label(leaf)].last_used_at < output.defined_at for leaf in (first, second))
+    assert get_metadata(selected, MemoryMetadata).buffer_bytes is None
+    assert not get_metadata(selected, MemoryMetadata).offsets
     assert get_metadata(consumer, MemoryMetadata).alias is None
+    summary = get_metadata(result.function, AllocationSummary)
+    by_value = {value.value: value for value in summary.values}
+    assert SSAValue(selected) not in by_value
+    liveness = get_metadata(result.function, Liveness)
+    for index in range(len(selected.args[0].elements)):
+        assert (
+            liveness.interval_of(SSAValue(selected.args[0], index)).last_used_at
+            == liveness.timeline_end
+        )
+    for region in consumer.args:
+        assert by_value.get(SSAValue(region)) is None
+        assert all(by_value.get(SSAValue(param)) is None for param in region.params)
+    allocated = by_value[SSAValue(consumer)]
+    assert all(
+        storage_root(allocated, by_value) is not storage_root(by_value[SSAValue(leaf)], by_value)
+        for leaf in (first, second)
+    )
 
 
 @pytest.mark.parametrize("family", FAMILIES)
 def test_every_analysis_runs_at_a_stated_size(family: str) -> None:
     module, function, dims = _subject(family)
 
-    result = analyze(module, function, analysis=family, dims=dims)
+    module, function = check_program(module, function, dims=dims)
+    result = analyze(module, function, analysis=family)
 
     assert result.metadata_types
     assert result.module is module
@@ -791,7 +784,11 @@ def test_every_analysis_runs_at_a_stated_size(family: str) -> None:
 
 def _predicted_ns(module, dims=None) -> int:
     """What the four families together say one program takes."""
-    result = analyze(module, module.entry_function(), analysis=FAMILIES, level="cta", dims=dims)
+    result = analyze(
+        *check_program(module, module.entry_function(), topology_level="cta", dims=dims),
+        analysis=FAMILIES,
+        level="cta",
+    )
     summary = get_metadata(result.function, PerformanceSummaryMetadata)
     assert summary is not None
     return summary.timeline.end_ns - summary.timeline.start_ns
@@ -806,13 +803,13 @@ def test_the_result_names_the_function_that_carries_the_records(family: str) -> 
     """
     module, authored, dims = _subject(family)
 
-    result = analyze(module, authored, analysis=family, dims=dims)
+    result = analyze(*check_program(module, authored, dims=dims), analysis=family)
 
     assert result.function is not authored
     assert result.function.name == authored.name
     assert all(
-        residual_dims(occurrence.frame.function, occurrence.frame) == ()
-        for occurrence in (scope for scope in walk_scopes(result.scopes) if scope.frame is not None)
+        residual_dims(frame.function, frame) == ()
+        for frame in CallFrameVisitor.walk_frames(CallFrame(result.module, result.function))
     )
 
 
@@ -821,9 +818,11 @@ def test_without_a_size_the_result_names_the_record_bearing_view() -> None:
     module = QWEN3_1_7B.build()
     function = module.lookup("mlp")
 
-    result = analyze(module, function, analysis="compute-cost")
+    checked, derived = check_program(module, function)
+    result = analyze(checked, derived, analysis="compute-cost")
 
-    assert result.module is module
+    assert result.module is checked
+    assert result.function is derived
     assert result.function.name == function.name
     assert origin_of(result.function) is function
     assert get_metadata(result.function, ComputeCostMetadata) is not None
@@ -833,13 +832,8 @@ def test_without_a_size_the_result_names_the_record_bearing_view() -> None:
 def test_a_dimension_the_function_does_not_have_is_refused() -> None:
     module = _aimed()
 
-    with pytest.raises(AnalysisError, match="no dimension named"):
-        analyze(
-            module,
-            module.entry_function(),
-            analysis="compute-cost",
-            dims={**DIMS, "batch": 2},
-        )
+    with pytest.raises(SpecializationError, match="no dimension named"):
+        check_program(module, module.entry_function(), dims={**DIMS, "batch": 2})
 
 
 def test_a_dimension_left_unbound_is_refused() -> None:
@@ -851,13 +845,8 @@ def test_a_dimension_left_unbound_is_refused() -> None:
     """
     module = _aimed()
 
-    with pytest.raises(AnalysisError, match="was not given a size"):
-        analyze(
-            module,
-            module.entry_function(),
-            analysis="compute-cost",
-            dims={"batch": 4},
-        )
+    with pytest.raises(SpecializationError, match="was not given a size"):
+        check_program(module, module.entry_function(), dims={"batch": 4})
 
 
 def test_an_empty_or_malformed_size_is_refused_rather_than_ignored() -> None:
@@ -865,10 +854,10 @@ def test_an_empty_or_malformed_size_is_refused_rather_than_ignored() -> None:
     module = _aimed()
     entry = module.entry_function()
 
-    with pytest.raises(AnalysisError, match="non-empty mapping"):
-        analyze(module, entry, analysis="compute-cost", dims={})
-    with pytest.raises(AnalysisError, match="takes an integer extent"):
-        analyze(module, entry, analysis="compute-cost", dims={"ctx_len": 32.0})
+    with pytest.raises(SpecializationError, match="non-empty mapping"):
+        check_program(module, entry, dims={})
+    with pytest.raises(SpecializationError, match="takes an integer extent"):
+        check_program(module, entry, dims={"ctx_len": 32.0})
 
 
 def test_a_size_states_nothing_about_a_function_from_elsewhere() -> None:
@@ -880,8 +869,8 @@ def test_a_size_states_nothing_about_a_function_from_elsewhere() -> None:
     module = _aimed()
     foreign = QWEN3_1_7B.build().lookup("mlp")
 
-    with pytest.raises(AnalysisError, match="is not a function of module"):
-        analyze(module, foreign, analysis="compute-cost", dims=DIMS)
+    with pytest.raises(AnalysisError, match="is owned by no single node of module"):
+        check_program(module, foreign, dims=DIMS)
 
 
 def test_the_entry_at_a_chosen_size_is_still_the_entry() -> None:

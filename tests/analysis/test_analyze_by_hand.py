@@ -49,7 +49,8 @@ from tilefoundry.analysis import (
     analyze,
 )
 from tilefoundry.analysis import footprint as footprint_analysis
-from tilefoundry.analysis import memory as memory_analysis
+from tilefoundry.analysis.access import SSAValue
+from tilefoundry.analysis.check import check_program
 from tilefoundry.analysis.compute_cost import local_duration_ns
 from tilefoundry.analysis.footprint import ReachedAddresses, footprint_of, merged
 from tilefoundry.analysis.iteration_scope import build_scopes, walk_scopes
@@ -62,11 +63,7 @@ from tilefoundry.target import CudaTarget, PerformanceServiceFacts, ThroughputFa
 
 
 def _report(module, *, analysis=("memory",)) -> dict:
-    result = analyze(
-        module,
-        module.entry_function(),
-        analysis=analysis,
-    )
+    result = analyze(*check_program(module, module.entry_function()), analysis=analysis)
     data = report_data(
         module=result.module,
         function=result.function,
@@ -112,7 +109,7 @@ def test_window_starts_preserve_read_traffic_and_footprint_precision(
     traffic = memory["traffic"]["storage"]["gmem"]
     assert traffic["total"]["read"] == C * (start_bytes + 2 * window_bytes)
     assert traffic["per_unit"][0]["read"] == start_bytes + 2 * window_bytes
-    assert _footprint_bytes(memory, "x") == window_bytes
+    assert _footprint_bytes(memory, "x") == (C * window_bytes if module is MeshStart else window_bytes)
     assert memory["footprint"]["precision"] == precision
 
 
@@ -126,20 +123,20 @@ def test_uncounted_boundary_marks_the_footprint_incomplete(
 ) -> None:
     buffer = InvariantReuse.entry_function().params[0]
     uncounted = ReachedAddresses(
-        buffer=buffer,
+        target=SSAValue(buffer),
+        label="x",
         output_index=0,
         dtype=None,
         reached=None,
         precision=missing_precision,
     )
     counted = ReachedAddresses(
-        buffer, 0, DType.bf16, isl.set("{ [i] : 0 <= i < 4 }"), counted_precision
+        SSAValue(buffer), 0, DType.bf16, isl.set("{ [i] : 0 <= i < 4 }"), counted_precision,
+        label="x",
     )
 
     footprint = footprint_of(
         merged((uncounted, counted)),
-        memory_level="gmem",
-        labels={(None, id(buffer), 0): "x"},
     )
 
     assert dict(footprint.buffers)["x"].of("gmem").total == 8
@@ -150,7 +147,7 @@ def test_uncounted_boundary_marks_the_footprint_incomplete(
     )
     assert footprint.precision is expected
     assert (
-        footprint_of((uncounted,), memory_level="gmem", labels={(None, id(buffer), 0): "x"}).precision
+        footprint_of((uncounted,)).precision
         is missing_precision
     )
 
@@ -164,7 +161,8 @@ def test_tuple_output_boundaries_add_instead_of_union(
     addresses = isl.set("{ [i] : 0 <= i < 4 }")
     reached = tuple(
         ReachedAddresses(
-            buffer=buffer,
+            target=SSAValue(buffer),
+            label="x",
             output_index=index,
             dtype=DType.bf16,
             reached=addresses,
@@ -176,8 +174,6 @@ def test_tuple_output_boundaries_add_instead_of_union(
     distinct = merged(reached)
     footprint = footprint_of(
         distinct,
-        memory_level="gmem",
-        labels={(None, id(buffer), 0): "x"},
     )
     by_name = dict(footprint.buffers)
     gmem = by_name["x"].of("gmem")
@@ -194,8 +190,7 @@ def test_tuple_output_boundaries_add_instead_of_union(
 
 def test_invariant_reuse_matches_the_written_arithmetic() -> None:
     result = analyze(
-        InvariantReuse,
-        InvariantReuse.entry_function(),
+        *check_program(InvariantReuse, InvariantReuse.entry_function()),
         analysis=("compute-cost", "memory", "roofline", "performance"),
     )
     data = report_data(
@@ -313,7 +308,7 @@ def test_truncated_wave_keeps_reuse_from_participating_boundaries() -> None:
     )
     assert _reuse_conclusions(memory) == [
         {
-            "buffer": "v3/viewed",
+            "buffer": "viewed",
             "time": "",
             "space": "cta.i",
             "holds_bytes": 32,
@@ -389,11 +384,7 @@ def test_persistent_gemm_fits_reuse_conclusions_match_the_reviewed_report() -> N
 def test_persistent_gemm_over_reuse_conclusions_match_the_reviewed_report(
     precision: AnalysisPrecision, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    count = footprint_analysis.footprint_of
-    monkeypatch.setattr(
-        footprint_analysis, "footprint_of",
-        lambda *args, **kwargs: replace(count(*args, **kwargs), precision=precision),
-    )
+    monkeypatch.setattr(footprint_analysis, "counted_precision", lambda items: precision)
     memory = _memory_record(Gemm_MNK_NN128x128x64_w12x11_k16384)
 
     assert _reuse_conclusions(memory) == [
@@ -430,12 +421,7 @@ def test_capacity_exceeded_matches_the_written_ratio(
     precision: AnalysisPrecision,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    count = memory_analysis.footprint_of
-    monkeypatch.setattr(
-        memory_analysis,
-        "footprint_of",
-        lambda *args, **kwargs: replace(count(*args, **kwargs), precision=precision),
-    )
+    monkeypatch.setattr(footprint_analysis, "counted_precision", lambda items: precision)
     data = _report(CapacityExceeded)
     memory = data["functions"][0]['function_records']["memory"]
     used = _working_set_bytes(memory)

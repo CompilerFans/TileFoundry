@@ -4,21 +4,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
-from tilefoundry.ir.core import Call, Expr, VerifyError
+from tilefoundry.ir.core import Call, Expr, VerifyError, get_metadata
 from tilefoundry.ir.core import attach_metadata as attach
 from tilefoundry.ir.hir.function import Function
-from tilefoundry.ir.hir.loop_region import LoopRegion
-from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.types import DType
-from tilefoundry.ir.visitor import ExprVisitor
-from tilefoundry.visitor_registry.call_frame import CallFrame
+from tilefoundry.visitor_registry.call_frame import CallFrameVisitor, ValuationVisitor
 from tilefoundry.visitor_registry.contexts import CostContext, TrafficBytes
 from tilefoundry.visitor_registry.visitors import CostEvaluator
 
 from .errors import AnalysisError
 from .facts import PerformanceServiceFacts, ThroughputFacts
 from .iteration_scope import Repeats
-from .metadata import Breakdown, ComputeCostMetadata, MemoryMetadata, breakdown, shares
+from .metadata import (
+    Breakdown,
+    ComputeCostMetadata,
+    MemoryMetadata,
+    added,
+    breakdown,
+    scaled,
+    shares,
+)
 from .precision import AnalysisPrecision
 from .visitor import AnalyzeContext
 
@@ -202,14 +207,67 @@ def _domain_values(held: Breakdown[int], domain: str) -> tuple[tuple[str, int], 
     return tuple((name, getattr(spread, domain)) for name, spread in held.kinds)
 
 
-def _accumulate(ctx: "ComputeCostContext", record: ComputeCostMetadata, repeats: Repeats) -> None:
-    _add(ctx.flops_logical, _domain_values(record.flops, "logical"), repeats.varying_loop_trips)
-    _add(ctx.flops, _domain_values(record.flops, "total"), repeats.loop_trips)
-    _add(
-        ctx.other_ops_logical,
-        _domain_values(record.other_ops, "logical"),
-        repeats.varying_loop_trips,
+def accumulate_logical(into, name, spread, ctx):
+    """Consume local loop dependencies, retaining only this definition's formals."""
+    precision = AnalysisPrecision.EXACT
+    for dependencies, value in spread.logical_groups:
+        changing = set().union(*(ctx.varies(dependency) for dependency in dependencies))
+        factor, bounded = ctx.trips(dependencies)
+        precision = precision.join(bounded)
+        formals = tuple(formal for formal in ctx.root.owner.params if id(formal) in changing)
+        key = (name, tuple(id(formal) for formal in formals))
+        value = scaled(value, factor)
+        if key in into:
+            value = added(into[key][1], value)
+        into[key] = formals, value
+    return precision
+
+
+def with_dependencies(held, dependencies):
+    """State a primitive's logical groups using its operand dependencies."""
+    return replace(
+        held,
+        kinds=tuple(
+            (name, replace(spread, logical_groups=((dependencies, spread.logical),)))
+            for name, spread in held.kinds
+        ),
     )
+
+
+def grouped_breakdown(held, groups):
+    """Publish a definition's logical groups beside its local numeric view."""
+    return replace(
+        held,
+        kinds=tuple(
+            (
+                name,
+                replace(
+                    spread,
+                    logical_groups=tuple(
+                        (dependencies, value)
+                        for (kind, _ids), (dependencies, value) in groups.items()
+                        if kind == name
+                    ),
+                ),
+            )
+            for name, spread in held.kinds
+        ),
+    )
+
+
+def _accumulate(
+    ctx: "ComputeCostContext",
+    record: ComputeCostMetadata,
+    repeats: Repeats,
+) -> None:
+    for held, groups in (
+        (record.flops, ctx.flop_groups),
+        (record.other_ops, ctx.other_groups),
+    ):
+        for name, spread in held.kinds:
+            bounded = accumulate_logical(groups, name, spread, ctx)
+            ctx.precision[0] = ctx.precision[0].join(bounded)
+    _add(ctx.flops, _domain_values(record.flops, "total"), repeats.loop_trips)
     _add(ctx.other_ops, _domain_values(record.other_ops, "total"), repeats.loop_trips)
     for index, unit in enumerate(record.topologies):
         held = ctx.by_unit.setdefault(unit, {"flops": {}, "other_ops": {}})
@@ -227,110 +285,82 @@ def _accumulate(ctx: "ComputeCostContext", record: ComputeCostMetadata, repeats:
 
 @dataclass
 class ComputeCostContext(AnalyzeContext):
-    calls: tuple[ComputeCostContext, ...] = ()
-    locals_by_unit: dict[str, CostContext] = field(default_factory=dict)
-    whole: CostContext | None = None
+    flop_groups: dict = field(default_factory=dict)
+    other_groups: dict = field(default_factory=dict)
+    units: tuple[str, ...] = ()
     flops: dict[str, int] = field(default_factory=dict)
-    flops_logical: dict[str, int] = field(default_factory=dict)
     other_ops: dict[str, int] = field(default_factory=dict)
-    other_ops_logical: dict[str, int] = field(default_factory=dict)
     by_unit: dict[str, dict[str, dict[str, int]]] = field(default_factory=dict)
-    call_count: list[int] = field(default_factory=lambda: [0])
     precision: list[AnalysisPrecision] = field(default_factory=lambda: [AnalysisPrecision.EXACT])
 
 
-class ComputeCostVisitor(ExprVisitor[None]):
+class ComputeCostVisitor(ValuationVisitor[None]):
     """Attach per-Call work and accumulate multiplicity-aware totals."""
-
-    def visit_Call(self, call, ctx):
-        child = next((scope for scope in ctx.current.children if scope.owner is call), None)
-        if child is None:
-            return self.default_visit_leaf(call, self.visit_operands(call, ctx), ctx)
-        for arg in call.args:
-            self.visit(arg, ctx)
-        if isinstance(child.index, Expr):
-            self.visit(child.index, ctx)
-        local = ComputeCostContext(ctx.module, ctx.target, ctx.topology_level, ctx.options,
-                                   current=child)
-        memo, self._memo = self._memo, {}
-        try:
-            self.visit(child.frame.function.body, replace(ctx, current=child, calls=(*ctx.calls, local)))
-        finally:
-            self._memo = memo
-        record = _summary(local)
-        attach(call, record)
-        attach(child.frame.function, record)
-
-    def visit_MeshRegion(self, expr: MeshRegion, ctx: ComputeCostContext) -> None:
-        child = next(item for item in ctx.current.children if item.owner is expr)
-        for arg in expr.args:
-            self.visit(arg, ctx)
-        self.visit(expr.body, replace(ctx, current=child))
-
-    def visit_LoopRegion(self, expr: LoopRegion, ctx: ComputeCostContext) -> None:
-        child = next(item for item in ctx.current.children if item.owner is expr)
-        inner = replace(ctx, current=child)
-        for operand in expr.args:
-            self.visit(operand, ctx)
-        self.visit(expr.body, inner)
-        for operand in expr.yield_values:
-            self.visit(operand, inner)
 
     def default_visit_leaf(
         self, expr: Expr, _operands: tuple[None, ...], ctx: ComputeCostContext
     ) -> None:
         if not isinstance(expr, Call):
             return
-        ctx.call_count[0] += 1
-        if not ctx.locals_by_unit or ctx.whole is None:
+        if not ctx.units:
             raise AnalysisError("compute-cost: visitor context is missing its cost context")
         repeats = ctx.current.repeats_of(expr, ctx.topology_level)
-        record = _call_cost_record(
-            expr, ctx.locals_by_unit, repeats.mesh_positions, ctx.whole, ctx.topology_level
-        )
+        callee = CallFrameVisitor.callee_frame(expr, ctx.frame)
+        if callee is None:
+            record = _call_cost_record(
+                expr,
+                {unit: replace(ctx, topology_level=unit) for unit in ctx.units},
+                repeats.mesh_positions,
+                replace(ctx, topology_level=None),
+                ctx.topology_level,
+            )
+            dependencies = ctx.dependencies(expr)
+
+            record = replace(
+                record,
+                flops=with_dependencies(record.flops, dependencies),
+                other_ops=with_dependencies(record.other_ops, dependencies)
+            )
+        else:
+            record = get_metadata(callee.function, ComputeCostMetadata).resolve(ctx)
         attach(expr, record)
-        ctx.precision[0] = ctx.precision[0].join(repeats.trips_precision)
+        ctx.precision[0] = ctx.precision[0].join(repeats.trips_precision).join(record.precision)
         _accumulate(ctx, record, repeats)
-        for call_ctx in ctx.calls:
-            local = ctx.current.repeats_of(expr, ctx.topology_level, stop=call_ctx.current)
-            call_ctx.precision[0] = call_ctx.precision[0].join(local.trips_precision)
-            _accumulate(call_ctx, record, local)
 
 
 def analyze_compute_cost(function: Function, context: AnalyzeContext) -> None:
     """Attach one-trip work per Call and multiplicity-aware totals per Function."""
-    module, topology_level = context.module, context.topology_level
-    topologies = module.effective_topologies()
-    frame = CallFrame(module, function)
+    topology_level = context.topology_level
+    topologies = context.topologies
     units = tuple(topology.name for topology in topologies) or (topology_level,)
-    locals_by_unit = {
-        unit: CostContext(frame=frame, topology_level=unit, topologies=topologies)
-        for unit in units
-        if unit is not None
-    }
     cost_context = ComputeCostContext(
-        module=module,
-        target=context.target,
-        topology_level=topology_level,
-        options=context.options,
-        root=context.root,
-        current=context.current,
-        locals_by_unit=locals_by_unit,
-        whole=CostContext(frame=frame),
+        **vars(context), units=tuple(dict.fromkeys(unit for unit in units if unit is not None))
     )
     ComputeCostVisitor().visit(function.body, cost_context)
-    if cost_context.call_count[0] > 0:
-        attach(function, _summary(cost_context))
+    attach(function, _summary(cost_context))
 
 
 def _summary(ctx):
     units = tuple(ctx.by_unit)
     return ComputeCostMetadata(
-        topologies=units, precision=ctx.precision[0],
-        flops=breakdown(ctx.flops, tuple(ctx.by_unit[u]["flops"] for u in units), 0,
-                        logical=ctx.flops_logical),
-        other_ops=breakdown(ctx.other_ops, tuple(ctx.by_unit[u]["other_ops"] for u in units), 0,
-                            logical=ctx.other_ops_logical),
+        topologies=units,
+        precision=ctx.precision[0],
+        flops=grouped_breakdown(
+            breakdown(
+                ctx.flops,
+                tuple(ctx.by_unit[u]["flops"] for u in units),
+                0,
+            ),
+            ctx.flop_groups,
+        ),
+        other_ops=grouped_breakdown(
+            breakdown(
+                ctx.other_ops,
+                tuple(ctx.by_unit[u]["other_ops"] for u in units),
+                0,
+            ),
+            ctx.other_groups,
+        ),
     )
 
 

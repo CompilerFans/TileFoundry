@@ -127,11 +127,13 @@ def run_authored_analysis(
         module = load_authored_ir(source)
         function = module.entry_function()
         require_bound_dims(module, function, dims, command="analyze")
+        try:
+            checked, root = check_program(
+                module, function, topology_level=topology if analyses else None, dims=dims
+            )
+        except SpecializationError as error:
+            raise ValueError(f"analyze: {error}") from None
         if not analyses:
-            try:
-                checked, root = check_program(module, function, dims=dims)
-            except SpecializationError as error:
-                raise ValueError(f"analyze: {error}") from None
             annotated = "\n".join(
                 as_script(frame.function, options=PythonPrintOptions(show_types=True))
                 for frame in CallFrameVisitor.walk_frames(CallFrame(checked, root))
@@ -139,7 +141,12 @@ def run_authored_analysis(
             Path(out_path).write_text(annotated, encoding="utf-8")
             return 0
 
-        result = analyze(module, function, analysis=analyses, topology_level=topology, dims=dims)
+        result = analyze(
+            checked,
+            root,
+            analysis=analyses,
+            topology_level=topology,
+        )
         rendered = render_analysis(result, operands=operands and not as_json)
         if as_json:
             Path(out_path).write_text(

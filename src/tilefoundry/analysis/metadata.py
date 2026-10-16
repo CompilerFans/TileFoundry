@@ -9,13 +9,68 @@ across calls.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import ClassVar, Protocol, runtime_checkable
 
 from tilefoundry.ir.core.metadata import IRMetadata
 from tilefoundry.visitor_registry.contexts import TrafficBytes
 
-from .access import BufferAlias
+from .access import BufferAlias, SSAValue
 from .precision import AnalysisPrecision
+
+
+@runtime_checkable
+class TimingValuation(Protocol):
+    """Translate a definition's event and time coordinates to its caller."""
+
+    def event(self, local: int) -> int: ...
+
+    def timeline(self, local: TimelineMetadata) -> TimelineMetadata: ...
+
+
+@runtime_checkable
+class LoopNestValuation(Protocol):
+    """Describe the loops surrounding a call in its caller's coordinates."""
+
+    def repeats(self) -> Repeats: ...
+
+    def domain(self) -> isl.set: ...
+
+
+@runtime_checkable
+class VarianceValuation(Protocol):
+    """Resolve a formal parameter's dependency on enclosing loops."""
+
+    def varies(self, formal: Var) -> frozenset[int]: ...
+
+    def trips(self, formals: tuple[Var, ...]) -> tuple[int, AnalysisPrecision]: ...
+
+
+@runtime_checkable
+class BindingValuation(Protocol):
+    """Resolve parameter and return storage at one call boundary."""
+
+    def actual(self, formal: Var, index: int = 0) -> BufferAlias: ...
+
+    def result(self) -> BufferAlias: ...
+
+    def project(
+        self, source: BufferAlias, actual_of=None
+    ) -> tuple[BufferAlias, AnalysisPrecision]: ...
+
+
+@runtime_checkable
+class InstanceValuation(Protocol):
+    """Name the owning module instance on the current call path."""
+
+    def path(self) -> tuple[str, ...]: ...
+
+
+@dataclass(frozen=True)
+class ExecutionMeshMetadata(IRMetadata):
+    """The unique enclosing mesh established while checking one definition."""
+
+    mesh: Mesh | None
 
 
 @dataclass(frozen=True)
@@ -26,9 +81,16 @@ class Spread[V]:
     its semantic structure while ``Spread`` states only its counting domain.
     """
 
-    logical: V
     total: V
     per_unit: tuple[V, ...] = ()
+    logical_groups: tuple[tuple[tuple[Var, ...], V], ...] = ()
+
+    @property
+    def logical(self) -> V:
+        logical = scaled(self.total, 0)
+        for _dependencies, value in self.logical_groups:
+            logical = added(logical, value)
+        return logical
 
     def at(self, index: int) -> V:
         """One topology level's value by position, or ``total`` when absent."""
@@ -63,7 +125,7 @@ def breakdown[V](
             (
                 kind,
                 Spread(
-                    logical=logical.get(kind, zero),
+                    logical_groups=(((), logical.get(kind, zero)),),
                     total=total.get(kind, zero),
                     per_unit=tuple(share.get(kind, zero) for share in per_unit),
                 ),
@@ -85,6 +147,20 @@ def shares[V](
     }
 
 
+def scaled[V](value: V, factor: int) -> V:
+    """Multiply a work count or a directional byte count."""
+    if isinstance(value, TrafficBytes):
+        return TrafficBytes(value.read * factor, value.write * factor)
+    return value * factor
+
+
+def added[V](left: V, right: V) -> V:
+    """Add work counts or directional byte counts."""
+    if isinstance(left, TrafficBytes):
+        return TrafficBytes(left.read + right.read, left.write + right.write)
+    return left + right
+
+
 @dataclass(frozen=True)
 class ComputeCostMetadata(IRMetadata):
     """Floating-point and other operation kinds, each with one counting spread."""
@@ -93,6 +169,7 @@ class ComputeCostMetadata(IRMetadata):
     flops: Breakdown[int] = Breakdown()
     other_ops: Breakdown[int] = Breakdown()
     precision: AnalysisPrecision = AnalysisPrecision.EXACT
+    requires: ClassVar[tuple[type, ...]] = ()
 
 
 @dataclass(frozen=True)
@@ -115,8 +192,27 @@ class Traffic:
 class Footprint:
     """Unique bytes one wave touches, by source buffer and memory level."""
 
-    buffers: tuple[tuple[str, Breakdown[int]], ...] = ()
-    precision: AnalysisPrecision = AnalysisPrecision.EXACT
+    groups: tuple[tuple[int, tuple[ReachedAddresses, ...]], ...] = ()
+
+    @property
+    def reached(self) -> tuple[ReachedAddresses, ...]:
+        from .footprint import merged  # noqa: PLC0415
+
+        return merged(item for _windows, items in self.groups for item in items)
+
+    @property
+    def buffers(self) -> tuple[tuple[str, Breakdown[int]], ...]:
+        from .footprint import counted_buffers  # noqa: PLC0415
+
+        return counted_buffers(self)
+
+    @property
+    def precision(self) -> AnalysisPrecision:
+        from .footprint import _window_item, counted_precision  # noqa: PLC0415
+
+        return counted_precision(
+            _window_item(item) for _windows, items in self.groups for item in items
+        )
 
 
 @dataclass(frozen=True)
@@ -136,6 +232,15 @@ class MemoryMetadata(IRMetadata):
     buffer_bytes: int | None = None
     offsets: tuple[int, ...] = ()
     alias: BufferAlias | None = None
+    requires: ClassVar[tuple[type, ...]] = (BindingValuation, LoopNestValuation)
+
+    def resolve(self, ctx: ValuationProvider) -> MemoryMetadata:
+        from .footprint import resolve_footprint  # noqa: PLC0415
+
+        return replace(
+            self,
+            footprint=resolve_footprint(self.footprint, ctx),
+        )
 
 
 @dataclass(frozen=True)
@@ -169,11 +274,12 @@ class ValueLifetime:
     ones carry the numeric suffix the printed form of the same program uses.
     """
 
-    binding: str
-    memory_level: str
-    bytes: int
+    value: SSAValue
     defined_at: int
     last_used_at: int
+    binding: str = ""
+    memory_level: str = ""
+    bytes: int = 0
     persistent: bool = False
 
 
@@ -215,6 +321,7 @@ class RegionMemoryMetadata(IRMetadata):
     peaks: tuple[MemoryLevelPeak, ...] = ()
     errors: tuple[str, ...] = ()
     advisories: tuple[str, ...] = ()
+    requires: ClassVar[tuple[type, ...]] = ()
 
     def peak_for(self, name: str) -> MemoryLevelPeak | None:
         """The peak recorded for *name*, if this region touches it."""
@@ -239,6 +346,7 @@ class RooflineMetadata(IRMetadata):
     memory_ns: int = 0
     ideal_ns: int = 0
     bound_by: str = "none"
+    requires: ClassVar[tuple[type, ...]] = ()
 
 
 @dataclass(frozen=True)
@@ -267,6 +375,12 @@ class PerformanceMetadata(IRMetadata):
     """
 
     timeline: TimelineMetadata
+    requires: ClassVar[tuple[type, ...]] = (TimingValuation, LoopNestValuation)
+
+    def resolve(self, ctx: ValuationProvider) -> PerformanceMetadata:
+        timing = ctx.request_valuation(TimingValuation)
+        ctx.request_valuation(LoopNestValuation)
+        return replace(self, timeline=timing.timeline(self.timeline))
 
 
 @dataclass(frozen=True)
@@ -281,9 +395,17 @@ class PerformanceSummaryMetadata(IRMetadata):
 
     timeline: TimelineMetadata
     waves: int
+    requires: ClassVar[tuple[type, ...]] = (TimingValuation, LoopNestValuation)
+
+    resolve = PerformanceMetadata.resolve
 
 
 __all__ = [
+    "BindingValuation",
+    "InstanceValuation",
+    "LoopNestValuation",
+    "TimingValuation",
+    "VarianceValuation",
     "Breakdown",
     "MemoryMetadata",
     "ComputeCostMetadata",

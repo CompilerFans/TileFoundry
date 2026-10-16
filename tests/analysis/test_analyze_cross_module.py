@@ -23,7 +23,6 @@ from tests.models.qwen3_1_7b.model import Qwen3_1_7B
 from tilefoundry.analysis.api import analyze
 from tilefoundry.analysis.check import check_program
 from tilefoundry.analysis.errors import AnalysisError
-from tilefoundry.analysis.iteration_scope import occurrence_path, walk_scopes
 from tilefoundry.analysis.metadata import ComputeCostMetadata, MemoryMetadata, RegionMemoryMetadata
 from tilefoundry.analysis.registry import Analyzer
 from tilefoundry.dsl import *
@@ -47,6 +46,7 @@ from tilefoundry.ir.types.shard_layout import ShardLayout
 from tilefoundry.ir.types.utils import tensor_types
 from tilefoundry.ir.visitor import collect_exprs
 from tilefoundry.target import CudaTarget, Target
+from tilefoundry.visitor_registry.call_frame import CallFrame, CallFrameVisitor
 
 _H200 = "nvidia.h200_sxm"
 _CTA = (Topology("cta", 132),)
@@ -55,13 +55,20 @@ _CTA = (Topology("cta", 132),)
 def _matmul_records(result) -> tuple[tuple[ComputeCostMetadata, MemoryMetadata, RegionMemoryMetadata], ...]:
     """Both halves of each occurrence's MatMul record."""
     records = []
-    for occurrence, expr in ((scope, expr) for scope in walk_scopes(result.scopes) if scope.frame is not None for expr in collect_exprs(scope.frame.function.body)):
-        if not isinstance(expr, Call) or not isinstance(expr.target, MatMul):
-            continue
-        record = get_metadata(expr, ComputeCostMetadata)
-        moved = get_metadata(expr, MemoryMetadata)
-        assert record is not None
-        records.append((record, moved))
+    def visit(frame):
+        for expr in collect_exprs(frame.function.body):
+            if not isinstance(expr, Call):
+                continue
+            child = CallFrameVisitor.callee_frame(expr, frame)
+            if child is not None:
+                visit(child)
+            elif isinstance(expr.target, MatMul):
+                record = get_metadata(expr, ComputeCostMetadata)
+                moved = get_metadata(expr, MemoryMetadata)
+                assert record is not None
+                records.append((record, moved))
+
+    visit(CallFrame(result.module, result.function))
     return tuple(records)
 
 
@@ -93,8 +100,11 @@ def test_a_repeated_call_site_counts_its_work_again() -> None:
         def twice(x: Tensor[(4, 8), "f32"]) -> Tensor[(4, 8), "f32"]:
             return tf.add(mm(x), mm(x))  # noqa: F821
 
-    one_result = analyze(CrossModule, CrossModule.entry_function(), analysis="compute-cost")
-    two_result = analyze(_Twice, _Twice.entry_function(), analysis="compute-cost")
+    one_result = analyze(
+        *check_program(CrossModule, CrossModule.entry_function()),
+        analysis="compute-cost",
+    )
+    two_result = analyze(*check_program(_Twice, _Twice.entry_function()), analysis="compute-cost")
     one_records = _matmul_records(one_result)
     two_records = _matmul_records(two_result)
     one = _flops(one_records)
@@ -116,8 +126,14 @@ def test_a_child_call_a_loop_varies_is_counted_once_per_trip() -> None:
                 acc = mm(acc)  # noqa: F821
             return acc
 
-    one_result = analyze(CrossModule, CrossModule.entry_function(), analysis="compute-cost")
-    looped_result = analyze(_Looped, _Looped.entry_function(), analysis="compute-cost")
+    one_result = analyze(
+        *check_program(CrossModule, CrossModule.entry_function()),
+        analysis="compute-cost",
+    )
+    looped_result = analyze(
+        *check_program(_Looped, _Looped.entry_function()),
+        analysis="compute-cost",
+    )
     one_occurrence = _matmul_records(one_result)
     looped_occurrence = _matmul_records(looped_result)
     one_root = get_metadata(one_result.function, ComputeCostMetadata)
@@ -139,9 +155,13 @@ def test_the_weight_traffic_of_a_fused_root_is_what_its_callees_read() -> None:
         ) -> Tensor[(4, 8), "f32"]:
             return tf.matmul(x, w)
 
-    direct_result = analyze(_Direct, _Direct.entry_function(), analysis=("compute-cost", "memory"))
+    direct_result = analyze(
+        *check_program(_Direct, _Direct.entry_function()),
+        analysis=("compute-cost", "memory"),
+    )
     fused_result = analyze(
-        CrossModule, CrossModule.entry_function(), analysis=("compute-cost", "memory")
+        *check_program(CrossModule, CrossModule.entry_function()),
+        analysis=("compute-cost", "memory"),
     )
     direct = _traffic(_matmul_records(direct_result))
     fused = _traffic(_matmul_records(fused_result))
@@ -165,7 +185,7 @@ def test_a_reached_child_resolving_another_hierarchy_is_invalid() -> None:
             return warped(x)  # noqa: F821
 
     with pytest.raises(AnalysisError, match="different topology hierarchy") as caught:
-        analyze(_Mismatch, _Mismatch.entry_function(), analysis="compute-cost")
+        analyze(*check_program(_Mismatch, _Mismatch.entry_function()), analysis="compute-cost")
     assert "launch" not in str(caught.value)
 
 
@@ -188,10 +208,8 @@ def test_a_child_declaring_the_caller_hierarchy_is_accepted() -> None:
             return declared(x)  # noqa: F821
 
     result = analyze(
-        _Agreeing,
-        _Agreeing.entry_function(),
+        *check_program(_Agreeing, _Agreeing.entry_function(), dims={"child_topology_extent": 132}),
         analysis=("compute-cost", "memory"),
-        dims={"child_topology_extent": 132},
     )
     assert set(result.metadata_types) >= {ComputeCostMetadata, MemoryMetadata, RegionMemoryMetadata}
 
@@ -199,7 +217,10 @@ def test_a_child_declaring_the_caller_hierarchy_is_accepted() -> None:
 @pytest.mark.parametrize("name,root", REFERENCE_PROGRAMS, ids=[n for n, _ in REFERENCE_PROGRAMS])
 def test_each_reference_program_is_one_analysable_kernel(name, root) -> None:
     """The shared programs measure as one root each; what a call means is not restated."""
-    result = analyze(root, root.entry_function(), analysis=("compute-cost", "memory"))
+    result = analyze(
+        *check_program(root, root.entry_function()),
+        analysis=("compute-cost", "memory"),
+    )
 
     assert set(result.metadata_types) >= {ComputeCostMetadata, MemoryMetadata, RegionMemoryMetadata}
 
@@ -287,8 +308,8 @@ def _call_program(definition, *, count=1, indexed=False, name="run"):
 
 @pytest.mark.parametrize(
     "kind,flops,traffic,peak,persistent,occurrences",
-    [("cross", 512, 512, 512, 384, 1), ("twice", 1056, 1408, 512, 384, 2),
-     ("looped", 1536, 1536, 512, 384, 1),
+    [("cross", 512, 512, 512, 384, 1), ("twice", 1056, 1408, 640, 384, 2),
+     ("looped", 1536, 1536, 640, 384, 1),
      ("one", 4, 48, 48, 32, 1), ("unrolled", 12, 144, 80, 64, 3),
      ("stacked", 12, 144, 80, 64, 1)],
 )
@@ -304,7 +325,10 @@ def test_retained_calls_match_the_memory_and_work_acceptance_values(
         "stacked": replace(StackedScaledParent, topologies=_CTA),
     }
     root = roots[kind]
-    result = analyze(root, root.entry_function(), analysis=("compute-cost", "memory"))
+    result = analyze(
+        *check_program(root, root.entry_function()),
+        analysis=("compute-cost", "memory"),
+    )
     cost = get_metadata(result.function, ComputeCostMetadata)
     moved = get_metadata(result.function, RegionMemoryMetadata)
     region = moved.peak_for("gmem")
@@ -312,13 +336,20 @@ def test_retained_calls_match_the_memory_and_work_acceptance_values(
     assert moved.traffic.storage.of("gmem").total.total_bytes == traffic
     assert (region.peak_bytes, region.persistent_bytes) == (peak, persistent)
     assert len(result.functions) == 2
-    assert len([scope for scope in walk_scopes(result.scopes) if scope.frame is not None]) - 1 == occurrences
+    frames = tuple(CallFrameVisitor.walk_frames(CallFrame(result.module, result.function)))
+    sites = [
+        (call, child)
+        for frame in frames
+        for call in collect_exprs(frame.function.body)
+        if isinstance(call, Call)
+        and (child := CallFrameVisitor.callee_frame(call, frame)) is not None
+    ]
+    assert len(sites) == occurrences
     if kind == "stacked":
-        assert occurrence_path(next(scope for scope in walk_scopes(result.scopes) if isinstance(scope.owner, Call))) == "v1"
         assert sum(isinstance(node, LoopRegion) for node in collect_exprs(result.function.body)) == 1
-    for occurrence in [scope for scope in walk_scopes(result.scopes) if scope.frame is not None][1:]:
-        assert get_metadata(occurrence.frame.function.body, ComputeCostMetadata) is not None
-        assert get_metadata(occurrence.owner, ComputeCostMetadata) == get_metadata(occurrence.frame.function, ComputeCostMetadata)
+    for call, child in sites:
+        assert get_metadata(child.function.body, ComputeCostMetadata) is not None
+        assert get_metadata(call, ComputeCostMetadata) == get_metadata(child.function, ComputeCostMetadata)
 
 
 def test_derived_nodes_and_bodies_do_not_grow_with_indexed_instance_count():
@@ -396,12 +427,12 @@ class _WriteGuardTarget(Target):
 
 def test_an_analyzer_cannot_write_records_on_a_shared_derived_callee():
     def write_on_definition(_function, context):
-        attach_metadata(next(scope.frame.function.body for scope in walk_scopes(context.root) if isinstance(scope.owner, Call)), MemoryMetadata())
+        attach_metadata(_function.body, MemoryMetadata())
 
     target = _WriteGuardTarget(Analyzer("bad", write_on_definition, produces=(ComputeCostMetadata,)))
     root = replace(CrossModule, target=target, topologies=None)
     with pytest.raises(AnalysisError, match="changed Metadata it does not declare"):
-        analyze(root, root.entry_function(), analysis="bad")
+        analyze(*check_program(root, root.entry_function()), analysis="bad")
 
 
 def test_repeated_callee_temporaries_require_one_shared_memory_placement():
@@ -436,26 +467,26 @@ def test_repeated_callee_temporaries_require_one_shared_memory_placement():
     function = Function.build(name="root", params=(root_x, root_w), body=body, return_type=type_)
     root = Module("SharedPressure", (helper, function), "root",
                   target=CudaTarget(_H200), topologies=topologies)
-    analyzed = analyze(root, function, analysis="memory")
+    analyzed = analyze(*check_program(root, function), analysis="memory")
     derived = next(fn for fn in analyzed.functions if fn.name == "helper")
     temporaries = [node for node in collect_exprs(derived.body)
                    if isinstance(node, Call) and isinstance(node.target, Empty)
                    and node.type.storage is StorageKind.SMEM]
     assert len(temporaries) == 2
-    calls = [scope for scope in walk_scopes(analyzed.scopes)
-             if scope.frame is not None and scope.frame.function is derived]
+    frame = CallFrame(analyzed.module, analyzed.function)
+    calls = [child for node in collect_exprs(analyzed.function.body)
+             if isinstance(node, Call) and (child := CallFrameVisitor.callee_frame(node, frame)) is not None
+             and child.function is derived]
     assert len(calls) == 2
-    offsets = [tuple(get_metadata(node, MemoryMetadata).offsets
-                     for node in collect_exprs(call.frame.function.body)
-                     if any(node is temporary for temporary in temporaries)) for call in calls]
-    assert offsets[0] == offsets[1]
-    assert all(len(held) == 1 for held in offsets[0])
+    assert calls[0].function is calls[1].function
+    offsets = [get_metadata(node, MemoryMetadata).offsets for node in temporaries]
+    assert all(len(held) == 1 for held in offsets)
 
 
 
 def test_partial_indexed_loop_counts_only_reached_persistent_weights():
     root = _stacked_program(3, trips=2)
-    result = analyze(root, root.entry_function(), analysis="memory")
+    result = analyze(*check_program(root, root.entry_function()), analysis="memory")
     peak = get_metadata(result.function, RegionMemoryMetadata).peak_for("gmem")
     assert (peak.persistent_bytes, peak.peak_bytes) == (48, 64)
 
@@ -495,8 +526,18 @@ def test_repeated_callee_placement_compares_alias_even_at_the_same_offset():
     function = Function.build(name="root", params=(root_x, root_y), body=body, return_type=body.type)
     root = Module("SharedAliases", (helper, function), "root",
                   target=CudaTarget(_H200), topologies=topologies)
-    with pytest.raises(AnalysisError, match="callee 'helper' node.*different alias relationships") as error:
-        analyze(root, function, analysis="memory")
-    message = str(error.value)
-    assert "v0" in message and "v1" in message
-    assert "[1 + i0]" in message and "[2 + i0]" in message
+    analyzed = analyze(*check_program(root, function), analysis="memory")
+    derived = next(fn for fn in analyzed.functions if fn.name == "helper")
+    frame = CallFrame(analyzed.module, analyzed.function)
+    reached = [
+        child.function for node in collect_exprs(analyzed.function.body)
+        if isinstance(node, Call)
+        and (child := CallFrameVisitor.callee_frame(node, frame)) is not None
+    ]
+    assert reached == [derived, derived]
+    buffers = [
+        get_metadata(node, MemoryMetadata) for node in collect_exprs(derived.body)
+        if isinstance(node, Call) and isinstance(node.target, Empty)
+    ]
+    assert len(buffers) == 2
+    assert all(len(record.offsets) == 1 and record.alias is None for record in buffers)

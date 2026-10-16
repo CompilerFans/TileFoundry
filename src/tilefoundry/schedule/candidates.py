@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from tilefoundry.analysis.api import build_iteration_scopes
-from tilefoundry.analysis.iteration_scope import walk_scopes
+from tilefoundry.analysis.check import check_program
+from tilefoundry.analysis.metadata import ExecutionMeshMetadata
 from tilefoundry.inspection import PatternPrinter, PythonPrinter
 from tilefoundry.ir.core import Call, OpCapability, get_metadata, op_identifier, value_label
 from tilefoundry.ir.core.metadata import SourceSpanMetadata
@@ -17,12 +17,13 @@ from tilefoundry.schedule._reporting import capability_families
 from tilefoundry.target import Target
 from tilefoundry.visitor_registry.access_relation import access_relation_registry
 from tilefoundry.visitor_registry.buffer_alias import aliased_operand
-from tilefoundry.visitor_registry.call_frame import CallFrameVisitor
+from tilefoundry.visitor_registry.call_frame import CallFrame, ValuationVisitor
 from tilefoundry.visitor_registry.candidates import (
     candidate_operands,
     candidate_ops,
     sole_candidate,
 )
+from tilefoundry.visitor_registry.contexts import ValuationContext
 
 
 def _instructions(target: Target) -> tuple[tuple[type, OpCapability], ...]:
@@ -39,14 +40,20 @@ def candidates(
     module, entry, *, source: str | None = None, dims: Mapping[str, int] | None = None
 ) -> dict[str, Any]:
     """Report instructions using the same acceptance boundary as explicit schedule inference."""
-    ctx = build_iteration_scopes(module, entry, dims=dims)
-    owners = {identity: scope for scope in walk_scopes(ctx.root) for identity in scope.relations}
-    declared = _instructions(ctx.target)
+    module, entry = check_program(module, entry, dims=dims)
+    target = module.resolve_target()
+    contexts = {}
+    frames = tuple(ValuationVisitor.walk_frames(CallFrame(module, entry)))
+    for frame in frames:
+        mesh = get_metadata(frame.function, ExecutionMeshMetadata)
+        contexts.update(ValuationVisitor.index_contexts(frame.function, ValuationContext(
+            frame=frame, owner=frame.function, current_mesh=None if mesh is None else mesh.mesh,
+        )))
+    declared = _instructions(target)
     type_printer = PythonPrinter()
     pattern_printer = PatternPrinter()
     rows = []
     calls = []
-    frames = CallFrameVisitor.walk_frames(ctx.root.frame)
     for call in (call for frame in frames for call in collect_exprs(frame.function.body)):
         if (
             not isinstance(call, Call)
@@ -60,8 +67,8 @@ def candidates(
         if call.type.storage is StorageKind.UMAT and call.type.shape == ():
             continue
         calls.append(call)
-        scope = owners[id(call)]
-        mesh = scope.execution_mesh()
+        context = contexts[id(call)]
+        frame, mesh = context.frame, context.current_mesh
         level = None if mesh is None else mesh.topologies[-1].name
         usable, refused = [], []
         for op_type, capability in declared:
@@ -72,9 +79,7 @@ def candidates(
                 attributes, types = candidate_operands(call, op_type)
                 if capability.attribute is not None:
                     attributes[capability.attribute] = capability.declaration
-                instances = match_instruction(
-                    op_type, attributes, types, mesh, frame=scope.frame
-                )
+                instances = match_instruction(op_type, attributes, types, mesh, frame=frame)
             except ScheduleRefusal as error:
                 refused.append(
                     {"id": identifier, **pattern_printer.match_data((error.path,), error.reason)}
@@ -116,7 +121,7 @@ def candidates(
             ),
             module.name,
         )
-    return {"source": source, "target": ctx.target.identity, "lines": rows}
+    return {"source": source, "target": target.identity, "lines": rows}
 
 
 def render(data: dict[str, Any]) -> str:

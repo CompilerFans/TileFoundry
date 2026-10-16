@@ -17,7 +17,7 @@ def gemm(
         with Mesh((Topology("thread", 256),), layout=(2, 128), names=("d0", "d1")) as scope:
             with scope[:1, :32] as scope_1:
                 qs = T.tensor_view(
-                    0,
+                    8192,
                     dtype="bf16",
                     storage="smem",
                     layout=(64, 64) | Swizzle(3, 4, 3),
@@ -25,7 +25,7 @@ def gemm(
                 )
                 T.fill(qs, 0.0)
                 ks = T.tensor_view(
-                    8192,
+                    0,
                     dtype="bf16",
                     storage="smem",
                     layout=(64, 64) | Swizzle(3, 4, 3),
@@ -40,7 +40,7 @@ def gemm(
                             shape=(256, 64),
                         )
                         ks_2 = T.tensor_view(
-                            8192,
+                            0,
                             dtype="bf16",
                             storage="smem",
                             layout=(64, 64) | Swizzle(3, 4, 3),
@@ -67,7 +67,7 @@ def gemm(
                             T.ptr_of(tile_3[r:r + 1, 0:0 + 64]), layout=(1, 64), shape=(1, 64)
                         )
                         qs_2 = T.tensor_view(
-                            0,
+                            8192,
                             dtype="bf16",
                             storage="smem",
                             layout=(64, 64) | Swizzle(3, 4, 3),
@@ -127,7 +127,7 @@ def gemm(
                     for o_n in range(0, 64, 64):
                         for o_k in range(0, 64, 64):
                             qs_3 = T.tensor_view(
-                                0,
+                                8192,
                                 dtype="bf16",
                                 storage="smem",
                                 layout=(64, 64) | Swizzle(3, 4, 3),
@@ -144,7 +144,7 @@ def gemm(
                                 shape=(64, 16),
                             )
                             ks_3 = T.tensor_view(
-                                8192,
+                                0,
                                 dtype="bf16",
                                 storage="smem",
                                 layout=(64, 64) | Swizzle(3, 4, 3),
@@ -300,7 +300,7 @@ def gemm(
                                 shape=(64, 16),
                             )
                             ks_4 = T.tensor_view(
-                                8192,
+                                0,
                                 dtype="bf16",
                                 storage="smem",
                                 layout=(64, 64) | Swizzle(3, 4, 3),

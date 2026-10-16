@@ -15,6 +15,7 @@ from tilefoundry.ir.core import (
     Call,
     Expr,
     RangeMetadata,
+    attach_metadata,
     binding_name,
 )
 from tilefoundry.ir.core.module import Module, ModuleList
@@ -28,12 +29,11 @@ from tilefoundry.ir.hir.specialize import (
     dim_vars_reached,
 )
 from tilefoundry.ir.types import Topology, callable_type_for
-from tilefoundry.ir.types.mesh import make_mesh
 from tilefoundry.ir.types.substitute import dim_vars_by_name, substitute_shape_dim
 from tilefoundry.ir.visitor import collect_exprs, expr_children
 from tilefoundry.target import UnsupportedCapabilityError
 from tilefoundry.target.facts import TopologyFacts
-from tilefoundry.visitor_registry.call_frame import CallFrame, CallFrameVisitor
+from tilefoundry.visitor_registry.call_frame import CallFrame, CallFrameVisitor, ValuationVisitor
 from tilefoundry.visitor_registry.contexts import TypeInferContext
 from tilefoundry.visitor_registry.typeinfer import TypeInferVisitor
 
@@ -41,6 +41,7 @@ from .errors import AnalysisError
 from .facts import PerformanceServiceFacts
 from .metadata import (
     ComputeCostMetadata,
+    ExecutionMeshMetadata,
     MemoryMetadata,
     PerformanceMetadata,
     PerformanceSummaryMetadata,
@@ -51,6 +52,7 @@ from .metadata import (
 _NODE_BUDGET = 10_000
 _DERIVED_METADATA = {
     ComputeCostMetadata,
+    ExecutionMeshMetadata,
     MemoryMetadata,
     PerformanceMetadata,
     PerformanceSummaryMetadata,
@@ -192,22 +194,18 @@ def _prepare_function(function):
     prepare(function)
 
 
-class _CheckCalls(CallFrameVisitor[None]):
-    def __init__(self, frame, derive, label):
+class _CheckCalls(ValuationVisitor[None]):
+    def __init__(self, derive, label):
         super().__init__()
-        self.frame, self.derive, self.label = frame, derive, label
+        self.derive, self.label = derive, label
 
     def default_visit_leaf(self, expr, operands, mesh):
         return None
 
-    def visit_MeshRegion(self, region, mesh=None):
-        for arg in region.args:
-            self.visit(arg, mesh)
-        self.visit(region.body, make_mesh(mesh, region.mesh) if mesh else region.mesh)
 
-    def visit_Call(self, call, mesh=None):
-        self.visit_operands(call, mesh)
-        inner = self.callee_frame(call, self.frame)
+    def visit_Call(self, call, ctx):
+        self.visit_operands(call, ctx)
+        inner = self.callee_frame(call, ctx.frame)
         if inner is None:
             return
         callee = inner.function
@@ -215,7 +213,7 @@ class _CheckCalls(CallFrameVisitor[None]):
         given = iter(call.args)
         types = tuple(param.type if implicit and param.is_const else next(given).type
                       for param in callee.params)
-        self.derive(inner, types, mesh, f"{self.label}/{binding_name(call)}")
+        self.derive(inner, types, ctx.current_mesh, f"{self.label}/{binding_name(call)}")
 
 
 def check_program(
@@ -298,10 +296,12 @@ def check_program(
         for param, type_ in zip(definition.params, types, strict=True):
             param.type = type_
         _prepare_function(definition)
-        TypeInferVisitor(ranges=True).visit(definition, TypeInferContext(frame=frame, current_mesh=mesh))
+        attach_metadata(definition, ExecutionMeshMetadata(mesh))
+        context = TypeInferContext(frame=frame, owner=definition, current_mesh=mesh)
+        TypeInferVisitor(ranges=True).visit(definition, context)
         definition.return_type = definition.body.type
         definition.type = callable_type_for(definition.params, definition.return_type)
-        _CheckCalls(frame, derive, label).visit(definition.body, mesh)
+        _CheckCalls(derive, label).visit(definition.body, context)
 
     root, module = bound_root, bound_module
     derive(initial, tuple(p.type for p in root.params), None, function.name)
@@ -344,7 +344,20 @@ def check_program(
                         f"{frame.module.name!r} calls {inner.module.name!r}, which resolves "
                         f"a different {noun} {actual!r} against {expected!r}; {suffix}"
                     )
-    ctx = analysis_check_context(module, root, topology_level)
+    check_analyses(module, root, analyzers, topology_level=topology_level)
+    return module, root
+
+
+def check_analyses(
+    module: Module,
+    function: Function,
+    analyzers: tuple[object, ...],
+    *,
+    topology_level: str | None = None,
+) -> None:
+    """Check requested families against a built program before any writes."""
+    functions = tuple(frame.function for frame in CallFrameVisitor.walk_frames(CallFrame(module, function)))
+    ctx = analysis_check_context(module, function, topology_level)
     for analyzer in analyzers:
         checker = analyzer.get_checker()
         if checker is None:
@@ -352,4 +365,3 @@ def check_program(
         checker.check_target_facts(ctx)
         for body in functions:
             checker.visit(body.body, replace(ctx, function=body))
-    return module, root

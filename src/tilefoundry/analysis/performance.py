@@ -8,18 +8,16 @@ from dataclasses import dataclass, field, replace
 from tilefoundry.ir.core import Call, Expr, get_metadata
 from tilefoundry.ir.core import attach_metadata as attach
 from tilefoundry.ir.hir.function import Function
-from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.math.binary import Binary
-from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.types.utils import static_dim_value
-from tilefoundry.ir.visitor import ExprVisitor
 from tilefoundry.target import UnsupportedCapabilityError
 from tilefoundry.target.facts import TopologyFacts
+from tilefoundry.visitor_registry.call_frame import CallFrameVisitor, ValuationVisitor
 
 from .compute_cost import local_duration_ns
 from .errors import AnalysisError
 from .facts import PerformanceServiceFacts, ThroughputFacts
-from .iteration_scope import IterationScope
+from .iteration_scope import IterationScope, walk_scopes
 from .metadata import (
     ComputeCostMetadata,
     MemoryMetadata,
@@ -40,51 +38,28 @@ class PerformanceContext(AnalyzeContext):
     facts: ThroughputFacts | None = None
     services: PerformanceServiceFacts | None = None
     occurrences: list[tuple[IterationScope, Call, int]] = field(default_factory=list)
+    time_base: int = 0
+
+    def timeline(self, local: TimelineMetadata) -> TimelineMetadata:
+        return replace(
+            local, start_ns=self.time_base + local.start_ns, end_ns=self.time_base + local.end_ns
+        )
 
 
-class PerformanceVisitor(ExprVisitor[None]):
+class PerformanceVisitor(ValuationVisitor[None]):
     """Collect one duration per Call in authored order."""
 
-    def __init__(self):
-        super().__init__()
-        self.durations = {}
-
     def visit_Call(self, call, ctx):
-        child = next((scope for scope in ctx.current.children if scope.owner is call), None)
-        if child is None:
-            return self.default_visit_leaf(call, self.visit_operands(call, ctx), ctx)
-        for arg in call.args:
-            self.visit(arg, ctx)
-        if isinstance(child.index, Expr):
-            self.visit(child.index, ctx)
-        function = child.frame.function
-        if id(function) not in self.durations:
-            inner = replace(ctx, current=child, occurrences=[])
-            memo, self._memo = self._memo, {}
-            try:
-                self.visit(function.body, inner)
-            finally:
-                self._memo = memo
-            duration = schedule(inner.occurrences, inner, origin=child)
-            self.durations[id(function)] = duration
-            attach(function, PerformanceSummaryMetadata(
-                TimelineMetadata(start_ns=0, end_ns=duration), waves=1))
-        ctx.occurrences.append((ctx.current, call, self.durations[id(function)]))
-
-    def visit_MeshRegion(self, expr: MeshRegion, ctx: PerformanceContext) -> None:
-        child = next(item for item in ctx.current.children if item.owner is expr)
-        for arg in expr.args:
-            self.visit(arg, ctx)
-        self.visit(expr.body, replace(ctx, current=child))
-
-    def visit_LoopRegion(self, expr: LoopRegion, ctx: PerformanceContext) -> None:
-        child = next(item for item in ctx.current.children if item.owner is expr)
-        inner = replace(ctx, current=child)
-        for operand in expr.args:
-            self.visit(operand, ctx)
-        self.visit(expr.body, inner)
-        for operand in expr.yield_values:
-            self.visit(operand, inner)
+        self.visit_operands(call, ctx)
+        callee = CallFrameVisitor.callee_frame(call, ctx.frame)
+        if callee is None:
+            return self.default_visit_leaf(call, (), ctx)
+        summary = get_metadata(callee.function, PerformanceSummaryMetadata)
+        if summary is None:
+            raise AnalysisError(f"performance: missing summary for {callee.function.name!r}")
+        summary = summary.resolve(ctx.for_call(call))
+        duration = (summary.timeline.end_ns - summary.timeline.start_ns) // summary.waves
+        ctx.occurrences.append((ctx.current, call, duration))
 
     def default_visit_leaf(
         self, expr: Expr, _operands: tuple[None, ...], ctx: PerformanceContext
@@ -128,12 +103,11 @@ def schedule(occurrences, context, *, origin):
         trips = scope.repeats_of(call, context.topology_level, stop=origin).loop_trips
         scheduled = duration * trips
         serialize_boundary = (
-            ((scope.depth - origin.depth) >= 4 and getattr(call.type, "shape", ()) != ())
-            or (
-                (scope.depth - origin.depth) == 2
-                and isinstance(call.target, Binary)
-                and getattr(call.type, "shape", ()) == ()
-            )
+            (scope.depth - origin.depth) >= 4 and getattr(call.type, "shape", ()) != ()
+        ) or (
+            (scope.depth - origin.depth) == 2
+            and isinstance(call.target, Binary)
+            and getattr(call.type, "shape", ()) == ()
         )
         start = cursor
         if serialize_boundary:
@@ -170,33 +144,27 @@ def analyze_performance(function: Function, context: AnalyzeContext) -> None:
         raise AnalysisError("performance requires a resolved topology level")
     facts = context.target.get_facts(ThroughputFacts)
     services = context.target.get_facts(PerformanceServiceFacts, context.topology_level)
-    performance_context = PerformanceContext(
-        module=context.module,
-        target=context.target,
-        topology_level=context.topology_level,
-        options=context.options,
-        root=context.root,
-        current=context.current,
-        facts=facts,
-        services=services,
-    )
+    performance_context = PerformanceContext(**vars(context), facts=facts, services=services)
     PerformanceVisitor().visit(function.body, performance_context)
     total_cursor = schedule(performance_context.occurrences, context, origin=context.root)
     summary_end = total_cursor
     roofline = get_metadata(function, RooflineMetadata)
-    if roofline is not None:
+    if function is context.entry and roofline is not None:
         summary_end = max(summary_end, roofline.ideal_ns)
     level = context.target.get_facts(TopologyFacts).parallel()
     if level is None or level.max_physical_units is None:
         raise UnsupportedCapabilityError(
             f"{type(context.target).__name__}: no default parallel topology level"
         )
-    topology = context.module.resolve_topology(level.name)
-    topology_extent = static_dim_value(topology.size)
+    topology = next(item for item in context.topologies if item.name == level.name)
+    topology_extent = (
+        static_dim_value(topology.size)
+        if function is context.entry
+        else max(scope.mesh_positions(level.name) for scope in walk_scopes(context.root))
+    )
     if topology_extent is None:
         raise AnalysisError(
-            f"performance: topology {topology.name!r} has unresolved extent "
-            f"{topology.size!r}"
+            f"performance: topology {topology.name!r} has unresolved extent {topology.size!r}"
         )
     waves = -(-topology_extent // level.max_physical_units)
     attach(

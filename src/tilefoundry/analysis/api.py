@@ -13,22 +13,22 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from tilefoundry.analysis.check import check_program
+from tilefoundry.analysis.access import SSAValue
+from tilefoundry.analysis.check import check_analyses
 from tilefoundry.analysis.errors import AnalysisError
-from tilefoundry.analysis.iteration_scope import IterationScope, ScopeBuilder
+from tilefoundry.analysis.iteration_scope import ScopeBuilder
+from tilefoundry.analysis.metadata import ExecutionMeshMetadata
 from tilefoundry.analysis.registry import Analyzer
 from tilefoundry.analysis.report import render_json, report_data
 from tilefoundry.analysis.visitor import AnalyzeContext
 from tilefoundry.dump import DumpFlags, dump
-from tilefoundry.ir.core import IRMetadata
+from tilefoundry.ir.core import IRMetadata, get_metadata
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
-from tilefoundry.ir.hir.specialize import SpecializationError
-from tilefoundry.ir.module_utils import list_call_paths
-from tilefoundry.ir.types.substitute import DimSubstitutionError
 from tilefoundry.ir.visitor import function_values
 from tilefoundry.target import Target, UnsupportedCapabilityError
-from tilefoundry.visitor_registry.call_frame import CallFrameVisitor
+from tilefoundry.visitor_registry.access_relation import leaves_of
+from tilefoundry.visitor_registry.call_frame import CallFrame, CallFrameVisitor
 
 
 @dataclass(frozen=True)
@@ -37,13 +37,12 @@ class AnalysisResult:
 
     ``executed`` records dependency order and ``metadata_types`` lists records
     actually written, excluding analyses that matched nothing. ``function`` is
-    the derived root that carries root-occurrence records; ``module`` remains the call's
+    the checked root that carries aggregate records; ``module`` remains the call's
     execution domain.
     """
 
     module: Module
     function: Function
-    scopes: IterationScope
     analyses: tuple[str, ...]
     topology_level: str | None
     executed: tuple[str, ...]
@@ -110,16 +109,8 @@ def _closure(target: Target, roots: tuple[str, ...]) -> tuple[Analyzer, ...]:
     return tuple(ordered)
 
 
-def build_iteration_scopes(
-    module: Module,
-    function: Function,
-    *,
-    topology_level: str | None = None,
-    dims: Mapping[str, int] | None = None,
-    analyzers: tuple[Analyzer, ...] = (),
-    options: object | None = None,
-) -> AnalyzeContext:
-    """Resolve geometry, check the program, and bind scopes without running analyses."""
+def _check_subject(module: Module, function: Function) -> None:
+    """Require an HIR definition owned by the supplied checked program."""
     if not isinstance(module, Module):
         raise TypeError(
             f"analyze: expected a Module, got {type(module).__name__}. A Function "
@@ -127,26 +118,74 @@ def build_iteration_scopes(
         )
     if not isinstance(function, Function):
         raise TypeError(f"analyze: expected an hir.Function, got {type(function).__name__}")
-    if not module.owns(function):
+    if not module.owns(function, derived=True):
         raise AnalysisError(
             f"analyze: {function.name!r} is not a function of module {module.name!r}"
         )
 
-    target = module.resolve_target()
+
+def _build_context(
+    module: Module,
+    function: Function,
+    *,
+    topology_level: str | None = None,
+    options: object | None = None,
+) -> tuple[AnalyzeContext, ...]:
+    """Build one local scope tree per definition in a previously checked program."""
+    _check_subject(module, function)
     topologies = module.effective_topologies()
     if topology_level is None:
         topology_level = topologies[0].name if topologies else None
 
-    try:
-        module, function = check_program(module, function, topology_level=topology_level, analyzers=analyzers, dims=dims)
-    except (SpecializationError, DimSubstitutionError) as error:
-        raise AnalysisError(f"analyze: {error}") from None
-    context = AnalyzeContext(
-        module, target, topology_level, options
-    )
-    context.root = context.current = ScopeBuilder(module, function, ctx=context).build()
+    contexts, returns = [], {}
+    frames = tuple(CallFrameVisitor.walk_frames(CallFrame(module, function), postorder=True))
+    for frame in frames:
+        context = AnalyzeContext(
+            frame=frame,
+            owner=frame.function,
+            topologies=frame.topologies,
+            topology_level=topology_level,
+            options=options,
+            entry=function,
+        )
+        builder = ScopeBuilder(
+            frame.module,
+            frame.function,
+            ctx=context,
+            is_root=frame.function is function,
+            returns=returns,
+        )
+        context.root = context.current = builder.build()
+        contexts.append(context)
+        body = frame.function.body
+        returns[id(frame.function)] = {
+            view: tuple(
+                (table[SSAValue(body, index)], context.root.precisions[view][SSAValue(body, index)])
+                for index in range(len(leaves_of(body.type)))
+            )
+            for view, table in context.root.sources.items()
+        }
+    return tuple(contexts)
 
-    return context
+
+def _check_valuations(
+    closure: tuple[Analyzer, ...], context_types: Mapping[str, type[AnalyzeContext]]
+) -> None:
+    """Validate declared record requirements before a family can write metadata."""
+    read_types = {}
+    for algorithm in closure:
+        records = set(algorithm.produces)
+        for dependency in algorithm.requires:
+            records.update(read_types[dependency])
+        read_types[algorithm.selector] = records
+        context_type = context_types[algorithm.selector]
+        for record in sorted(records, key=lambda item: item.__name__):
+            for valuation in record.requires:
+                if not issubclass(context_type, valuation):
+                    raise AnalysisError(
+                        f"{algorithm.selector}: {context_type.__name__} does not "
+                        f"provide {valuation.__name__} for {record.__name__}"
+                    )
 
 
 def analyze(
@@ -157,49 +196,55 @@ def analyze(
     topology_level: str | None = None,
     level: str | None = None,
     options: object | None = None,
-    dims: "Mapping[str, int] | None" = None,
 ) -> AnalysisResult:
     """Run the requested analyses' union dependency closure over *function*.
 
-    The module supplies target and topology; *topology_level* defaults to its
-    coarsest level. *dims* selects a specialization and substitutes concrete
-    extents before measurement. The original function must be a prototype or
-    variant owned by the module, and the result identifies the concrete derived
-    root that received records.
+    The caller supplies the program returned by ``check_program``. Analyses
+    write records onto that same program; dimensions are bound by the caller.
+    The selected topology defaults to the module's coarsest level.
     """
     if topology_level is not None and level is not None and topology_level != level:
         raise ValueError("analyze: topology_level and level disagree")
     topology_level = topology_level if topology_level is not None else level
+    _check_subject(module, function)
+    if get_metadata(function, ExecutionMeshMetadata) is None:
+        raise AnalysisError("analyze needs the program returned by check_program")
     roots = _roots(analysis)
     result_module = module
-    closure = _closure(module.resolve_target(), roots) if isinstance(module, Module) else ()
-    context = build_iteration_scopes(
+    closure = _closure(module.resolve_target(), roots)
+    if topology_level is None:
+        topologies = module.effective_topologies()
+        topology_level = topologies[0].name if topologies else None
+    check_analyses(module, function, closure, topology_level=topology_level)
+    contexts = _build_context(
         module,
         function,
         topology_level=topology_level,
-        dims=dims,
-        analyzers=closure,
         options=options,
     )
-    module = context.module
-    topology_level = context.topology_level
-    function = context.root.owner
-    functions = tuple(frame.function for frame in CallFrameVisitor.walk_frames(context.root.frame))
+    from .compute_cost import ComputeCostContext  # noqa: PLC0415
+    from .memory import MemoryContext  # noqa: PLC0415
+    from .performance import PerformanceContext  # noqa: PLC0415
+
+    families = {
+        "compute-cost": ComputeCostContext,
+        "memory": MemoryContext,
+        "performance": PerformanceContext,
+    }
+    context_types = {a.selector: families.get(a.selector, AnalyzeContext) for a in closure}
+    _check_valuations(closure, context_types)
+    context = contexts[-1]
+    functions = tuple(frame.function for frame in CallFrameVisitor.walk_frames(context.frame))
 
     order: list[type[IRMetadata]] = []
     written_records: set[tuple] = set()
-    authored = tuple(
-        fn for frame in list_call_paths(result_module).values() for owner in (frame.function,) if isinstance(owner, Function) for fn in (owner, *owner.variants)
-    )
-    authored_before = _metadata_snapshot(authored)
     for algorithm in closure:
         before = _metadata_snapshot(functions)
         try:
-            algorithm.run(function, context)
+            for local in contexts:
+                algorithm.run(local.frame.function, local)
         except UnsupportedCapabilityError as error:
             raise AnalysisError(f"{algorithm.selector}: {error}") from None
-        if _metadata_snapshot(authored) != authored_before:
-            raise AnalysisError(f"{algorithm.selector!r} changed authored IR metadata")
         after = _metadata_snapshot(functions)
         records = _require_owned_writes(algorithm, before, after)
         written_records |= records
@@ -216,7 +261,6 @@ def analyze(
     result = AnalysisResult(
         module=result_module,
         function=function,
-        scopes=context.root,
         analyses=roots,
         topology_level=topology_level,
         executed=tuple(algorithm.selector for algorithm in closure),
@@ -309,4 +353,4 @@ def _require_owned_writes(
     return written
 
 
-__all__ = ["AnalysisResult", "analyze", "build_iteration_scopes"]
+__all__ = ["AnalysisResult", "analyze"]

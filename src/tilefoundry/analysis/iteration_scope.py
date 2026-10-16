@@ -2,22 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 
 import isl
 
-from tilefoundry.ir.core import Call, Constant, Expr, Tuple, Var, binding_name
-from tilefoundry.ir.core.module import Module, ModuleList
+from tilefoundry.ir.core import Call, Expr, get_metadata
+from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
-from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.isl_interop import dim_range
-from tilefoundry.ir.types import Mesh, TensorType, Topology, TupleType
+from tilefoundry.ir.types import Mesh, TensorType, Topology
 from tilefoundry.ir.types.dim import DimSub, simplify_dim
 from tilefoundry.ir.types.layout import ComposedLayout, get, size
-from tilefoundry.ir.types.mesh import make_mesh
 from tilefoundry.ir.types.utils import static_dim_value
 from tilefoundry.ir.visitor import expr_children
 from tilefoundry.visitor_registry.access_relation import (
@@ -30,20 +29,25 @@ from tilefoundry.visitor_registry.access_relation import (
     renaming_relation,
 )
 from tilefoundry.visitor_registry.buffer_alias import aliased_operand
-from tilefoundry.visitor_registry.call_frame import CallFrame, CallFrameVisitor
+from tilefoundry.visitor_registry.call_frame import CallFrame, ValuationVisitor
 from tilefoundry.visitor_registry.contexts import TypeInferContext
 
 from .access import (
     Access,
+    AliasKind,
     BufferAlias,
+    SSAValue,
     aligned_source,
     apply_source,
     buffer_alias,
     eliminate_parameters,
+    forwarded_leaves,
+    referenced_values,
     resolve_access,
 )
 from .errors import AnalysisError
 from .loop_domain import induction_name, iteration_domain
+from .metadata import ExecutionMeshMetadata
 from .precision import AnalysisPrecision
 from .visitor import AnalyzeContext
 
@@ -60,8 +64,7 @@ def _positions_at(mesh: Mesh, unit: str, topologies: tuple[Topology, ...]) -> in
         count = size(get(stated, index))
         if not isinstance(count, int) or isinstance(count, bool) or count < 1:
             raise AnalysisError(
-                f"mesh level {topology.name!r} needs positive static "
-                f"extents, got {count!r}"
+                f"mesh level {topology.name!r} needs positive static extents, got {count!r}"
             )
         positions *= count
     return positions
@@ -81,13 +84,15 @@ class Repeats:
 class IterationScope:
     """One Function, authored loop, or mesh region, with all accesses below it."""
 
-    owner: Function | LoopRegion | MeshRegion | Call
+    owner: Function | LoopRegion | MeshRegion
     parent: IterationScope | None
     children: tuple[IterationScope, ...]
     depth: int
     domain: isl.set
-    captures: tuple[tuple[Var, Expr], ...]
+    context: AnalyzeContext
     domain_params: dict[str, object] = field(default_factory=dict)
+    sources: dict[str, dict[SSAValue, BufferAlias]] = field(default_factory=dict)
+    precisions: dict[str, dict[SSAValue, AnalysisPrecision]] = field(default_factory=dict)
     accesses: dict[str, dict[int, tuple[Call, tuple[Access, ...]]]] = field(default_factory=dict)
     outputs: dict[str, dict[int, tuple[Call, tuple[Access, ...]]]] = field(default_factory=dict)
     relations: dict[int, tuple[Call, tuple[AccessRelation, ...]]] = field(default_factory=dict)
@@ -95,12 +100,20 @@ class IterationScope:
         default_factory=dict
     )
     refused: dict[str, frozenset[Call]] = field(default_factory=dict)
-    topologies: tuple[Topology, ...] = ()
-    occurrence: IterationScope | None = None
-    frame: CallFrame | None = None
     variance: dict[int, frozenset[int]] = field(default_factory=dict)
-    slot: ModuleList | None = None
-    index: Expr | int | None = None
+
+    @cached_property
+    def capture_names(self):
+        """The first authored capture name for each source in this definition."""
+        names = {}
+        for scope in walk_scopes(self):
+            for param, _argument in scope.captures:
+                names.setdefault(scope.context.capture_root(param), param)
+        return names
+
+    @property
+    def captures(self):
+        return self.owner.captures() if isinstance(self.owner, (MeshRegion, LoopRegion)) else ()
 
     def projected_relations(self, call: Call, ctx: TypeInferContext) -> tuple[AccessRelation, ...]:
         """Return *call*'s relations in *ctx*'s topology window, projecting it once.
@@ -124,68 +137,19 @@ class IterationScope:
         holder.projections[key] = (call, local)
         return local
 
-    def capture_root(self, value: Expr) -> Expr:
-        """Resolve invariant parameters through their enclosing region captures."""
-        cursor = self
-        while cursor is not None:
-            for param, argument in cursor.captures:
-                if value is param:
-                    value = argument
-                    break
-            cursor = cursor.parent
-        return value
-
-    def is_variant(self, value: Expr, occurrence=None) -> bool:
+    def is_variant(self, value: Expr) -> bool:
         """Whether *value* depends on this loop's induction or carry values."""
         if not isinstance(self.owner, LoopRegion):
             return False
-        occurrence = self.occurrence if occurrence is None else occurrence
-        return occurrence is not None and id(self) in occurrence.variance.get(id(value), frozenset())
+        return id(self) in self.variance.get(id(value), frozenset())
 
-    def enclosing_loops(self) -> tuple[LoopRegion, ...]:
-        """Return this scope's loop owners in outer-to-inner order."""
-        loops = []
-        cursor: IterationScope | None = self
-        while cursor is not None:
-            if isinstance(cursor.owner, LoopRegion):
-                loops.append(cursor.owner)
-            cursor = cursor.parent
-        loops.reverse()
-        return tuple(loops)
-
-    def enclosing_mesh(self) -> Mesh | None:
-        """Return the nearest enclosing mesh, or None when there is none."""
-        cursor: IterationScope | None = self
-        while cursor is not None:
-            if isinstance(cursor.owner, MeshRegion):
-                return cursor.owner.mesh
-            cursor = cursor.parent
-        return None
-
-    def execution_mesh(self) -> Mesh | None:
-        """Compose every enclosing mesh in the same order as type inference."""
-        meshes = []
-        cursor: IterationScope | None = self
-        while cursor is not None:
-            if isinstance(cursor.owner, MeshRegion):
-                meshes.append(cursor.owner.mesh)
-            cursor = cursor.parent
-        return make_mesh(*reversed(meshes)) if meshes else None
-
-    def mesh_positions(self, unit: str | None, stop=None) -> int:
-        """Count positions in the composed enclosing meshes at a topology unit."""
-        meshes = []
-        root = self
-        cursor: IterationScope | None = self
-        while cursor is not None and cursor is not stop:
-            if isinstance(cursor.owner, MeshRegion):
-                meshes.append(cursor.owner.mesh)
-            root = cursor
-            cursor = cursor.parent
-        if not meshes or unit is None:
-            return 1
-        meshes.reverse()
-        return _positions_at(make_mesh(*meshes), unit, stop.frame.topologies if stop is not None else root.topologies)
+    def mesh_positions(self, unit: str | None) -> int:
+        mesh = self.context.current_mesh
+        return (
+            1
+            if mesh is None or unit is None
+            else _positions_at(mesh, unit, self.context.topologies)
+        )
 
     def repeats_of(self, call: Call, unit: str | None, stop=None) -> Repeats:
         """Return this Call's loop and mesh multiplicities in the current scope."""
@@ -196,13 +160,11 @@ class IterationScope:
             if isinstance(cursor.owner, LoopRegion):
                 trips = cursor.trips()
                 loops *= trips
-                if self.occurrence is not None and id(cursor) in self.occurrence.variance.get(
-                    id(call), frozenset()
-                ):
+                if id(cursor) in self.variance.get(id(call), frozenset()):
                     varying *= trips
                 precision = precision.join(cursor.trips_precision)
             cursor = cursor.parent
-        return Repeats(varying, loops, self.mesh_positions(unit, stop=stop), precision)
+        return Repeats(varying, loops, self.mesh_positions(unit), precision)
 
     def _counted(self) -> tuple[int, AnalysisPrecision]:
         """This scope's iteration count relative to its parent, and how exact it is.
@@ -214,7 +176,7 @@ class IterationScope:
         widest span is an upper bound on every coordinate's count, which is
         what every consumer of a trip count already reads it as.
         """
-        if isinstance(self.owner, (MeshRegion, Call)) or self.parent is None:
+        if isinstance(self.owner, MeshRegion) or self.parent is None:
             return 1, AnalysisPrecision.EXACT
         owner = self.owner
         span = simplify_dim(DimSub, (owner.extent, owner.start))
@@ -264,17 +226,7 @@ class IterationScope:
         return self._trips_cache[1]
 
 
-def occurrence_path(scope):
-    """Binding-name path to an occurrence, with an empty root path."""
-    parts = []
-    while scope.parent is not None:
-        if isinstance(scope.owner, Call):
-            parts.append(binding_name(scope.owner))
-        scope = scope.parent
-    return "/".join(reversed(parts))
-
-
-class ScopeBuilder(CallFrameVisitor[None]):
+class ScopeBuilder(ValuationVisitor[None]):
     """Build one IterationScope tree and its access views for a Function.
 
     Scopes record each call's logical relations, whatever level the caller's
@@ -288,215 +240,177 @@ class ScopeBuilder(CallFrameVisitor[None]):
         *,
         views: Sequence[str] = ("narrow", "device", "unit"),
         ctx: AnalyzeContext | None = None,
+        is_root: bool = True,
+        returns: Mapping[int, Mapping[str, tuple[tuple[BufferAlias, AnalysisPrecision], ...]]]
+        | None = None,
     ) -> None:
+        super().__init__(root_function=graph)
         self.graph = graph
-        self.topologies = module.effective_topologies()
+        self.is_root = is_root
+        self.returns = {} if returns is None else returns
+        frame = CallFrame(module, graph) if ctx is None or ctx.frame is None else ctx.frame
         self.views = tuple(views)
-        self.sources: dict[str, dict[int, BufferAlias | tuple]] = {view: {} for view in self.views}
-        self.precisions: dict[str, dict[int, AnalysisPrecision | tuple]] = {
+        self.sources: dict[str, dict[SSAValue, BufferAlias]] = {view: {} for view in self.views}
+        self.precisions: dict[str, dict[SSAValue, AnalysisPrecision]] = {
             view: {} for view in self.views
         }
-        self.definitions: dict[int, IterationScope] = {}
-        self.aliases: dict[int, BufferAlias | None] = {}
         self.type_ctx = (
-            AnalyzeContext(module, module.resolve_target(), None, None)
+            AnalyzeContext(frame=frame, topologies=frame.topologies)
             if ctx is None
             else replace(ctx, topology_level=None)
         )
         self.unit_ctx = ctx if ctx is not None else self.type_ctx
         self.seeds: dict[int, IterationScope]
         self.variance: dict[int, frozenset[int]]
-        self.seen: set[int]
 
     def _empty_accesses(self) -> dict[str, dict[int, tuple[Call, tuple[Access, ...]]]]:
         return {view: {} for view in self.views}
 
-    def _view_context(self, view: str) -> TypeInferContext:
-        return self.unit_ctx if view == "unit" else self.type_ctx
+    def _view_context(self, view: str, scope: IterationScope) -> TypeInferContext:
+        return replace(
+            scope.context,
+            topology_level=self.unit_ctx.topology_level if view == "unit" else None,
+            access_view=view,
+        )
 
-    def _source_relation(
-        self, source: BufferAlias | tuple, held, scope: IterationScope
-    ) -> BufferAlias | tuple:
-        """Carry one operand entry into a region, or union its inner loop points."""
-        if isinstance(source, tuple):
-            return tuple(
-                self._source_relation(item, field, scope)
-                for item, field in zip(source, held.fields, strict=True)
-            )
+    def _source_relation(self, source: BufferAlias, held, scope: IterationScope) -> BufferAlias:
+        """Align one cached leaf source with this region's loop coordinates."""
         rank = len(held.shape) if isinstance(held, TensorType) else 1
         relation = aligned_source(source, rank, scope.depth, scope.domain_params)
-        domain = scope.domain.insert_dims(
-            isl.dim_type.SET, scope.depth, relation.dim(isl.dim_type.IN) - scope.depth
+        relation = relation.intersect_domain(
+            scope.domain.insert_dims(
+                isl.dim_type.SET, scope.depth, relation.dim(isl.dim_type.IN) - scope.depth
+            )
         )
-        relation = relation.intersect_domain(domain)
-        retained = dict(source.relation.values)
-        retained.update(scope.domain_params)
+        retained = {**source.relation.values, **scope.domain_params}
         values = {
-            relation.get_dim_name(isl.dim_type.PARAM, axis): retained[
-                relation.get_dim_name(isl.dim_type.PARAM, axis)
-            ] for axis in range(relation.dim(isl.dim_type.PARAM))
+            name: retained[name]
+            for axis in range(relation.dim(isl.dim_type.PARAM))
+            if (name := relation.get_dim_name(isl.dim_type.PARAM, axis)) in retained
         }
         return replace(source, relation=AccessRelation(relation, values))
 
-    def _identity_source(
-        self, expr: Expr, held, scope: IterationScope, index: int = 0
-    ) -> BufferAlias:
-        """A material result names itself, with no data-coordinate renaming."""
+    def _identity_source(self, value: SSAValue, held, scope: IterationScope) -> BufferAlias:
+        """A material leaf names itself, with no data-coordinate renaming."""
         rank = len(held.shape) if isinstance(held, TensorType) else 1
         relation = identity_access(rank).relation.insert_dims(isl.dim_type.IN, 0, scope.depth)
-        domain = scope.domain.insert_dims(isl.dim_type.SET, scope.depth, rank)
-        relation = relation.intersect_domain(domain)
-        values = {
-            name: value for name, value in scope.domain_params.items()
-            if relation.find_dim_by_name(isl.dim_type.PARAM, name) >= 0
-        }
-        return BufferAlias(expr, AccessRelation(relation, values), index, scope.occurrence)
-
-    def _material_source(self, expr: Expr, held, scope: IterationScope) -> BufferAlias | tuple:
-        """Number tensor leaves first, then retain the result's type structure."""
-        leaves = iter(
-            self._identity_source(expr, leaf, scope, index)
-            for index, leaf in enumerate(leaves_of(held))
+        relation = relation.intersect_domain(
+            scope.domain.insert_dims(isl.dim_type.SET, scope.depth, rank)
         )
-        return self._structured_source(expr, held, scope, leaves)
+        values = referenced_values(relation, scope.domain_params)
+        return BufferAlias(value, AccessRelation(relation, values), AliasKind.FORWARD)
 
-    def _structured_source(
-        self, expr: Expr, held, scope: IterationScope, leaves: Iterator[BufferAlias]
-    ) -> BufferAlias | tuple:
-        """Reassemble an already indexed leaf sequence into one structured source."""
-        if isinstance(held, TensorType):
-            return next(leaves)
-        if isinstance(held, TupleType):
-            return tuple(
-                self._structured_source(expr, field, scope, leaves) for field in held.fields
+    def _forward(self, expr, operands, scope, view):
+        """Cache flattened sources once for tuple, capture and region forwarding."""
+        types = leaves_of(self._view_context(view, scope).local_type_of(expr))
+        for index, (operand, held) in enumerate(zip(operands, types, strict=True)):
+            value = SSAValue(expr, index)
+            self.sources[view][value] = self._source_relation(
+                self.sources[view][operand], held, scope
             )
-        return self._identity_source(expr, held, scope)
+            self.precisions[view][value] = self.precisions[view][operand]
 
-    def _exact_precision(self, source: BufferAlias | tuple) -> AnalysisPrecision | tuple:
-        """Mirror a material source's structure with exact leaf precisions."""
-        if isinstance(source, tuple):
-            return tuple(self._exact_precision(item) for item in source)
-        return AnalysisPrecision.EXACT
-
-    def _view_alias(
-        self, expr: Expr, scope: IterationScope, view: str, local_relations
-    ) -> BufferAlias | None:
-        """Prove a registered view once logically, then use this view's coordinates."""
-        if not isinstance(expr, Call):
-            return None
-        if id(expr) not in self.aliases:
-            self.aliases[id(expr)] = (
-                buffer_alias(expr, self.type_ctx, scope.projected_relations(expr, self.type_ctx))
-                if aliased_operand(expr) is not None else None
-            )
-        alias = self.aliases[id(expr)]
+    def _record_source(self, expr, scope, view, local_relations=(), alias=None):
+        """Cache each leaf's fully composed source before any access reads it."""
+        table, precisions = self.sources[view], self.precisions[view]
+        ctx = self._view_context(view, scope)
+        if (operands := forwarded_leaves(expr, ctx)) is not None:
+            self._forward(expr, operands, scope, view)
+            return
         if alias is not None and view == "unit":
-            return replace(alias, relation=renaming_relation(expr, self.unit_ctx, local_relations))
-        return alias
-
-    def _view_source(
-        self, alias: BufferAlias, scope: IterationScope, view: str
-    ) -> tuple[BufferAlias, AnalysisPrecision]:
-        """Eliminate this view's parameters before composing its operand's source."""
-        ctx = self._view_context(view)
-        operand = self.sources[view][id(alias.buffer)]
-        relation = alias.relation.relation.insert_dims(isl.dim_type.IN, 0, scope.depth)
-        domain = scope.domain.insert_dims(
-            isl.dim_type.SET, scope.depth, relation.dim(isl.dim_type.IN) - scope.depth
-        )
-        relation = relation.intersect_domain(domain)
-        retained = dict(scope.domain_params)
-        relation, precision = eliminate_parameters(
-            relation, alias.relation.values, scope,
-            ctx.local_type_of(alias.buffer) if view == "unit" else scope.capture_root(alias.buffer).type,
-            narrow=view == "narrow", retained=retained,
-        )
-        held = ctx.local_type_of(alias.buffer)
-        rank = len(held.shape) if isinstance(held, TensorType) else 1
-        relation = apply_source(relation, operand, rank, scope.depth, scope.domain_params)
-        retained.update(operand.relation.values)
-        values = {
-            relation.get_dim_name(isl.dim_type.PARAM, axis): retained[
-                relation.get_dim_name(isl.dim_type.PARAM, axis)
-            ] for axis in range(relation.dim(isl.dim_type.PARAM))
-        }
-        return (
-            BufferAlias(
-                operand.buffer, AccessRelation(relation, values), operand.index, operand.occurrence
-            ),
-            precision.join(self.precisions[view][id(alias.buffer)]),
-        )
-
-    def _record_source(
-        self, expr: Expr, scope: IterationScope, view: str, local_relations=()
-    ) -> None:
-        table = self.sources[view]
-        precisions = self.precisions[view]
-        ctx = self._view_context(view)
-        if isinstance(expr, Tuple):
-            table[id(expr)] = tuple(
-                self._source_relation(table[id(item)], ctx.local_type_of(item), scope)
-                for item in expr.elements
-            )
-            precisions[id(expr)] = tuple(precisions[id(item)] for item in expr.elements)
-            return
-        if isinstance(expr, Call) and isinstance(expr.target, TupleGetItem) and (
-            isinstance(expr.args[1], Constant) and type(expr.args[1].value) is int
-        ):
-            index = expr.args[1].value
-            table[id(expr)] = self._source_relation(
-                table[id(expr.args[0])][index], ctx.local_type_of(expr), scope
-            )
-            precisions[id(expr)] = precisions[id(expr.args[0])][index]
-            return
-        alias = self._view_alias(expr, scope, view, local_relations)
+            alias = replace(alias, relation=renaming_relation(expr, ctx, local_relations))
         if alias is not None:
-            table[id(expr)], precisions[id(expr)] = self._view_source(alias, scope, view)
+            source = table[alias.target]
+            relation = alias.relation.relation.insert_dims(isl.dim_type.IN, 0, scope.depth)
+            relation = relation.intersect_domain(
+                scope.domain.insert_dims(
+                    isl.dim_type.SET, scope.depth, relation.dim(isl.dim_type.IN) - scope.depth
+                )
+            )
+            retained = dict(scope.domain_params)
+            relation, precision = eliminate_parameters(
+                relation,
+                alias.relation.values,
+                scope,
+                ctx.local_type_of(alias.target.expr)
+                if view == "unit"
+                else scope.context.capture_root(alias.target.expr).type,
+                narrow=view == "narrow",
+                retained=retained,
+                formals=() if self.is_root else self.graph.params,
+            )
+            held = ctx.local_type_of(alias.target.expr)
+            rank = len(held.shape) if isinstance(held, TensorType) else 1
+            relation = apply_source(relation, source, rank, scope.depth, scope.domain_params)
+            retained.update(source.relation.values)
+            values = {
+                name: retained[name]
+                for axis in range(relation.dim(isl.dim_type.PARAM))
+                if (name := relation.get_dim_name(isl.dim_type.PARAM, axis)) in retained
+            }
+            table[SSAValue(expr)] = BufferAlias(
+                source.target, AccessRelation(relation, values), AliasKind.VIEW
+            )
+            precisions[SSAValue(expr)] = precision.join(precisions[alias.target])
             return
-        table[id(expr)] = self._material_source(expr, ctx.local_type_of(expr), scope)
-        precisions[id(expr)] = self._exact_precision(table[id(expr)])
+        held = ctx.local_type_of(expr)
+        for index, leaf in enumerate(leaves_of(held) or (held,)):
+            value = SSAValue(expr, index)
+            table[value] = self._identity_source(value, leaf, scope)
+            precisions[value] = AnalysisPrecision.EXACT
 
     def _record_accesses(self, expr: Call, scope: IterationScope) -> None:
         if (
             isinstance(expr.target, Function)
+            or not leaves_of(expr.type)
             or access_relation_registry.lookup(type(expr.target)) is None
         ):
             for view in self.views:
                 self._record_source(expr, scope, view)
             return
+        logical = self._view_context("narrow", scope)
         try:
-            stated = relations_of(expr, self.type_ctx)
+            stated = relations_of(expr, logical)
             scope.relations[id(expr)] = (expr, stated)
         except (NotImplementedError, TypeError, ValueError, isl.Error):
             for view in self.views:
                 self._record_source(expr, scope, view)
                 scope.refused[view] = scope.refused.get(view, frozenset()) | {expr}
             return
+        alias = (
+            buffer_alias(expr, logical, scope.projected_relations(expr, logical))
+            if aliased_operand(expr) is not None
+            else None
+        )
         for view in self.views:
-            ctx = self._view_context(view)
+            ctx = self._view_context(view, scope)
             try:
                 local_relations = scope.projected_relations(expr, ctx)
             except (NotImplementedError, TypeError, ValueError, isl.Error):
                 self._record_source(expr, scope, view)
                 scope.refused[view] = scope.refused.get(view, frozenset()) | {expr}
                 continue
-            self._record_source(expr, scope, view, local_relations)
+            self._record_source(expr, scope, view, local_relations, alias)
             for inputs, boundaries, into in (
-                (True, local_relations[:len(expr.args)], scope.accesses),
-                (False, local_relations[len(expr.args):], scope.outputs),
+                (True, local_relations[: len(expr.args)], scope.accesses),
+                (False, local_relations[len(expr.args) :], scope.outputs),
             ):
                 built: list[Access] = []
                 for index, boundary in enumerate(boundaries):
                     operand = expr.args[index] if inputs else expr
                     access = resolve_access(
-                        operand, boundary, scope, ctx,
+                        operand,
+                        boundary,
+                        scope,
+                        ctx,
                         input_index=index if inputs else None,
                         output_index=None if inputs else index,
-                        narrow=view == "narrow", sources=self.sources[view],
-                        precisions=self.precisions[view], source_scope=self.definitions[id(operand)],
+                        narrow=view == "narrow",
+                        sources=self.sources[view],
+                        precisions=self.precisions[view],
+                        formals=() if self.is_root else self.graph.params,
                     )
-                    if access is not None:
-                        built.append(access)
+                    built.extend(access)
                 into.setdefault(view, {})[id(expr)] = (expr, tuple(built))
 
     def _record_variance(self, expr: Expr, operands: tuple[Expr, ...]) -> None:
@@ -507,201 +421,93 @@ class ScopeBuilder(CallFrameVisitor[None]):
             changing.add(id(loop))
         self.variance[id(expr)] = frozenset(changing)
 
-    def _visit_call(self, expr, scope, frame):
-        for arg in expr.args:
-            self._visit(arg, scope)
-        target = expr.target
-        slot = target if isinstance(target, ModuleList) else (
-            target.args[0] if isinstance(target, Call) else None
+    def region_context(self, expr, ctx):
+        scope = ctx.current
+        domain, parameters = (
+            iteration_domain(expr, scope)
+            if isinstance(expr, LoopRegion)
+            else (scope.domain, scope.domain_params)
         )
-        if slot is not None:
-            slot = scope.occurrence.frame.module.children[slot.key]
-        index = target.args[1] if isinstance(target, Call) else None
-        if isinstance(index, Constant):
-            index = index.value
         child = IterationScope(
-            expr, scope, (), scope.depth, scope.domain,
-            tuple(zip((p for p in frame.function.params
-                       if isinstance(expr.target, Function) or not p.is_const), expr.args, strict=True)),
-            domain_params=scope.domain_params, accesses=self._empty_accesses(),
-            frame=frame, slot=slot, index=index,
+            owner=expr,
+            parent=scope,
+            children=(),
+            depth=scope.depth + isinstance(expr, LoopRegion),
+            domain=domain,
+            domain_params=parameters,
+            context=ctx,
+            accesses=self._empty_accesses(),
+            variance=self.variance,
+            sources=self.sources,
+            precisions=self.precisions,
         )
-        if isinstance(child.index, Expr):
-            self._visit(child.index, scope)
-        child.occurrence = child
         scope.children = (*scope.children, child)
-        names = ("sources", "precisions", "definitions", "aliases", "seen", "seeds", "variance")
-        saved = {name: getattr(self, name) for name in names}
-        self.sources = {view: {} for view in self.views}
-        self.precisions = {view: {} for view in self.views}
-        self.definitions, self.aliases, self.seeds, self.seen = {}, {}, {}, set()
-        self.variance = child.variance
-        saved_type, saved_unit = self.type_ctx, self.unit_ctx
-        self.type_ctx = replace(self.type_ctx, module=frame.module, target=frame.target, current=child)
-        self.unit_ctx = replace(self.unit_ctx, module=frame.module, target=frame.target, current=child)
-        try:
-            for param, argument in child.captures:
-                self.seen.add(id(param))
-                self.definitions[id(param)] = child
-                self.variance[id(param)] = saved["variance"].get(id(argument), frozenset())
-                for view in self.views:
-                    self.sources[view][id(param)] = self._source_relation(
-                        saved["sources"][view][id(argument)],
-                        self._view_context(view).local_type_of(argument),
-                        child,
-                    )
-                    self.precisions[view][id(param)] = saved["precisions"][view][id(argument)]
-            for weight in frame.function.params:
-                if any(weight is param for param, _ in child.captures):
-                    continue
-                self._visit(weight, child)
-                if isinstance(child.index, Expr):
-                    self.variance[id(weight)] = saved["variance"].get(id(child.index), frozenset())
-            self._visit(frame.function.body, child)
-            results = {
-                view: (
-                    self.sources[view][id(frame.function.body)],
-                    self.precisions[view][id(frame.function.body)],
-                )
-                for view in self.views
-            }
-            changing = self.variance.get(id(frame.function.body), frozenset())
-        finally:
-            self.type_ctx, self.unit_ctx = saved_type, saved_unit
-            for name, table in saved.items():
-                setattr(self, name, table)
-        for view, (source, precision) in results.items():
-            self.sources[view][id(expr)] = self._source_relation(
-                source, self._view_context(view).local_type_of(expr), scope
-            )
-            self.precisions[view][id(expr)] = precision
-        self.variance[id(expr)] = changing
-
-    def _visit(self, expr: Expr, scope: IterationScope) -> None:
-        if id(expr) in self.seen:
-            return
-        self.seen.add(id(expr))
-        self.definitions[id(expr)] = scope
-        if isinstance(expr, Call) and (frame := self.callee_frame(expr, scope.occurrence.frame)) is not None:
-            self._visit_call(expr, scope, frame)
-            return
+        inner = super().region_context(expr, ctx)
+        child.context = inner
         if isinstance(expr, LoopRegion):
-            for operand in expr.args:
-                self._visit(operand, scope)
-            domain, domain_params = iteration_domain(expr, scope)
-            child = IterationScope(
-                owner=expr,
-                parent=scope,
-                children=(),
-                depth=scope.depth + 1,
-                domain=domain,
-                captures=expr.captures(),
-                domain_params=domain_params,
-                accesses=self._empty_accesses(),
-                occurrence=scope.occurrence,
-            )
-            scope.children = (*scope.children, child)
-            self.seeds[id(expr.induction_var)] = child
-            self._visit(expr.induction_var, child)
-            for carried in expr.params[: len(expr.yield_values)]:
-                self.seeds[id(carried)] = child
-                self._visit(carried, child)
-            for param, argument in child.captures:
-                self._record_variance(param, (argument,))
-                self.seen.add(id(param))
-                self.definitions[id(param)] = child
-                for view in self.views:
-                    self.sources[view][id(param)] = self._source_relation(
-                        self.sources[view][id(argument)],
-                        self._view_context(view).local_type_of(argument), child,
-                    )
-                    self.precisions[view][id(param)] = self.precisions[view][id(argument)]
-            self._visit(expr.body, child)
-            for operand in expr.yield_values:
-                self._visit(operand, child)
+            for param in (expr.induction_var, *expr.params[: len(expr.yield_values)]):
+                self.seeds[id(param)] = child
+        for param, argument in expr.captures():
+            self._record_variance(param, (argument,))
+            self._memo[id(param)] = (param, None)
             for view in self.views:
-                params = expr.params[:len(expr.yield_values)]
-                carries = tuple(self.sources[view][id(param)] for param in params)
-                precisions = tuple(self.precisions[view][id(param)] for param in params)
-                if carries:
-                    source = carries[0] if len(carries) == 1 else carries
-                    precision = precisions[0] if len(carries) == 1 else precisions
-                else:
-                    source = self.sources[view][id(expr.body)]
-                    precision = self.precisions[view][id(expr.body)]
-                self.sources[view][id(expr)] = self._source_relation(
-                    source, self._view_context(view).local_type_of(expr), scope
-                )
-                self.precisions[view][id(expr)] = precision
-            self._record_variance(expr, expr_children(expr))
-            return
-        if isinstance(expr, MeshRegion):
-            for operand in expr.args:
-                self._visit(operand, scope)
-            child = IterationScope(
-                owner=expr,
-                parent=scope,
-                children=(),
-                depth=scope.depth,
-                domain=scope.domain,
-                captures=expr.captures(),
-                domain_params=scope.domain_params,
-                accesses=self._empty_accesses(),
-                occurrence=scope.occurrence,
-            )
-            scope.children = (*scope.children, child)
-            for param, argument in child.captures:
-                self._record_variance(param, (argument,))
-                self.seen.add(id(param))
-                self.definitions[id(param)] = child
-                for view in self.views:
-                    self.sources[view][id(param)] = self._source_relation(
-                        self.sources[view][id(argument)],
-                        self._view_context(view).local_type_of(argument), child,
-                    )
-                    self.precisions[view][id(param)] = self.precisions[view][id(argument)]
-            self._visit(expr.body, child)
+                self._forward(param, forwarded_leaves(param, inner), child, view)
+        return inner
+
+    def default_visit_leaf(self, expr, operands, ctx):
+        scope = ctx.current
+        if isinstance(expr, (LoopRegion, MeshRegion)):
+            scope = scope.parent
             for view in self.views:
-                self.sources[view][id(expr)] = self._source_relation(
-                    self.sources[view][id(expr.body)],
-                    self._view_context(view).local_type_of(expr.body), scope,
-                )
-                self.precisions[view][id(expr)] = self.precisions[view][id(expr.body)]
-            self._record_variance(expr, expr_children(expr))
-            return
-        operands = expr_children(expr)
-        for operand in operands:
-            self._visit(operand, scope)
-        if isinstance(expr, Call):
-            self._record_accesses(expr, scope)
+                self._forward(expr, forwarded_leaves(expr, ctx), scope, view)
+        elif isinstance(expr, Call):
+            callee = self.callee_frame(expr, ctx.frame)
+            if callee is None:
+                self._record_accesses(expr, scope)
+            else:
+                for view in self.views:
+                    binding = self._view_context(view, scope).for_call(expr)
+                    for index, (source, precision) in enumerate(
+                        self.returns[id(callee.function)][view]
+                    ):
+                        value = SSAValue(expr, index)
+                        projected, bounded = binding.project(source)
+                        self.sources[view][value] = projected
+                        self.precisions[view][value] = precision.join(bounded)
         else:
             for view in self.views:
                 self._record_source(expr, scope, view)
-        self._record_variance(expr, operands)
+        self._record_variance(expr, expr_children(expr))
 
     def build(self) -> IterationScope:
         self.seeds = {}
         self.variance = {}
-        self.seen = set()
         domain, domain_params = iteration_domain(self.graph, None)
+        mesh = get_metadata(self.graph, ExecutionMeshMetadata)
+        context = replace(
+            self.type_ctx,
+            owner=self.graph,
+            parent=None,
+            current_mesh=None if mesh is None else mesh.mesh,
+        )
         root = IterationScope(
             owner=self.graph,
             parent=None,
             children=(),
             depth=0,
             domain=domain,
-            captures=(),
             domain_params=domain_params,
+            context=context,
             accesses=self._empty_accesses(),
-            topologies=self.topologies,
+            variance=self.variance,
+            sources=self.sources,
+            precisions=self.precisions,
         )
-        root.occurrence = root
-        root.frame = CallFrame(self.type_ctx.module, self.graph)
-        root.variance = self.variance
+        context.root = context.current = root
         for param in self.graph.params:
-            self._visit(param, root)
-        if self.graph.body is not None:
-            self._visit(self.graph.body, root)
+            self.visit(param, context)
+            self.variance[id(param)] = frozenset((id(param),))
+        self.visit_function_body(self.graph, context)
         return root
 
 

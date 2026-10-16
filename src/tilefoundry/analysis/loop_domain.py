@@ -57,16 +57,12 @@ def iteration_domain(
     """Build the accumulated authored iteration domain for one scope owner."""
     if isinstance(owner, Function):
         return isl.set("{ [] }"), {}
-    loops = (*(() if parent is None else parent.enclosing_loops()), owner)
+    loops = (*(() if parent is None else parent.context.enclosing_loops()), owner)
     names = [f"p{index}" for index in range(len(loops))]
     coords = {id(loop.induction_var): name for loop, name in zip(loops, names)}
-    cursor = parent
-    while cursor is not None:
-        for param, _ in cursor.captures:
-            root = parent.capture_root(param)
-            if id(root) in coords:
-                coords[id(param)] = coords[id(root)]
-        cursor = cursor.parent
+    if parent is not None:
+        coords.update({param: coords[id(root)] for param, root in parent.context.loop_aliases.items()
+                       if id(root) in coords})
     values: IslParamValues = {}
     domain = isl.set(f"{{ [{', '.join(names)}] }}")
     for index, loop in enumerate(loops):
