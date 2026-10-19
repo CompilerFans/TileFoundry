@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from tilefoundry.codegen.cuda.context import CudaCodegenContext
 from tilefoundry.ir.tir.arith import Binary, BinaryKind, Unary, UnaryKind
+from tilefoundry.ir.tir.cast import Cast
 from tilefoundry.ir.types.shard_layout import ShardLayout, shard_layout_local_shape
 from tilefoundry.ir.types.utils import (
     shape_has_dim_var,
@@ -198,12 +199,18 @@ def _emit_binary(call, ctx: CudaCodegenContext) -> None:
 
 
 @register_codegen(CudaTarget, Role.EMIT, Unary)
+@register_codegen(CudaTarget, Role.EMIT, Cast)
 def _emit_unary(call, ctx: CudaCodegenContext) -> None:
-    """One source, always the bare tag -- a unary needs no lambda."""
+    """One source, always the bare tag -- a unary needs no lambda.
+
+    An effect-form ``Cast`` is ``UnaryKind.CAST``: the store into the
+    destination converts, so its functor is the identity.
+    """
     src, dst = call.args
     src_n = _tensor_expr(src, ctx)
     dst_n = _tensor_expr(dst, ctx)
-    tag = _UNARY_TAG[call.target.kind]
+    kind = UnaryKind.CAST if isinstance(call.target, Cast) else call.target.kind
+    tag = _UNARY_TAG[kind]
     n = _dyn_clip(dst, (src,), ctx)
     if n is None:
         ctx.emit(f"tilefoundry::ops::elementwise({dst_n}, {tag}{{}}, {src_n});")
