@@ -10,7 +10,6 @@ from enum import Enum
 from types import UnionType
 from typing import Union, get_args, get_origin, get_type_hints
 
-from tilefoundry.analysis.footprint import wave_of
 from tilefoundry.analysis.metadata import (
     Breakdown,
     ComputeCostMetadata,
@@ -250,7 +249,6 @@ def report_data(
             printer.render(ctx.function)
     selected = frozenset(selected_types(module, analyses, metadata_types))
     target = module.resolve_target()
-    wave = wave_of(module, target, topology_level)
     owners = {
         id(candidate): frame.module.name
         for frame in list_call_paths(module).values()
@@ -284,10 +282,6 @@ def report_data(
         "target": target.identity,
         "module": module.name,
         "topology": topology_level,
-        "wave": {
-            "counted": 0 if wave is None else wave[0],
-            "declared": 0 if wave is None else wave[1],
-        },
         "requested": list(analyses),
         "executed": list(executed),
         "functions": rows,

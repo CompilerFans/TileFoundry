@@ -316,7 +316,7 @@ def test_a_symbolic_store_stride_preserves_the_literal_control_result() -> None:
 
     literal_service, literal_local, literal_roofline, literal_performance = observed["literal"]
     symbolic_service, symbolic_local, symbolic_roofline, symbolic_performance = observed["symbolic"]
-    assert literal_roofline == symbolic_roofline == 439_331
+    assert literal_roofline == symbolic_roofline == 453_060
     assert symbolic_local - literal_local == 6 * 32
     assert symbolic_service - literal_service == 6 * 32 * 128
     assert symbolic_performance - literal_performance == 6 * 32
@@ -330,8 +330,8 @@ def test_roofline_uses_exact_integer_ceiling_above_float_precision() -> None:
     bound = get_metadata(result.function, RooflineMetadata)
 
     assert bound is not None
-    assert bound.compute_ns == 1_492_537_313_434
-    assert bound.ideal_ns == 1_492_537_313_434
+    assert bound.compute_ns == 197_014_925_373_451
+    assert bound.ideal_ns == 197_014_925_373_451
 
 
 _SPLIT_GRID = 128
@@ -421,13 +421,13 @@ def test_a_program_whose_peak_exceeds_capacity_reports_an_error() -> None:
 
     tight_memory = analyze(*check_program(tight, split), analysis="memory")
     tight_record = get_metadata(tight_memory.function, RegionMemoryMetadata)
-    assert tight_record.errors == ("smem placement peak 206.25KB exceeds capacity 103.12KB",)
-    assert '#   error="smem placement peak 206.25KB exceeds capacity 103.12KB"' in render_text(
+    assert tight_record.errors == ("smem placement peak 206.25KiB exceeds capacity 103.12KiB",)
+    assert '#   error="smem placement peak 206.25KiB exceeds capacity 103.12KiB"' in render_text(
         render_analysis(tight_memory)
     )
     assert render_analysis(tight_memory).data["functions"][0]["function_records"]["memory"][
         "errors"
-    ] == ["smem placement peak 206.25KB exceeds capacity 103.12KB"]
+    ] == ["smem placement peak 206.25KiB exceeds capacity 103.12KiB"]
 
     tight_performance = analyze(*check_program(tight, split), analysis="performance")
     assert (

@@ -8,6 +8,7 @@ from tilefoundry.ir.core import Call, Expr, VerifyError, get_metadata
 from tilefoundry.ir.core import attach_metadata as attach
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.types import DType
+from tilefoundry.target.facts import TopologyFacts
 from tilefoundry.visitor_registry.contexts import CostContext, TrafficBytes
 from tilefoundry.visitor_registry.valuation import ValuationVisitor
 from tilefoundry.visitor_registry.visitors import CostEvaluator
@@ -15,6 +16,7 @@ from tilefoundry.visitor_registry.visitors import CostEvaluator
 from .errors import AnalysisError
 from .facts import PerformanceServiceFacts, ThroughputFacts
 from .iteration_scope import Repeats
+from .liveness import result_copies
 from .metadata import (
     Breakdown,
     ComputeCostMetadata,
@@ -68,8 +70,13 @@ def local_duration_ns(
     topology_level: str | None = None,
     level: str | None = None,
     scale: int = 1,
+    positions: int = 1,
 ) -> int:
-    """Price one occurrence's projected work against one unit's throughputs."""
+    """Price one occurrence's projected work against one unit's throughputs.
+
+    At the bandwidth level, one unit moves its share of the occurrence's
+    footprint: one window's bytes over the *positions* that window holds.
+    """
     topology_level = topology_level if topology_level is not None else level
     if topology_level is None:
         raise AnalysisError("performance: no topology level was selected")
@@ -111,8 +118,11 @@ def local_duration_ns(
     storage_traffic = (
         shares(moved.traffic.storage, moved.topologies, topology_level) if moved is not None else {}
     )
+    unique = None if moved is None or moved.footprint is None else moved.footprint.bytes_at(facts.bandwidth_level)
     for memory_level, traffic in storage_traffic.items():
         crossed = traffic.total_bytes * scale
+        if unique is not None and memory_level == facts.bandwidth_level:
+            crossed = -(-unique[0] // positions) * scale
         throughput = services.bandwidth(memory_level)
         if not crossed or throughput is None:
             continue
@@ -141,6 +151,31 @@ def local_duration_ns(
         if rate:
             link_ns = -(-(sent * 1_000_000_000) // rate)
     return max(compute_ns, memory_ns, link_ns)
+
+
+def inflight_bytes(call: Call, scope, target, level: str) -> int | None:
+    """Bytes one parallel unit keeps in flight for *call*'s traffic at *level*.
+
+    An asynchronous copy (TMA, ``cp.async``) keeps every stage of its buffer in
+    flight: one unit's bytes at *level* times the slots its buffer declares. A
+    synchronous access keeps one 16-byte access per thread of the unit, and as
+    many threads as the finest level allows when the program states none.
+    """
+    facts = target.get_facts(TopologyFacts)
+    unit = facts.parallel()
+    if unit is None or not facts.topologies:
+        return None
+    op = getattr(call.target, "op", call.target)
+    if getattr(getattr(type(op), "_op_schema", None), "category", None) == "async":
+        moved = get_metadata(call, MemoryMetadata)
+        stage = None if moved is None else shares(moved.traffic.storage, moved.topologies, unit.name).get(level)
+        slots = max((result_copies(scope.capture_root(arg)) for arg in call.args), default=1)
+        return None if stage is None else stage.total_bytes * slots
+    finest = facts.topologies[-1]
+    threads = finest.max_logical_units
+    if scope.mesh is not None and finest.name in {item.name for item in scope.mesh.topologies}:
+        threads = min(threads, scope.mesh_positions(finest.name) // scope.mesh_positions(unit.name))
+    return None if threads is None else threads * 16
 
 
 def _call_cost_record(

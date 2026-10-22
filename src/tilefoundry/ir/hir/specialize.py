@@ -13,8 +13,8 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 
-from tilefoundry.ir.core import Call, Constant, Expr, Op, Tuple, Var
-from tilefoundry.ir.core.module import ModuleList
+from tilefoundry.ir.core import Call, Constant, Expr, Op, Tuple, Var, VerifyError
+from tilefoundry.ir.core.module import Module, ModuleList
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.pattern import Pattern, RangePattern
 from tilefoundry.ir.types import callable_type_for
@@ -28,6 +28,7 @@ from tilefoundry.ir.types.substitute import (
 )
 from tilefoundry.ir.types.tensor_type import TensorType
 from tilefoundry.ir.visitor import ExprCloner, ExprVisitor
+from tilefoundry.visitor_registry.contexts import ValuationContext
 
 from .function import Function
 
@@ -257,6 +258,46 @@ class InstantiateDimensionCloner(ExprCloner):
         return dataclasses.replace(rebuilt, type=substitute_dims(value.type, self.dims))
 
 
+def instantiate(
+    module: Module, function: Function, dims: Mapping[str, int] | None
+) -> tuple[Module, Function]:
+    """Bind *dims* wherever *function* reaches them, in a clone of *module*.
+
+    A dimension may be declared by any reachable function, not only by the
+    signature of *function*; a name that nothing reachable declares is refused.
+    The authored Module and Function are untouched.
+    """
+    supplied = {} if dims is None else dict(dims)
+    declared = {}
+    collector = _DimVarCollector(declared, supplied)
+    collector.visit_function(function, ValuationContext(module, function))
+    if collector.cycles:
+        raise VerifyError(f"recursive call path through {collector.cycles[0]!r}")
+    if collector.missing_bodies:
+        name, path = collector.missing_bodies[0]
+        raise VerifyError(f"cannot analyze Function {name!r} without a body at {path!r}")
+    unknown = sorted(set(supplied) - declared.keys())
+    if unknown:
+        if declared:
+            reached = ", ".join(
+                f"{name} ({collector.declared_by.get(name, function.name)})"
+                for name in sorted(declared)
+            )
+            detail = f"the dimensions it reaches are {reached}"
+        else:
+            detail = "no function it reaches declares a dimension"
+        raise SpecializationError(
+            f"{function.name!r} has no dimension named {unknown!r}; {detail}"
+        )
+    for name, extent in supplied.items():
+        substitute_shape_dim(declared[name], {name: extent})
+    cloner = InstantiateDimensionCloner(dims)
+    for reached, _frame in collector.functions:
+        cloner.function(reached)
+    root = cloner.function(function)
+    return cloner.module(module), root
+
+
 def _substitute_op_dims(target: object, dims: Mapping[str, int]) -> object:
     """Substitute bindings in an operation's shape-valued attributes."""
     if isinstance(target, Function) or not isinstance(target, Op):
@@ -328,6 +369,7 @@ class _DimVarCollector(ExprVisitor[None]):
         super().__init__()
         self.found = found
         self.dims = dims
+        self.declared_by: dict[str, str] = {}
         self.seen_functions = set()
         self.active_functions = set()
         self.functions = []
@@ -338,6 +380,14 @@ class _DimVarCollector(ExprVisitor[None]):
     def default_visit_leaf(self, expr, operands, ctx):
         return None
 
+    def _record(self, found: dict[str, object]) -> None:
+        """Note declarations, remembering which function stated each name first."""
+        owner = self.path[-1] if self.path else None
+        for name in found:
+            if name not in self.found and owner is not None:
+                self.declared_by[name] = owner
+        self.found.update(found)
+
     def _collect_expr(self, expr: Expr, ctx=None) -> None:
         from tilefoundry.ir.types.substitute import _collect  # noqa: PLC0415
 
@@ -346,11 +396,15 @@ class _DimVarCollector(ExprVisitor[None]):
             if isinstance(expr, ModuleList) and ctx is not None
             else expr
         )
-        _collect(current.type, self.found)
+        staging: dict[str, object] = {}
+        _collect(current.type, staging)
+        self._record(staging)
 
     def _collect_bounds(self, expr: Expr) -> None:
+        staging: dict[str, object] = {}
         for bound in ("extent", "step", "start"):
-            _collect_entries(getattr(expr, bound, None), self.found)
+            _collect_entries(getattr(expr, bound, None), staging)
+        self._record(staging)
 
     def _visit_children(self, expr: Expr, ctx=None) -> None:
         if isinstance(expr, Call) and isinstance(expr.target, Call):
@@ -367,8 +421,6 @@ class _DimVarCollector(ExprVisitor[None]):
             self.visit(body, ctx)
 
     def visit_function(self, fn: Function, frame=None) -> None:
-        if frame is not None:
-            self.found.update(dim_vars_by_name(frame.topologies))
         if id(fn) in self.active_functions:
             self.cycles.append("/".join((*self.path, fn.name)))
             return
@@ -381,9 +433,11 @@ class _DimVarCollector(ExprVisitor[None]):
         self.path.append(fn.name)
         previous_memo, self._memo = self._memo, {}
         try:
+            if frame is not None:
+                self._record(dim_vars_by_name(frame.topologies))
             for param in fn.params:
-                self.found.update(dim_vars_by_name(param.type))
-            self.found.update(dim_vars_by_name(fn.return_type))
+                self._record(dim_vars_by_name(param.type))
+            self._record(dim_vars_by_name(fn.return_type))
             if self.dims is None:
                 for variant in fn.variants:
                     self.visit_function(variant, frame)
@@ -409,9 +463,11 @@ class _DimVarCollector(ExprVisitor[None]):
         if isinstance(callee, Function):
             self.visit_function(callee, inner)
         else:
+            staging: dict[str, object] = {}
             for attribute in getattr(type(target), "params", lambda: ())():
                 if attribute.kind == "attribute":
-                    _collect_entries(getattr(target, attribute.name, None), self.found)
+                    _collect_entries(getattr(target, attribute.name, None), staging)
+            self._record(staging)
 
     def visit_Tuple(self, expr: Tuple, ctx=None) -> None:
         self._collect_expr(expr, ctx)

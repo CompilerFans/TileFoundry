@@ -37,7 +37,7 @@ from tilefoundry.analysis.access import Access, eliminate_parameters
 from tilefoundry.analysis.allocation import AllocationSummaryMetadata, aligned
 from tilefoundry.analysis.api import _build_context
 from tilefoundry.analysis.check import check_program
-from tilefoundry.analysis.compute_cost import local_duration_ns
+from tilefoundry.analysis.compute_cost import inflight_bytes, local_duration_ns
 from tilefoundry.analysis.errors import AnalysisError
 from tilefoundry.analysis.iteration_scope import IterationScope
 from tilefoundry.analysis.liveness import LivenessMetadata
@@ -61,7 +61,7 @@ from tilefoundry.ir.hir.tensor.insert_slice import InsertSlice
 from tilefoundry.ir.hir.tensor.reshape import Reshape
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.visitor import collect_exprs
-from tilefoundry.target import CudaTarget, PerformanceServiceFacts, ThroughputFacts
+from tilefoundry.target import CudaTarget, PerformanceServiceFacts, ThroughputFacts, TopologyFacts
 from tilefoundry.visitor_registry.contexts import ValuationContext
 from tilefoundry.visitor_registry.valuation import ValuationVisitor
 
@@ -200,6 +200,9 @@ EXPECTED_MEMORY_PEAKS = {
         "gmem": 282688,
         "rmem": 0,
     },
+    "mesh_pricing.UnderFilled.f[static]": {"gmem": 2 * 40 * 8192 * 2, "rmem": 8192 * 2},
+    "mesh_pricing.SharedWindow.f[static]": {"gmem": 256 + 4 * 256, "rmem": 0},
+    "mesh_pricing.PlacedWindow.f[static]": {"gmem": 256 + 4 * 256, "rmem": 8},
     "hand_checked.InvariantReuse.reuse[static]": {
         "gmem": 64,
         "rmem": 0,
@@ -441,7 +444,7 @@ def assert_reported_contract(report: dict) -> None:
     assert 0 <= timeline["start_ns"] <= timeline["end_ns"]
     assert records["memory"]["solver_status"] in ("optimal", "feasible")
     predicted_ns = timeline["end_ns"] - timeline["start_ns"]
-    assert summary["waves"] > 0 and predicted_ns % summary["waves"] == 0
+    assert predicted_ns % -(-summary["wave"][0] // summary["wave"][1]) == 0
     assert records["roofline"]["ideal_ns"] <= predicted_ns
 
     timed = 0
@@ -489,12 +492,12 @@ def assert_internal_contract(result: AnalysisResult, scopes: tuple[IterationScop
     """Each duration matches its priced work and divides the enclosing loop trips.
 
     A definition-local duration is its own compute-cost record priced at the
-    target's rates. One a loop repeats is written once, so its interval is that
-    many of its own durations.
+    target's rates for the units its definition runs. One a loop repeats is
+    written once, so its interval is that many of its own durations.
     """
     module_target = result.module.resolve_target()
     throughput = module_target.get_facts(ThroughputFacts)
-    services = module_target.get_facts(PerformanceServiceFacts, result.level)
+    physical = module_target.get_facts(TopologyFacts).level(result.level).max_physical_units
     for function, expr in (
         (function, expr) for function in result.functions for expr in collect_exprs(function.body)
     ):
@@ -505,12 +508,19 @@ def assert_internal_contract(result: AnalysisResult, scopes: tuple[IterationScop
             continue
         cost = get_metadata(expr, ComputeCostMetadata)
         assert cost is not None
+        owner = next(
+            scope.snapshot.definition.locations[id(expr)]
+            for scope in scopes if id(expr) in scope.snapshot.definition.locations
+        )
+        active = min(owner.root.active_positions(result.level), physical)
+        inflight = inflight_bytes(expr, owner, module_target, throughput.bandwidth_level)
         duration = local_duration_ns(
             cost,
             throughput,
-            services,
+            module_target.get_facts(PerformanceServiceFacts, (result.level, active, inflight)),
             moved=get_metadata(expr, MemoryMetadata),
             level=result.level,
+            positions=min(owner.mesh_positions(result.level), active),
         )
         record = get_metadata(expr, PerformanceMetadata)
         if not duration:
@@ -521,18 +531,10 @@ def assert_internal_contract(result: AnalysisResult, scopes: tuple[IterationScop
         assert span % duration == 0, describe_expr(expr)
         runs = span // duration
         available = 1
-        owner = next(
-            (
-                scope.snapshot.definition.locations[id(expr)]
-                for scope in scopes if id(expr) in scope.snapshot.definition.locations
-            ),
-            None,
-        )
-        if owner is not None:
-            cursor = owner
-            while cursor.parent is not None:
-                available *= cursor.trips()
-                cursor = cursor.parent
+        cursor = owner
+        while cursor.parent is not None:
+            available *= cursor.trips()
+            cursor = cursor.parent
         assert 1 <= runs <= available and available % runs == 0, describe_expr(expr)
         trips = record.timeline.trips
         assert 1 <= trips <= available and available % trips == 0, describe_expr(expr)

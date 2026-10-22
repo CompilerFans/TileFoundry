@@ -14,6 +14,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
+from tests.fixtures.logical import callee_dim
 from tests.fixtures.placed import gqa_decode, leaf_weights
 from tests.fixtures.shapes.composed_leaf_source import composed_leaf_source
 from tests.models.corpus import MODELS_ROOT
@@ -394,6 +395,31 @@ def test_inputs_must_be_stated(capsys) -> None:
     assert "no inputs stated" in capsys.readouterr().err
 
 
+def test_a_json_target_without_a_parent_is_a_usage_error(capsys) -> None:
+    """A misspelt report path is refused at parse time, before any comparison runs."""
+    with pytest.raises(SystemExit) as stopped:
+        cli.main(
+            [
+                "check",
+                DISPATCHING,
+                "--inputs",
+                "random",
+                "--out",
+                "output",
+                "--fn",
+                "nan_inf",
+                "--json",
+                "/nonexistent-dir/report.json",
+            ]
+        )
+
+    assert stopped.value.code == 2
+    refused = capsys.readouterr()
+    assert refused.out == ""
+    assert refused.err.startswith("usage: tilefoundry check")
+    assert "/nonexistent-dir/report.json: its parent directory does not exist" in refused.err
+
+
 def test_without_a_reference_only_a_one_sided_predicate_is_admitted(capsys) -> None:
     """Running the evaluator alone measures the candidate, and says only that."""
     assert (
@@ -441,6 +467,53 @@ def test_without_a_reference_only_a_one_sided_predicate_is_admitted(capsys) -> N
     reported = capsys.readouterr().out
     assert "reference: none" in reported
     assert "nan 0 inf 0" in reported
+
+
+@pytest.mark.parametrize(
+    ("selector", "dim", "refusal"),
+    (
+        ("Staged.main", "BT=8", None),
+        ("Rooted.main", "BT=8", None),
+        ("Staged.main", "BTT=8", "has no dimension named ['BTT']; the dimensions it reaches are BT (stage)"),
+        ("DeadScratch.main", "BT=8", "no function it reaches declares a dimension"),
+    ),
+)
+def test_a_dim_binds_where_a_reached_function_declares_it(
+    selector, dim, refusal, tmp_path, capsys
+) -> None:
+    """--dim binds a helper's own axis, here or behind a module boundary.
+
+    A name nothing reachable declares is refused with the functions that do
+    declare dims; a binding the block dropped declares nothing.
+    """
+    x = torch.arange(4, dtype=torch.float32)
+    torch.save(x, tmp_path / "x.pt")
+    torch.save(x, tmp_path / "expected.pt")
+    code = cli.main(
+        [
+            "check",
+            f"{callee_dim.__file__}:{selector}",
+            "--inputs",
+            f"files:{tmp_path / 'x.pt'}",
+            "--expected",
+            str(tmp_path / "expected.pt"),
+            "--out",
+            "output",
+            "--fn",
+            "allclose",
+            "--atol",
+            "1e-6",
+            "--rtol",
+            "1e-6",
+            "--dim",
+            dim,
+        ]
+    )
+    captured = capsys.readouterr()
+    if refusal is None:
+        assert code == 0 and "PASS" in captured.out
+    else:
+        assert code != 0 and refusal in captured.err
 
 
 def test_a_dimension_left_as_a_range_is_refused(capsys) -> None:

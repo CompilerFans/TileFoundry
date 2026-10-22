@@ -131,7 +131,7 @@ def test_usage_errors_print_usage_before_error(tf) -> None:
     assert done.stdout == ""
     assert done.stderr.startswith("usage: tilefoundry analyze")
     assert (
-        "tilefoundry analyze: error: the following arguments are required: SOURCE, PATH"
+        "tilefoundry analyze: error: the following arguments are required: SOURCE"
         in done.stderr
     )
     assert "SOURCE" in done.stderr
@@ -211,7 +211,7 @@ def test_performance_resolves_derived_execution_geometry(tf, derived_prefill, tm
             "trips": 1,
             "stride_ns": 0,
         },
-        "waves": 1,
+        "wave": [3, 132],
     }
 
 

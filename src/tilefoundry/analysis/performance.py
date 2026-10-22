@@ -9,12 +9,11 @@ from tilefoundry.ir.core import Call, Expr, get_metadata
 from tilefoundry.ir.core import attach_metadata as attach
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.math.binary import Binary
-from tilefoundry.ir.types.utils import static_dim_value
 from tilefoundry.target import UnsupportedCapabilityError
-from tilefoundry.target.facts import TopologyFacts
+from tilefoundry.target.facts import TopologyFacts, TopologyLevelFacts
 from tilefoundry.visitor_registry.valuation import ValuationVisitor
 
-from .compute_cost import local_duration_ns
+from .compute_cost import inflight_bytes, local_duration_ns
 from .errors import AnalysisError
 from .facts import PerformanceServiceFacts, ThroughputFacts
 from .iteration_scope import IterationScope
@@ -36,22 +35,13 @@ class PerformanceContext(AnalyzeContext):
     """State carried through the performance-family expression walk."""
 
     facts: ThroughputFacts | None = None
-    services: PerformanceServiceFacts | None = None
+    active: int = 1
+    parallel: TopologyLevelFacts | None = None
     occurrences: list[tuple[IterationScope, Call, int]] = field(default_factory=list)
 
 
 class PerformanceVisitor(ValuationVisitor[None]):
     """Collect one duration per Call in authored order."""
-
-    def __init__(self, scope):
-        super().__init__()
-        self.positions = {unit.name: scope.mesh_positions(unit.name) for unit in scope.topologies}
-
-    def on_region_start(self, region, ctx):
-        inner = super().on_region_start(region, ctx)
-        for unit in self.positions:
-            self.positions[unit] = max(self.positions[unit], inner.scope.mesh_positions(unit))
-        return inner
 
     def visit_Call(self, call, ctx):
         self.visit_operands(call, ctx)
@@ -61,7 +51,8 @@ class PerformanceVisitor(ValuationVisitor[None]):
         summary = get_metadata(callee, PerformanceSummaryMetadata, ctx=ctx)
         if summary is None:
             raise AnalysisError(f"performance: missing summary for {callee.name!r}")
-        duration = (summary.timeline.end_ns - summary.timeline.start_ns) // summary.waves
+        waves = _waves(ctx.definitions[id(callee)], ctx.parallel)
+        duration = (summary.timeline.end_ns - summary.timeline.start_ns) // waves
         ctx.occurrences.append((ctx.scope, call, duration))
 
     def default_visit_leaf(
@@ -74,16 +65,23 @@ class PerformanceVisitor(ValuationVisitor[None]):
         moved = get_metadata(expr, MemoryMetadata)
         if cost is None or moved is None:
             raise AnalysisError(f"performance: missing compute/memory record for {expr!r}")
-        if ctx.facts is None or ctx.services is None:
+        if ctx.facts is None:
             raise AnalysisError("performance: visitor context is missing target facts")
+        inflight = inflight_bytes(expr, scope, ctx.target, ctx.facts.bandwidth_level)
         duration = local_duration_ns(
             cost,
             ctx.facts,
-            ctx.services,
+            ctx.target.get_facts(PerformanceServiceFacts, (ctx.topology_level, ctx.active, inflight)),
             moved=moved,
             topology_level=ctx.topology_level,
+            positions=min(scope.mesh_positions(ctx.topology_level), ctx.active),
         )
         ctx.occurrences.append((scope, expr, duration))
+
+
+def _waves(scope, level) -> int:
+    """Whole waves of *level*'s physical units the positions *scope* runs need."""
+    return -(-scope.active_positions(level.name) // level.max_physical_units)
 
 
 def schedule(occurrences, context, *, origin):
@@ -145,40 +143,41 @@ def schedule(occurrences, context, *, origin):
 
 
 def analyze_performance(function: Function, context: AnalyzeContext) -> None:
-    """Attach flat occurrence intervals and one function envelope."""
+    """Attach flat occurrence intervals and one function envelope.
+
+    Rates are those of the units the function's meshes run, and the envelope
+    repeats once per wave of those positions.
+    """
     if context.topology_level is None:
         raise AnalysisError("performance requires a resolved topology level")
-    facts = context.target.get_facts(ThroughputFacts)
-    services = context.target.get_facts(PerformanceServiceFacts, context.topology_level)
-    performance_context = PerformanceContext(**vars(context), facts=facts, services=services)
-    visitor = PerformanceVisitor(context.scope)
-    visitor.visit(function.body, performance_context)
+    topologies = context.target.get_facts(TopologyFacts)
+    level = topologies.parallel()
+    if level is None or level.max_physical_units is None:
+        raise UnsupportedCapabilityError(
+            f"{type(context.target).__name__}: no default parallel topology level"
+        )
+    positions = context.scope.active_positions(context.topology_level)
+    physical = topologies.level(context.topology_level).max_physical_units
+    active = min(positions, physical)
+    performance_context = PerformanceContext(
+        **vars(context),
+        facts=context.target.get_facts(ThroughputFacts),
+        active=active,
+        parallel=level,
+    )
+    PerformanceVisitor().visit(function.body, performance_context)
     total_cursor = schedule(performance_context.occurrences, context, origin=context.scope.root)
     summary_end = total_cursor
     roofline = get_metadata(function, RooflineMetadata)
     if function is context.entry and roofline is not None:
         summary_end = max(summary_end, roofline.ideal_ns)
-    level = context.target.get_facts(TopologyFacts).parallel()
-    if level is None or level.max_physical_units is None:
-        raise UnsupportedCapabilityError(
-            f"{type(context.target).__name__}: no default parallel topology level"
-        )
-    topology = next(item for item in context.topologies if item.name == level.name)
-    topology_extent = (
-        static_dim_value(topology.size)
-        if function is context.entry
-        else visitor.positions[level.name]
-    )
-    if topology_extent is None:
-        raise AnalysisError(
-            f"performance: topology {topology.name!r} has unresolved extent {topology.size!r}"
-        )
-    waves = -(-topology_extent // level.max_physical_units)
     attach(
         function,
         PerformanceSummaryMetadata(
-            timeline=TimelineMetadata(start_ns=0, end_ns=summary_end * waves),
-            waves=waves,
+            timeline=TimelineMetadata(
+                start_ns=0, end_ns=summary_end * _waves(context.scope, level)
+            ),
+            wave=(positions, physical),
         ),
     )
 

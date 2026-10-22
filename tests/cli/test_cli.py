@@ -18,6 +18,7 @@ from tilefoundry.cli.source import (
     one_extent_per_dim,
 )
 from tilefoundry.target import CpuTarget, registered_targets
+from tilefoundry.utils.units import format_bytes
 
 
 class ListedCpuTarget(CpuTarget):
@@ -732,7 +733,7 @@ def test_analyze_reports_retained_occurrences_from_one_rendering(tmp_path) -> No
     assert cli.main(["analyze", selector, str(operands_path), *flags, "--operands"]) == 0
     asked = operands_path.read_text(encoding="utf-8")
     assert "operands=" not in first
-    assert "operands=0:r30.00KB/w0;result:r0/w30.00KB" in asked
+    assert "operands=0:r30.00KiB/w0;result:r0/w30.00KiB" in asked
     assert (
         cli.main(["analyze", selector, str(operands_json_path), *flags, "--operands", "--json"])
         == 0
@@ -777,7 +778,6 @@ def test_analyze_reports_retained_occurrences_from_one_rendering(tmp_path) -> No
         "shared_expert::placed": 33280,
         "v2": 30720,
     }
-    assert payload["wave"] == {"counted": 132, "declared": 132}
     assert "cache" not in payload
     assert (
         not {
@@ -790,21 +790,20 @@ def test_analyze_reports_retained_occurrences_from_one_rendering(tmp_path) -> No
     )
     assert header.splitlines() == [
         "# analysis target=nvidia.h200_sxm module=MoEMegaKernel function=experts "
-        f"topology={payload['topology']} wave=132/132",
+        f"topology={payload['topology']}",
         f"# selection requested={','.join(payload['requested'])} "
         f"executed={','.join(payload['executed'])}",
         "# compute-cost "
         f"flops=f32:{cost['flops']['f32']['logical']}@logical,"
         f"{cost['flops']['f32']['total']}@total,"
         f"{cost['flops']['f32']['per_unit'][0]}@{payload['topology']} precision=exact",
-        "# memory traffic=gmem:r120.00KB/w90.00KB@logical,"
-        "r7.79MB/w3.93MB@total,r62.75KB/w32.75KB@cta "
-        "footprint=tokens:2.50KB;routed_expert::placed:30.25KB;shared_expert::placed:32.50KB;v2:30.00KB "
-        "footprint-precision=exact peak=gmem:90.00KB persistent=gmem:30.00KB",
+        "# memory traffic=gmem:r120.00KiB/w90.00KiB@logical,"
+        "r7.79MiB/w3.93MiB@total,r62.75KiB/w32.75KiB@cta "
+        "footprint=tokens:2.50KiB;routed_expert::placed:30.25KiB;shared_expert::placed:32.50KiB;v2:30.00KiB "
+        "footprint-precision=exact peak=gmem:90.00KiB persistent=gmem:30.00KiB",
         f"# roofline ideal-ns={bound['ideal_ns']} bound-by={bound['bound_by']}",
         "# performance root=MoEMegaKernel::experts "
-        f"predicted-ns={summary['timeline']['end_ns']} "
-        f"waves={summary['waves']}",
+        f"predicted-ns={summary['timeline']['end_ns']} wave=132/132",
     ]
     assert payload["functions"][0]["totals"]["flops"] == {
         name: spread["total"] for name, spread in cost["flops"].items()
@@ -879,3 +878,48 @@ def test_analyze_reports_retained_occurrences_from_one_rendering(tmp_path) -> No
         }
     ) == len(rows)
     assert "units=" not in annotated
+
+
+def test_analyze_without_a_path_writes_the_report_to_stdout(capsys) -> None:
+    source = Path(__file__).parents[1] / "fixtures" / "placed" / "rmsnorm.py"
+    assert cli.main(["analyze", f"{source}:RmsnormModule", "--memory"]) == 0
+    assert "# memory traffic=" in capsys.readouterr().out
+
+
+def test_analyze_memory_lines_state_json_totals(tmp_path) -> None:
+    """Each Function's # memory @total is that Function's JSON totals."""
+    source = Path(__file__).parents[1] / "fixtures" / "placed" / "moe_mega_kernel.py"
+    selector = f"{source}:MoEMegaKernel"
+    flags = ["--compute-cost", "--memory"]
+
+    json_path = tmp_path / "report.json"
+    text_path = tmp_path / "report.py"
+    assert cli.main(["analyze", selector, str(json_path), *flags, "--json"]) == 0
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert cli.main(["analyze", selector, str(text_path), *flags]) == 0
+    text = text_path.read_text(encoding="utf-8")
+
+    memory_lines = {}
+    for line in text.splitlines():
+        if identity := re.match(r"# analysis .* module=(\S+) function=(\S+)", line):
+            current = ".".join(identity.groups())
+        elif line.startswith("# memory traffic="):
+            memory_lines[current] = line
+    functions = payload["functions"]
+    assert len(functions) > 1, "one Function has no other record to be confused with"
+    assert set(memory_lines) == {row["function"] for row in functions}
+    for row in functions:
+        line = memory_lines[row["function"]]
+        traffic = re.search(r"traffic=(\S+)", line).group(1)
+        segments = {
+            segment.split(":", 1)[0]: segment.split(":", 1)[1]
+            for segment in traffic.split(";")
+        }
+        for level, moved in row["totals"]["traffic"].items():
+            total = f"r{format_bytes(moved['read'])}/w{format_bytes(moved['write'])}@total"
+            assert total in segments[level].split(",")
+    entry = functions[0]
+    for row in functions[1:]:
+        for level, moved in row["totals"]["traffic"].items():
+            whole = entry["totals"]["traffic"][level]
+            assert whole["read"] >= moved["read"] and whole["write"] >= moved["write"]

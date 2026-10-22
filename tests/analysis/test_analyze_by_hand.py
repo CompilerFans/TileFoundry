@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import isl
 import pytest
@@ -38,6 +39,7 @@ from tests.fixtures.placed.hand_checked import (
     TruncatedWaveReuse,
     WaveTruncation,
 )
+from tests.fixtures.placed.mesh_pricing import PlacedWindow, SharedWindow, UnderFilled
 from tests.fixtures.placed.persistent_gemm_flat import PersistentGemmFlat
 from tests.fixtures.placed.persistent_gemm_tiled import PersistentGemmTiled
 from tilefoundry.analysis import (
@@ -45,6 +47,7 @@ from tilefoundry.analysis import (
     ComputeCostMetadata,
     MemoryMetadata,
     PerformanceMetadata,
+    PerformanceSummaryMetadata,
     allocation,
     analyze,
 )
@@ -54,11 +57,15 @@ from tilefoundry.analysis.compute_cost import local_duration_ns
 from tilefoundry.analysis.footprint import ReachedAddresses, footprint_of, merged
 from tilefoundry.analysis.iteration_scope import build_scopes
 from tilefoundry.analysis.report import report_data
-from tilefoundry.ir.core import get_metadata
+from tilefoundry.cli.source import load_namespace
+from tilefoundry.ir.core import Call, get_metadata
 from tilefoundry.ir.core.expr import SSAValue
 from tilefoundry.ir.hir.loop_region import LoopRegion
+from tilefoundry.ir.hir.schedule import ScheduleOp
 from tilefoundry.ir.hir.sharding.reshard import Reshard
+from tilefoundry.ir.hir.tensor.insert_slice import InsertSlice
 from tilefoundry.ir.types import DType
+from tilefoundry.ir.visitor import collect_exprs
 from tilefoundry.target import CudaTarget, PerformanceServiceFacts, ThroughputFacts
 
 
@@ -214,8 +221,9 @@ def test_invariant_reuse_matches_the_written_arithmetic() -> None:
     assert _footprint_bytes(memory, "x") == 16
     footprint_total = memory["footprint"]["buffers"]["x"]["gmem"]["total"]
     assert footprint_total == 192
+    four_ctas_in_flight = 4 * 1024 * 16 * 1_000_000_000 // 353
     assert data["functions"][0]["function_records"]["roofline"]["memory_ns"] == -(
-        -(footprint_total * 1_000_000_000) // 4_800_000_000_000
+        -(footprint_total * 1_000_000_000) // four_ctas_in_flight
     )
     assert N // BN == 3
     assert data["functions"][0]["function_records"]["compute-cost"]["flops"]["bf16"] == {
@@ -290,9 +298,7 @@ def test_wave_truncation_counts_only_the_resident_ctas() -> None:
     )
     all_declared = all_declared_data["functions"][0]["function_records"]["memory"]
 
-    assert resident_data["wave"] == {"counted": 132, "declared": 256}
     assert _footprint_bytes(resident, "x") == 132 * 4 * 2
-    assert all_declared_data["wave"] == {"counted": 256, "declared": 256}
     assert resident["traffic"]["storage"]["gmem"]["total"] == {"read": 2048, "write": 0}
     assert all_declared["traffic"]["storage"]["gmem"]["total"] == {"read": 2048, "write": 0}
     assert _footprint_bytes(all_declared, "x") == 256 * 4 * 2
@@ -307,7 +313,6 @@ def test_truncated_wave_keeps_reuse_from_participating_boundaries() -> None:
     data = _report(TruncatedWaveReuse, analysis=("memory", "roofline"))
     memory = data["functions"][0]["function_records"]["memory"]
 
-    assert data["wave"] == {"counted": 132, "declared": 256}
     assert memory["traffic"]["storage"]["gmem"]["total"] == {"read": 8192, "write": 0}
     assert _working_set_bytes(memory) == 32
     assert sum(levels["gmem"]["total"] for levels in memory["footprint"]["buffers"].values()) == 64
@@ -421,8 +426,8 @@ def test_persistent_gemm_over_reuse_conclusions_match_the_reviewed_report(
     )
     assert all(row["precision"] == precision.value for row in memory["reuse_windows"])
     assert memory[category] == [
-        "l2 reuse window mi holds 176.00MB at a 132-unit wave, exceeding capacity 47.68MB",
-        "l2 reuse window ni holds 92.00MB at a 132-unit wave, exceeding capacity 47.68MB",
+        "l2 reuse window mi holds 176.00MiB at a 132-unit wave, exceeding capacity 47.68MiB",
+        "l2 reuse window ni holds 92.00MiB at a 132-unit wave, exceeding capacity 47.68MiB",
     ]
     assert memory["advisories" if category == "errors" else "errors"] == []
 
@@ -445,9 +450,9 @@ def test_capacity_exceeded_matches_the_written_ratio(
 
     assert (used, capacity, used * 100 / capacity) == (1_572_864, 1_048_576, 150.0)
     diagnosis = [
-        "l2 working set 1.50MB at the first iteration of a 1-unit wave exceeds capacity 1.00MB"
+        "l2 working set 1.50MiB at the first iteration of a 1-unit wave exceeds capacity 1.00MiB"
     ]
-    assert memory["errors"] == ["rmem placement peak 1.50MB exceeds capacity 256.00KB"] + (
+    assert memory["errors"] == ["rmem placement peak 1.50MiB exceeds capacity 256.00KiB"] + (
         diagnosis if category == "errors" else []
     )
     assert memory["advisories"] == (diagnosis if category == "advisories" else [])
@@ -576,3 +581,53 @@ def test_analyzer_agrees_with_deepgemm_min_choice() -> None:
     }
 
     assert min(analyzed, key=analyzed.get) == min(official, key=official.get) == "reuse_b"
+
+
+def _priced(owner):
+    return analyze(*check_program(owner, owner.entry_function()), analysis="performance")
+
+
+def _first_duration(result, kind) -> int:
+    call = next(
+        expr
+        for expr in collect_exprs(result.function.body)
+        if isinstance(expr, Call) and isinstance(expr.target, kind)
+    )
+    timeline = get_metadata(call, PerformanceMetadata).timeline
+    return timeline.end_ns - timeline.start_ns
+
+
+def test_forty_of_132_lanes_move_one_row_per_latency() -> None:
+    """Each CTA keeps 1024 threads x 16 B in flight, so its 16 KiB row takes one latency."""
+    result = _priced(UnderFilled)
+    assert get_metadata(result.function, PerformanceSummaryMetadata).wave == (40, 132)
+    row = 1024 * 16 * 1_000_000_000
+    assert _first_duration(result, Reshard) == -(-row // (row // 353))
+
+
+def test_a_tma_load_keeps_its_three_stages_in_flight() -> None:
+    """One 16 KiB stage moves while all three are in flight: a third of the latency."""
+    fixture = Path(__file__).parents[1] / "fixtures" / "schedule" / "hir"
+    namespace, _ = load_namespace(f"{fixture / 'gemm_8192x17408x5120_tma_store.py'}:GEMM")
+    assert _first_duration(_priced(namespace["GEMM_8192X17408X5120_TMA_STORE"]), ScheduleOp) == 118
+
+
+def test_a_window_every_position_writes_alike_costs_its_share() -> None:
+    """Traffic bills each of 4 positions its 256 B window; HBM time is the footprint's share.
+
+    One position's share is ``(y + windows) / 4`` at 46.4 GB/s: ``(256 + 256) / 4``
+    takes 3 ns when every position writes the same window, ``(256 + 1024) / 4``
+    takes 7 ns when each writes its own.
+    """
+    durations = []
+    for owner in (SharedWindow, PlacedWindow):
+        result = _priced(owner)
+        insert = next(
+            expr
+            for expr in collect_exprs(result.function.body)
+            if isinstance(expr, Call) and isinstance(expr.target, InsertSlice)
+        )
+        gmem = get_metadata(insert, MemoryMetadata).traffic.storage.of("gmem")
+        assert gmem.total.write == 4 * gmem.at(0).write == 4 * 256
+        durations.append(_first_duration(result, InsertSlice))
+    assert durations == [3, 7]

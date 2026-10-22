@@ -217,7 +217,9 @@ bounds the caller stated.
     `check` does not run.
   - `--json PATH` MUST write the machine-readable report to `PATH` and MUST NOT
     write any byte of that report to stdout. Without `--json`, the human report
-    MUST remain on stdout.
+    MUST remain on stdout. A `PATH` whose parent directory does not exist MUST
+    be refused when the arguments are parsed, before any comparison runs, and
+    the refusal MUST name the path.
   - Reaching one leaf MUST read only that leaf Module's own weights. A comparison
     of one kernel MUST NOT materialise a whole model. A Module is the unit that
     loads, so what a run binds is everything the selected Module declares, not the
@@ -394,10 +396,11 @@ explicit analysis; there is no ordinary `--target` option.
   - A selection MUST resolve to a Module. A bare Function MUST be rejected
     naming the reason: it declares neither the Target its numbers are measured
     against nor the topology hierarchy they divide over.
-  - `analyze` MUST require a `PATH` whether or not an analysis flag was supplied.
-    Its typed HIR, text report, or JSON report MUST be written to that path, and
-    successful execution MUST write none of the report to stdout.
-  - `--json` MUST write the report as JSON to the required `PATH` instead of text.
+  - `analyze` MUST accept an optional `PATH` whether or not an analysis flag was
+    supplied. With `PATH`, its typed HIR, text report, or JSON report MUST be
+    written to that path, and successful execution MUST write none of the report
+    to stdout. Without `PATH`, the same report bytes MUST be written to stdout.
+  - `--json` MUST write the report as JSON, to `PATH` or stdout, instead of text.
     Its `source` field MUST carry each reached definition once with its records
     ([analysis §2](./analysis.md#2-composed-analysis)).
     `--operands` MUST NOT change `source`: it is always the annotated HIR from the
@@ -456,9 +459,9 @@ explicit analysis; there is no ordinary `--target` option.
     measurements reported.
   - The report's `target` field MUST be the concrete Target value's `identity`,
     so two products served by one Target class remain distinguishable.
-  - On success with at least one requested root, the `PATH` file begins with the
-    `#`-headed report followed by annotated HIR. With no analysis flag, the `PATH`
-    file contains typed HIR alone, with no report header and no analysis Metadata
+  - On success with at least one requested root, the report begins with the
+    `#`-headed report followed by annotated HIR. With no analysis flag, it
+    contains typed HIR alone, with no report header and no analysis Metadata
     comment.
     On inference, verification, or analysis failure, stdout MUST be empty and
     stderr MUST report the source location, binding where available, and reason.

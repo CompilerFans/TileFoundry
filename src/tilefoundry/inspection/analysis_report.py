@@ -93,16 +93,12 @@ def _summary(
 ) -> tuple[IRMetadata, ...]:
     """One record per summary line: identity, selection, then findings."""
     module_name, _, function_name = data["function"].rpartition(".")
-    wave = data["wave"]
-    counted = wave["counted"]
-    declared = wave["declared"]
     views: list[IRMetadata] = [
         ReportIdentity(
             target=data["target"],
             module=module_name,
             function=function_name,
             topology=data["topology"] or "none",
-            wave=f"{counted}/{declared}" if counted and declared else "",
         ),
         ReportSelection(requested=tuple(data["requested"]), executed=tuple(data["executed"])),
     ]
@@ -122,7 +118,7 @@ def _summary(
             PerformanceSummaryView(
                 root=f"{module_name}::{function_name}",
                 predicted_ns=summary.timeline.end_ns - summary.timeline.start_ns,
-                waves=summary.waves,
+                wave="/".join(map(str, summary.wave)),
             )
         )
     return tuple(views)

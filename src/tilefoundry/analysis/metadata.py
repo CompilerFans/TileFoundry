@@ -171,6 +171,16 @@ class Footprint:
 
         return counted_precision(item for _windows, items in self._grouped for item in items)
 
+    def bytes_at(self, level: str) -> tuple[int, int] | None:
+        """One window's and every executed window's bytes, when all sit at *level*.
+
+        Reads and writes are one count: they share one bandwidth.
+        """
+        kinds = tuple(item for *_held, held in self.buffers for item in held.kinds)
+        if any(name != level for name, _spread in kinds):
+            return None
+        return sum(s.logical for _n, s in kinds), sum(s.total for _n, s in kinds)
+
 
 @dataclass(frozen=True)
 class MemoryMetadata(IRMetadata):
@@ -329,14 +339,15 @@ class PerformanceMetadata(IRMetadata):
 class PerformanceSummaryMetadata(IRMetadata):
     """One Function's predicted time, and what reaching it took.
 
-    ``timeline`` is the whole-Function envelope from zero, so its duration is
-    the prediction; ``waves`` is the uniform scaling between one local wave and
-    that envelope. The prediction is exact for the model it states, so there is
-    nothing here about how it was reached.
+    ``timeline`` is the whole-Function envelope from zero, every wave the
+    Function's executing positions need, so its duration is the prediction.
+    ``wave`` is those positions against the physical units of the selected
+    level. The prediction is exact for the model it states, so there is nothing
+    here about how it was reached.
     """
 
     timeline: TimelineMetadata
-    waves: int
+    wave: tuple[int, int]
 
 
 __all__ = [

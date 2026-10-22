@@ -534,6 +534,10 @@ class IterationScope:
             else _positions_at(self.mesh, unit, self.topologies)
         )
 
+    def active_positions(self, unit):
+        """The most positions any mesh in this scope or below it runs at *unit*."""
+        return max((self.mesh_positions(unit), *(c.active_positions(unit) for c in self.children)))
+
     def dependency_trips(self, formals):
         changing = set().union(*(self.provenance.varies(p) for p in formals))
         count, precision = 1, AnalysisPrecision.EXACT

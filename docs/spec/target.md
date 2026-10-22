@@ -213,18 +213,29 @@ class CudaTarget(Target):
     through the corresponding getters. These selections MUST NOT use
     `Target.name`, an exact-concrete-type table, or a second extension
     registration.
-  - CUDA's `ThroughputFacts` MUST publish the whole-device compute and
-    HBM-bandwidth rates and nothing per unit; what one CTA gets through is
-    `PerformanceServiceFacts`.
-  - CUDA's `PerformanceServiceFacts` MUST derive `unit_flops` and global-memory
-    `unit_bandwidth` by dividing each whole-device rate by `device.sm_count`.
-    Shared-memory bandwidth MUST multiply the architecture's byte/clock/SM rate
-    by the device's typed SM clock before projection to the requested unit.
-    CUDA MUST take `unit_ops` from the device document unchanged and MUST name
-    its default unit `cta`; `TopologyLevelFacts.max_physical_units` MUST NOT
-    enter this derivation. `unit_ops` is not a division of a device peak,
-    because no vendor publishes a device-wide integer, predicate, select,
-    special or local-move rate to divide.
+  - CUDA's `ThroughputFacts` and `PerformanceServiceFacts` MUST both read
+    `rates(target, unit, active)`, the one source of CUDA rates: what `active`
+    units of `unit` get through together. A query is a level name or
+    `(level, active, inflight)`. `active` counts only at `cta`, where it MUST be
+    capped at the units the deployment holds; any other level, and a bare level,
+    runs all of its units. `inflight` is the bytes one CTA keeps in flight for
+    the access being priced. `ThroughputFacts` is `rates` itself, the
+    whole deployment when asked about no level; `PerformanceServiceFacts` is
+    `rates` divided by `active`, rounding down. CUDA MUST name its default unit
+    `cta`; `TopologyLevelFacts.max_physical_units` MUST NOT enter this
+    derivation.
+  - `rates` MUST scale each deployment dense-FLOP rate, each service rate
+    (`unit_ops` from the device document, per SM) and the shared-memory
+    bandwidth (the architecture's byte/clock/SM rate times the device's typed SM
+    clock) by `active` over the units the deployment holds. Global-memory
+    bandwidth MUST be the HBM peak and, at `cta` on a device stating
+    `gmem_latency_ns`, no more than `active * inflight / gmem_latency_ns`: by
+    Little's law one CTA with `inflight` bytes outstanding moves at most that
+    many bytes per latency. One 1024-thread CTA with 16 B per thread in flight
+    moves about 46 GB/s on H200, so about 103 CTAs reach its 4.8 TB/s. A device
+    without the fact, or a query without `inflight`, has no cap. `unit_ops` is not a division of a device peak, because no vendor
+    publishes a device-wide integer, predicate, select, special or local-move
+    rate to divide.
   - `topology_limit("cta")` MUST equal `device.sm_count`, and
     `topology_limit("thread")` MUST equal the architecture's corresponding
     structural limit. An unsupported name MUST be refused.
@@ -333,7 +344,7 @@ class CudaArchitecture(Architecture):
     them, and a device MUST NOT restate them.
   - A shared-memory bandwidth stated in byte/clock/SM MUST remain an
     architecture fact. Turning it into byte/s requires the paired device's SM
-    clock and happens only in the `PerformanceServiceFacts` projection.
+    clock and happens only in the CUDA `rates` projection.
   - It MUST NOT carry a compute-throughput rate. A FLOP/s figure depends on the
     clock of one product, so it is a device fact ([§4.2](#42-cudadevice)) even
     though the instruction it rates is the architecture's.
@@ -397,6 +408,7 @@ class CudaDevice(Device):
     l2_capacity_bytes: int | None
     _dense_flops: tuple[tuple[DType, int], ...]
     _service_ops: tuple[tuple[str, int], ...]
+    gmem_latency_ns: int | None = None
 
     def peak_for(self, dtype: DType) -> int: ...
 
@@ -413,6 +425,12 @@ class CudaDevice(Device):
   - It MUST describe how many SMs the product has and how its memory system and
     compute units perform. Per-SM structural limits belong to the architecture
     ([§4.1](#41-cudaarchitecture)).
+  - `gmem_latency_ns` MUST be the device's global-memory load latency in ns,
+    read from the optional leaf `memory.gmem.latency`. It is a cited figure,
+    not a measurement on the described host: H200 records 353 ns from the
+    pointer-chase plateau of the same GH100 die (arXiv 2608.15764), with the
+    cycle counts of two other studies as cross-checks. A document that omits
+    the leaf or records it unavailable states no latency.
   - `sm_clock_hz` MUST be a typed device fact when a per-clock architecture
     rate needs conversion to a per-second service rate. A clock derived from an
     existing peak MUST record that derivation once; other service evidence MUST
@@ -450,6 +468,8 @@ The installed `nvidia.h200_sxm` device document.
     as the architecture it composes with.
   - It MUST record a dense peak for each of `f32`, `f16`, `bf16`, and
     `fp8e4m3`.
+  - `memory.gmem.latency` MUST record 353 ns as a `reference` figure with its
+    source and cross-checks in `conditions`.
   - `throughput.f4e2m1` MUST be recorded unavailable rather than omitted: the
     Hopper tensor cores have no FP4 mode, so the product has no such rate, which
     is a fact about it and not a number nobody published.
@@ -474,6 +494,8 @@ The installed `nvidia.b200_sxm` device document.
     as the architecture it composes with.
   - It MUST record a dense peak for each of `f32`, `f16`, `bf16`, `fp8e4m3`, and
     `f4e2m1`.
+  - `memory.gmem.latency` MUST be recorded unavailable: no cited figure is
+    recorded for this product, so its global-memory rate has no per-CTA cap.
   - Resource facts the vendor does not publish for this product, its SM count
     and its L2 capacity among them, MUST be recorded as measured on the
     described host rather than estimated or borrowed from a related part
@@ -620,7 +642,8 @@ class AppleM2Pro:
     arithmetic. FP16 service MUST divide the documented per-AMX-unit estimate
     across core streams using the AMX unit count and performance-core count.
     Non-FLOP work MUST use the documented per-core lane-event estimate.
-    Global-memory bandwidth MUST be shared across the same core streams.
+    Global-memory bandwidth MUST be shared across the same core streams. AMX
+    reads the level of a `(level, active)` query and ignores `active`.
     Unrecorded DTypes and services MUST remain absent.
 
 
