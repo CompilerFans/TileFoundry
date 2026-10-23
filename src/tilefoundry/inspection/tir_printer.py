@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from tilefoundry.inspection.print_context import TirPrintContext
 from tilefoundry.inspection.printer_base import PythonPrinter
-from tilefoundry.ir.core import Call, Constant, Op, Tuple, Var, get_metadata
+from tilefoundry.ir.core import Call, Constant, Op, Tuple, Var
 from tilefoundry.ir.core.kinds import BinaryKind
 from tilefoundry.ir.core.module import Module, ModuleList
 from tilefoundry.ir.hir.function import Function as HirFunction
@@ -137,7 +137,9 @@ class TirPrinter(PythonPrinter, StmtVisitor[list[str]], ExprVisitor[str]):
                 if value is not None:
                     with self.type_surface(indent=self.indent + "    "):
                         rendered = (
-                            self.layout_surface(value, self.context)
+                            self.layout_surface(
+                                value, self.context, storage=getattr(expr.type, "storage", None)
+                            )
                             if isinstance(value, LayoutBase)
                             else self.print(value, self.context, self.indent + "    ")
                         )
@@ -166,12 +168,12 @@ class TirPrinter(PythonPrinter, StmtVisitor[list[str]], ExprVisitor[str]):
         rendered = self.visit(stmt.value)
         line = f"{self.indent}{self.visit(stmt.var)} = {rendered}"
         if len(line) + 4 <= _LINE_LENGTH or not isinstance(stmt.value, Call):
-            return [line] + self.visit(stmt.body)
+            return [line]
         if isinstance(stmt.value.target, AllocTensor):
             lines = self._wrapped_alloc(stmt)
         else:
             lines = self._wrapped_call(f"{self.visit(stmt.var)} = ", rendered)
-        return lines + self.visit(stmt.body)
+        return lines
 
     def _wrapped_call(self, prefix: str, rendered: str) -> list[str]:
         head, separator, arguments = rendered.partition("(")
@@ -387,9 +389,9 @@ def _definition_lines(fn: PrimFunction, name: str, ctx: TirPrintContext) -> list
         rendered = []
         for param in fn.params:
             type_ = (
-                printer.visit(param.type, ctx)
-                if isinstance(param.type, (TensorType, PointerType))
-                else repr(param.type)
+                printer.visit(param.annotation, ctx)
+                if isinstance(param.annotation, (TensorType, PointerType))
+                else repr(param.annotation)
             )
             if param.is_const and isinstance(param.type, TensorType):
                 type_ = type_.replace("Tensor[", "ConstTensor[", 1)
@@ -411,6 +413,7 @@ def _function_block(
 ) -> list[str]:
     ctx = context or TirPrintContext()
     ctx.valuation = frame
+    ctx.target = fn.target
     target = ctx.use(fn.target.to_python())
     dim_vars = {
         d.name: d
@@ -436,42 +439,15 @@ def _function_block(
     return _RenderedLines(lines, ctx.imports)
 
 
-def tir_function_to_python(fn: PrimFunction, *, options=None) -> str:
+def tir_function_to_python(fn: PrimFunction) -> str:
     lines = _function_block(fn)
     ctx = TirPrintContext()
     ctx.imports.update(lines.imports)
     lines = [*ctx.header(), "", *lines]
-    comments = _function_comments(fn, options)
-    if comments:
-        lines = [*comments, "", *lines]
     return "\n".join(lines) + "\n"
 
 
-def _function_comments(fn: PrimFunction, options) -> list[str]:
-    """Render requested function metadata using the analysis report machinery.
-
-    Import after initialization: analysis_report imports HirPrinter, whose
-    module imports this TIR printer.
-    """
-    if options is None:
-        return []
-    from tilefoundry.analysis.metadata import RegionMemoryMetadata  # noqa: PLC0415
-    from tilefoundry.inspection.analysis_report import (  # noqa: PLC0415
-        memory_summary,
-        render_summary,
-    )
-
-    records = []
-    for metadata_type in options.comment_metadata_types:
-        record = get_metadata(fn, metadata_type)
-        if record is not None:
-            records.extend(
-                memory_summary(record) if isinstance(record, RegionMemoryMetadata) else (record,)
-            )
-    return render_summary(records, opt_in=options.comment_opt_in).splitlines()
-
-
-def _single_module_to_python(mod: Module, module_name: str, names, *, options=None) -> str:
+def _single_module_to_python(mod: Module, module_name: str, names) -> str:
     name = module_name or mod.name
     lines: list[str] = []
     ctx = TirPrintContext()
@@ -508,7 +484,7 @@ def _single_module_to_python(mod: Module, module_name: str, names, *, options=No
             raise TypeError(f"TIR printer cannot serialize {type(fn).__name__}")
         block = _function_block(fn, frame=ValuationContext(mod, fn))
         ctx.imports.update(block.imports)
-        blocks.append([*_function_comments(fn, options), *block])
+        blocks.append(block)
     for index, block in enumerate(blocks):
         if index:
             lines.append("")
@@ -527,7 +503,7 @@ def _single_module_to_python(mod: Module, module_name: str, names, *, options=No
     return "\n".join(header + lines) + "\n"
 
 
-def tir_module_to_python(mod: Module, module_name: str | None = None, *, options=None) -> str:
+def tir_module_to_python(mod: Module, module_name: str | None = None) -> str:
     """Print shared TIR definitions once, with slots referring to those definitions."""
     from .python_printer import (  # noqa: PLC0415 -- printer cycle
         _definition_names,
@@ -539,9 +515,7 @@ def tir_module_to_python(mod: Module, module_name: str | None = None, *, options
     declarations = []
     lines = []
     for node in _module_definition_order(mod):
-        source = _single_module_to_python(
-            node, names[id(node)], names, options=options
-        ).splitlines()
+        source = _single_module_to_python(node, names[id(node)], names).splitlines()
         start = next(index for index, line in enumerate(source) if line.startswith("@module"))
         for line in source[:start]:
             if line.startswith(("from ", "import ")) and line not in (

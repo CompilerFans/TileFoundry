@@ -1,8 +1,3 @@
-# analysis target=nvidia.h200_sxm module=SparseDecode function=gemm topology=cta wave=1/1
-# selection requested=memory executed=memory
-# memory traffic=gmem:r17.00KiB/w16.00KiB@logical,r17.00KiB/w16.00KiB@total,r17.00KiB/w16.00KiB@cta,r17.00KiB/w8.06KiB@thread;rmem:r189.60KiB/w153.52KiB@logical,r189.60KiB/w153.52KiB@total,r189.60KiB/w153.52KiB@cta,r6.54KiB/w2.23KiB@thread;smem:r40.00KiB/w48.00KiB@logical,r40.00KiB/w48.00KiB@total,r40.00KiB/w48.00KiB@cta,r18.75KiB/w48.00KiB@thread footprint=idx:512B;kv:128B;q:128B;v45:151:8.00KiB footprint-precision=exact peak=gmem:72.50KiB;rmem:32.25KiB;smem:16.00KiB persistent=gmem:64.50KiB
-#   buffer=kv holds=264B time=r space=none reuse=7.88KiB fits=yes precision=exact
-
 from __future__ import annotations
 
 from tilefoundry.dsl import *
@@ -47,13 +42,11 @@ def gemm(
                             layout=(1, 64) | Swizzle(3, 4, 3),
                             shape=(1, 64),
                         )
-                        value_2 = T.tensor_view(
-                            T.ptr_of(idx[r:r + 1]), layout=((1,), (0,)), shape=(1,)
-                        )
+                        value_2 = T.tensor_view(T.ptr_of(idx[r:r + 1]), layout=(1,), shape=(1,))
                         T.copy_async(value, value_1, value_2, fill=0)
                         value_3 = T.tensor_view(
                             T.ptr_of(q[0:0 + 1, 1:1 + 1, r + 32:r + 32 + 1, 0:0 + 1]),
-                            layout=((1, 64), (0, 1)),
+                            layout=(1, 64),
                             shape=(1, 64),
                         )
                         qs_2 = T.tensor_view(
@@ -88,23 +81,23 @@ def gemm(
                         "rmem",
                     ]
                 )
-                ii_dst = T.alloc_tensor(tensor_type=Tensor[(64,), "i64", (64,), "rmem"])
+                ii_dst = T.alloc_tensor(tensor_type=Tensor[(64,), "i64", "rmem"])
                 value_5 = T.tensor_view(T.ptr_of(idx), layout=(64,), shape=(64,))
                 value_6 = T.tensor_view(T.ptr_of(ii_dst), layout=(64,), shape=(64,))
                 T.copy(value_5, value_6)
-                ii = T.alloc_tensor(tensor_type=Tensor[(64,), "i64", (64,), "rmem"])
+                ii = T.alloc_tensor(tensor_type=Tensor[(64,), "i64", "rmem"])
                 scalar = T.alloc_tensor(tensor_type=Tensor[(), "i64", "rmem"])
                 T.fill(scalar, 0)
                 T.binary(value_6, scalar, ii, kind=BinaryKind.ADD)
-                value_7 = T.alloc_tensor(tensor_type=Tensor[(64,), "bool", (64,), "rmem"])
+                value_7 = T.alloc_tensor(tensor_type=Tensor[(64,), "bool", "rmem"])
                 scalar_1 = T.alloc_tensor(tensor_type=Tensor[(), "i64", "rmem"])
                 T.fill(scalar_1, 0)
                 T.binary(ii, scalar_1, value_7, kind=BinaryKind.GE)
-                value_8 = T.alloc_tensor(tensor_type=Tensor[(64,), "bool", (64,), "rmem"])
+                value_8 = T.alloc_tensor(tensor_type=Tensor[(64,), "bool", "rmem"])
                 scalar_2 = T.alloc_tensor(tensor_type=Tensor[(), "i64", "rmem"])
                 T.fill(scalar_2, 256)
                 T.binary(ii, scalar_2, value_8, kind=BinaryKind.LT)
-                live = T.alloc_tensor(tensor_type=Tensor[(64,), "bool", (64,), "rmem"])
+                live = T.alloc_tensor(tensor_type=Tensor[(64,), "bool", "rmem"])
                 T.binary(value_7, value_8, live, kind=BinaryKind.AND)
                 s = T.alloc_tensor(
                     tensor_type=Tensor[
@@ -216,9 +209,7 @@ def gemm(
                 )
                 scalar_3 = T.alloc_tensor(tensor_type=Tensor[(), "f32", "rmem"])
                 T.fill(scalar_3, -1e999)
-                value_11 = T.tensor_view(
-                    T.ptr_of(live), layout=((1, 64), (0, 1)), shape=(1, 64)
-                )
+                value_11 = T.tensor_view(T.ptr_of(live), layout=(1, 64), shape=(1, 64))
                 value_12 = T.tensor_view(
                     T.ptr_of(s),
                     layout=((4 @ scope_3.d0, 2, 8 @ scope_3.d1, 8, 4 @ scope_3.d2, 2), (16, 8, 1, 512, 128, 64)),
@@ -307,12 +298,12 @@ def gemm(
                             )
                             value_17 = T.tensor_view(
                                 T.ptr_of(ks_4),
-                                layout=Layout(((4, 2, 8), (1, 64)), ((1024, 512, 64), (1024, 1))) | Swizzle(3, 4, 3),
+                                layout=Layout(((4, 2, 8), (1, 64)), ((1024, 512, 64), (0, 1))) | Swizzle(3, 4, 3),
                                 shape=(64, 64),
                             )
                             rhs_view_4 = T.tensor_view(
                                 T.ptr_of(value_17[o_k_1:o_k_1 + 16, o_n_1:o_n_1 + 64]),
-                                layout=(Layout(((2, 8), (1, 64)), ((512, 64), (1024, 1))) | Swizzle(3, 4, 3)) @ {B()},
+                                layout=(Layout(((2, 8), (1, 64)), ((512, 64), (0, 1))) | Swizzle(3, 4, 3)) @ {B()},
                                 shape=(16, 64),
                             )
                             T.tiled_mma(

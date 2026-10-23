@@ -32,7 +32,9 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     new_layout = x_ty.layout
     if shard_layout_of(x_ty.layout) is not None:
         relation = relations_of(call, ctx)
-        derived = derive_output_shard_layout((x_ty,), relation, x_ty.shape)
+        derived = derive_output_shard_layout(
+            (x_ty,), relation, x_ty.shape, ctx=ctx, storage=x_ty.storage
+        )
         if derived is not None:
             new_layout = derived
     return TensorType(

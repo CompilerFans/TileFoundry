@@ -27,6 +27,50 @@ from .stride import compact_col_major
 from .swizzle_layout import get_swizzle_portion
 
 
+def slice(coord, layout):
+    """CuTe slice: keep underscore modes and remove coordinates that are given."""
+    if isinstance(layout, ComposedLayout):
+        return slice_and_offset(coord, layout)[0]
+    if isinstance(layout, Layout):
+        return Layout(slice(coord, layout.shape), slice(coord, layout.strides))
+    if coord is None:
+        return layout
+    if isinstance(coord, tuple):
+        return tuple(
+            value
+            for c, mode in zip(coord, layout, strict=True)
+            for value in ((mode,) if c is None else slice(c, mode))
+        )
+    return ()
+
+
+def slice_and_offset(coord, layout):
+    """CuTe slice_and_offset; composed offsets stay inside their mapping."""
+    from .stride import crd2idx  # noqa: PLC0415
+
+    if isinstance(layout, ComposedLayout):
+        sliced, offset = slice_and_offset(coord, layout.outer)
+        return ComposedLayout(layout.inner, layout.offset + offset, sliced), 0
+    return slice(coord, layout), crd2idx(coord, layout.shape, layout.strides)
+
+
+def domain_offset(coord, layout, shape):
+    """CuTe domain_offset: move the pointer, or a composed layout's offset."""
+    from tilefoundry.ir.isl_interop import normalize_dim  # noqa: PLC0415
+
+    from .int_tuple import compatible_profile  # noqa: PLC0415
+    from .layout import flatten, unflatten  # noqa: PLC0415
+    from .shard_layout import ShardLayout  # noqa: PLC0415
+    from .stride import crd2idx  # noqa: PLC0415
+
+    if isinstance(layout, ComposedLayout):
+        _, offset = domain_offset(coord, layout.outer, shape)
+        return ComposedLayout(layout.inner, normalize_dim(layout.offset + offset), layout.outer), 0
+    primitive = layout.layout if isinstance(layout, ShardLayout) else layout
+    grouped = unflatten(flatten(primitive), compatible_profile(primitive.shape, shape))
+    return layout, crd2idx(tuple(coord), grouped.shape, grouped.strides)
+
+
 def cosize(layout: Union[Layout, ComposedLayout]) -> int:
     """The codomain extent.
 
@@ -87,8 +131,6 @@ def _coalesce_profile(
         return filter(layout, major=major) if filtered else _coalesce_flat(layout, major=major)
 
     strides = layout.strides
-    if strides is None:
-        strides = compact_col_major(layout.shape)
     if not isinstance(strides, tuple) or len(layout.shape) != len(strides):
         raise ValueError(
             f"coalesce: layout shape has {len(layout.shape)} modes at "
@@ -307,10 +349,7 @@ def _make_layout(*layouts: Layout) -> Layout:
 
     return Layout(
         shape=tuple(mode(layout.shape) for layout in layouts),
-        strides=tuple(
-            mode(layout.strides if layout.strides is not None else compact_col_major(layout.shape))
-            for layout in layouts
-        ),
+        strides=tuple(mode(layout.strides) for layout in layouts),
     )
 
 
@@ -356,7 +395,7 @@ def _compose_layout(left: Layout, right, *, major: str) -> Layout:
             *(get(left, index) for index in range(len(right), len(left.shape))),
         )
     if isinstance(right, Layout):
-        strides = right.strides if right.strides is not None else compact_col_major(right.shape)
+        strides = right.strides
         if len(right.shape) == 1 and not isinstance(right.shape[0], tuple):
             return _compose_mode(left, right.shape[0], strides[0], major=major)
         return _make_layout(
@@ -370,10 +409,9 @@ def _compose_layout(left: Layout, right, *, major: str) -> Layout:
 def composition(left, right, offset: int = 0, *, major: str = "col"):
     """CuTe ``composition``, dispatched to the supported overloads.
 
-    The general Layout overload has no consumers in this round. Future
-    consumers include ``utils._inner_layout`` and ``utils.tile_view_layout``;
-    their currently pre-grouped tiles require a separate refactor. ``offset``
-    belongs to the existing swizzle overload.
+    Slice composes logical-axis windows with this overload. Instruction tile
+    views still use their pre-grouped representation. ``offset`` belongs to
+    the existing swizzle overload.
     """
     if swizzle_layout.supports_composition(left, right):
         return swizzle_layout.composition(left, right, offset)
@@ -387,9 +425,8 @@ def composition(left, right, offset: int = 0, *, major: str = "col"):
 def logical_divide(layout: Layout, tile, *, major: str = "col") -> Layout:
     """CuTe ``logical_divide``: compose the integer tile and its complement.
 
-    No consumers are connected in this round. ``utils._inner_layout`` and
-    ``utils.tile_view_layout`` are future consumers after their pre-grouped
-    tile representation is refactored. Symbolic tiles are unsupported.
+    Instruction tile views remain future consumers after their pre-grouped
+    representation is refactored. Symbolic tiles are unsupported.
     """
     if tile is None:
         return layout
@@ -415,9 +452,8 @@ def logical_divide(layout: Layout, tile, *, major: str = "col") -> Layout:
 def zipped_divide(layout: Layout, tile, *, major: str = "col") -> Layout:
     """CuTe ``zipped_divide``: gather the divided tile and remainder modes.
 
-    No consumers are connected in this round. ``utils._inner_layout`` and
-    ``utils.tile_view_layout`` are future consumers after their pre-grouped
-    tile representation is refactored. Symbolic tiles are unsupported.
+    Instruction tile views remain future consumers after their pre-grouped
+    representation is refactored. Symbolic tiles are unsupported.
     """
     if tile is None:
         return _make_layout(Layout((1,), (0,)), layout)
@@ -479,6 +515,9 @@ def right_inverse(layout: Union[Layout, ComposedLayout, Swizzle]):
 
 __all__ = [
     "composition",
+    "domain_offset",
+    "slice",
+    "slice_and_offset",
     "cosize",
     "coalesce",
     "filter",

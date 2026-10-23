@@ -426,6 +426,7 @@ def values_in_region(
     exited_at: int,
     facts: MemoryHierarchyFacts,
     topology_names: tuple[str, ...],
+    owners,
 ) -> tuple[ValueLifetime, ...]:
     """Resident values whose lifetimes and ownership intersect one mesh region.
 
@@ -449,8 +450,9 @@ def values_in_region(
             raise AnalysisError(f"memory: level {lifetime.memory_level!r} has no declared owner")
         if declared.owner == TARGET_MEMORY_OWNER:
             continue
-        owner_position = positions.get(declared.owner)
-        if owner_position is None:
+        try:
+            private = owners.private(lifetime.memory_level, topology_names[outermost_region])
+        except ValueError:
             raise AnalysisError(
                 f"memory: level {lifetime.memory_level!r} owner {declared.owner!r} "
                 f"is not a declared topology in {topology_names}"
@@ -460,7 +462,7 @@ def values_in_region(
             if not entered_at < lifetime.defined_at < exited_at:
                 continue
         else:
-            if outermost_region > owner_position:
+            if not private:
                 continue
             layout = shard_layout_of(getattr(held, "layout", None))
             if layout is None or not held_in_region(participant_layout(layout).mesh, region.mesh):
@@ -540,7 +542,9 @@ def analyze_memory(function: Function, context: AnalyzeContext) -> None:
     for level in facts.explicit_levels:
         if not level.owner:
             raise AnalysisError(f"memory: level {level.name!r} has no declared owner")
-        if level.owner != TARGET_MEMORY_OWNER and level.owner not in owner_topologies:
+        try:
+            context.target.storage_owners
+        except ValueError:
             raise AnalysisError(
                 f"memory: level {level.name!r} owner {level.owner!r} is not a "
                 f"target topology in {owner_topologies}"
@@ -755,7 +759,13 @@ def _place(model, facts, topologies):
     names = tuple(level.name for level in model.context.target.get_facts(TopologyFacts).topologies)
     for window in model.liveness.regions:
         resident = values_in_region(
-            tuple(model.windows), window.region, window.entered_at, window.exited_at, facts, names
+            tuple(model.windows),
+            window.region,
+            window.entered_at,
+            window.exited_at,
+            facts,
+            names,
+            model.context.target.storage_owners,
         )
         levels = _resident_peaks(
             model, resident, offsets, facts, sizes, interval=(window.entered_at, window.exited_at)

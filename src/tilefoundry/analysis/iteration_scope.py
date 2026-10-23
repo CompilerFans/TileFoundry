@@ -311,7 +311,7 @@ class AccessAnalysis:
         if key not in cache:
             values = {}
             scope = self.scope.caller_scope if caller else self.scope
-            term = AccessRelation.affine(value, scope, values=values)
+            term = AccessRelation.affine_of(value, scope, values=values)
             cache[key] = (value, term, values)
         return cache[key][1:]
 
@@ -593,7 +593,9 @@ class IterationScope:
             except (ArithmeticError, TypeError, ValueError):
                 bounds = None
             if bounds is None:
-                refuse_runtime_bound(owner, "extent")
+                refuse_runtime_bound(
+                    owner, "extent" if static_dim_value(owner.extent) is None else "start"
+                )
             widest = bounds[1] - 1
             if bounds[1] - bounds[0] > 1:
                 precision = AnalysisPrecision.UPPER_BOUND

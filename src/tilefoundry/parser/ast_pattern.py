@@ -44,11 +44,13 @@ from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
 from tilefoundry.ir.hir.sharding.reshard import Reshard
 from tilefoundry.ir.hir.specialize import DISPLAY_NAME
 from tilefoundry.ir.hir.tensor.arange import Arange
+from tilefoundry.ir.hir.tensor.bitcast import Bitcast
 from tilefoundry.ir.hir.tensor.reshape import Reshape
 from tilefoundry.ir.hir.tensor.slice import Slice, slice_size
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.isl_interop import normalize_dim
 from tilefoundry.ir.pattern import RangePattern
+from tilefoundry.ir.tir.memory.tensor_view import TensorView
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.shape import ShapeOf
 from tilefoundry.ir.tir.stmts import (
@@ -76,7 +78,7 @@ from tilefoundry.ir.types import (
     TupleType,
     UnitType,
 )
-from tilefoundry.ir.types.callable_type import CallableType
+from tilefoundry.ir.types.callable_type import CallableType, bind_annotation
 from tilefoundry.ir.types.dim import (
     DimAdd,
     DimFloorDiv,
@@ -89,14 +91,13 @@ from tilefoundry.ir.types.dim import (
 )
 from tilefoundry.ir.types.layout import LayoutBase
 from tilefoundry.ir.types.mesh import make_mesh
-from tilefoundry.ir.types.shard_layout import canonical_shard_layout
 from tilefoundry.ir.types.storage import StorageKind, resolve_storage
 from tilefoundry.ir.types.stride import compact_row_major
 from tilefoundry.ir.types.utils import static_dim_value
 from tilefoundry.ir.visitor import BindingSubstitutionCloner
 from tilefoundry.target import MemoryHierarchyFacts, Target, UnsupportedCapabilityError
 from tilefoundry.visitor_registry.contexts import TypeInferContext, ValuationContext
-from tilefoundry.visitor_registry.typeinfer import TypeInferVisitor, inference_type
+from tilefoundry.visitor_registry.typeinfer import TypeInferVisitor, infer_function
 
 T = TypeVar("T")
 _TYPE_INFER_CONTEXT = "<type_infer_context>"
@@ -282,6 +283,8 @@ runtime = SimpleNamespace(
     OpSchema=OpSchema,
     PrimFunction=PrimFunction,
     Reshard=Reshard,
+    TensorView=TensorView,
+    Bitcast=Bitcast,
     Reshape=Reshape,
     Return=Return,
     Sequential=Sequential,
@@ -296,6 +299,7 @@ runtime = SimpleNamespace(
     TypeInferContext=TypeInferContext,
     ValuationContext=ValuationContext,
     TypeInferVisitor=TypeInferVisitor,
+    bind_annotation=bind_annotation,
     TupleGetItem=TupleGetItem,
     Unary=Unary,
     UnaryKind=UnaryKind,
@@ -303,7 +307,6 @@ runtime = SimpleNamespace(
     Var=Var,
     DISPLAY_NAME=DISPLAY_NAME,
     compact_row_major=compact_row_major,
-    canonical_shard_layout=canonical_shard_layout,
     make_mesh=make_mesh,
     dim_expr=dim_expr,
     normalize_dim=normalize_dim,
@@ -1219,12 +1222,11 @@ class ModuleBuildContext:
 
         for function in functions:
             if isinstance(function, runtime.Function):
-                verify_function(function, module=result)
-                inference_type(
+                infer_function(
                     function,
                     runtime.TypeInferContext(module=result, function=function),
-                    ranges=True,
                 )
+                verify_function(function, module=result)
             elif isinstance(function, runtime.PrimFunction):
                 verify_prim_function(function, module_fns=result)
         return result
@@ -1519,7 +1521,14 @@ def parse_node(pattern: AstPattern[T], node: ast.AST, context: MatchContext) -> 
             situation=child.situation,
             role=child.role,
             binding_name=binding_name,
-            values=child.values,
+            values={
+                **child.values,
+                **(
+                    matched.pattern.child_values(matched, child, children, active_context)
+                    if hasattr(matched.pattern, "child_values")
+                    else {}
+                ),
+            },
             lexical_bindings=child.lexical_bindings,
             isolated_scope=child.isolated_scope,
             function=child.function_context,

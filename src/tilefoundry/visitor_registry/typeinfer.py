@@ -15,14 +15,15 @@ from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
+from tilefoundry.ir.isl_interop import dim_range
 from tilefoundry.ir.tir.shape import ShapeOf
-from tilefoundry.ir.types.callable_type import callable_type_for
+from tilefoundry.ir.types.callable_type import bind_annotation, callable_type_for
 from tilefoundry.ir.types.dim import DimVar
 from tilefoundry.ir.types.dtype import IntegerDType
-from tilefoundry.ir.types.layout_correspondence import layout_correspondence
+from tilefoundry.ir.types.int_tuple import compatible_profile
 from tilefoundry.ir.types.substitute import canonicalize_dims
 from tilefoundry.ir.types.tensor_type import TensorType, TupleType, Type
-from tilefoundry.ir.types.utils import tensor_types, types_compatible
+from tilefoundry.ir.types.utils import static_dim_value, tensor_types, types_compatible
 from tilefoundry.ir.visitor import expr_children
 from tilefoundry.visitor_registry.valuation import ValuationVisitor
 
@@ -70,11 +71,9 @@ def _check_module_index(slot: ModuleList, index=MISSING, *, index_type=None):
 
 def _require_axis_groups(node, type_, ctx):
     for tensor in tensor_types(type_):
-        if tensor.layout is not None and tensor != TensorType.umat_tensor(
-            tensor.shape, tensor.dtype
-        ):
+        if tensor.layout is not None:
             try:
-                layout_correspondence(tensor.layout.shape, tensor.shape).tensor_axes()
+                compatible_profile(tensor.layout.shape, tensor.shape)
             except ValueError as error:
                 ctx.error(node, str(error))
 
@@ -139,7 +138,7 @@ class TypeInferVisitor(ValuationVisitor[Type]):
             attach_metadata(expr, RangeMetadata(*results.value_range))
 
     def visit_leaf_Var(self, var: Var, _operands, ctx: TypeInferContext) -> Type:
-        return var.annotation
+        return var.type
 
     def visit_leaf_Constant(self, c: Constant, _operands, ctx: TypeInferContext) -> Type:
         return c.type
@@ -208,7 +207,7 @@ class TypeInferVisitor(ValuationVisitor[Type]):
         memo = {}
         for param in callee.params:
             if child and param.is_const:
-                memo[id(param)] = (param, param.annotation)
+                memo[id(param)] = (param, param.type)
                 continue
             index, arg_type = next(given)
             declared = param.annotation
@@ -297,7 +296,24 @@ class TypeInferVisitor(ValuationVisitor[Type]):
                 f"{len(region.params)} params",
             )
         memo = self._region_memo(region, ctx)
-        memo[id(region.induction_var)] = (region.induction_var, region.induction_var.annotation)
+        induction_type = region.induction_var.type
+        memo[id(region.induction_var)] = (region.induction_var, induction_type)
+        if self._owns_body:
+            region.induction_var.type = induction_type
+        if self._ranges:
+            step = static_dim_value(region.step)
+            bounds = None
+            if step is not None and step > 0:
+                try:
+                    start, stop = dim_range(region.start), dim_range(region.extent)
+                    if start is not None and stop is not None and start[0] < stop[1] - 1:
+                        bounds = (start[0], stop[1] - 1)
+                except (NotImplementedError, ArithmeticError, TypeError, ValueError):
+                    bounds = None
+            self._record_range(
+                region.induction_var,
+                TypeInferResults(induction_type, value_range=bounds),
+            )
         inner = TypeInferVisitor(
             memo=memo,
             owns_body=self._owns_body,
@@ -329,7 +345,11 @@ class TypeInferVisitor(ValuationVisitor[Type]):
         produced, and what one unit costs is cost's question.
         """
         memo = self._region_memo(expr, ctx)
-        inner = TypeInferVisitor(memo=memo, owns_body=self._owns_body, ranges=self._ranges)
+        inner = TypeInferVisitor(
+            memo=memo,
+            owns_body=self._owns_body,
+            ranges=self._ranges,
+        )
         return inner.visit(expr.body, replace(ctx.enter_region(expr), memo=memo))
 
     def visit_Function(self, fn: Function, ctx: TypeInferContext) -> Type:
@@ -339,7 +359,15 @@ class TypeInferVisitor(ValuationVisitor[Type]):
             ctx = replace(ctx, function=fn)
         for param in fn.params:
             _require_axis_groups(param, param.annotation, ctx)
-        memo = {id(param): (param, param.annotation) for param in fn.params}
+        memo = {
+            id(param): ctx.memo[id(param)]
+            if id(param) in ctx.memo
+            else (param, bind_annotation(param.type))
+            for param in fn.params
+        }
+        if self._owns_body:
+            for param in fn.params:
+                param.type = memo[id(param)][1]
         if fn.body is not None:
             TypeInferVisitor(
                 memo=memo,
@@ -365,6 +393,15 @@ class TypeInferVisitor(ValuationVisitor[Type]):
         ctx.error(expr, f"no typeinfer rule for Expr subclass {type(expr).__name__}")
 
 
+def infer_function(fn: Function, ctx: TypeInferContext) -> Function:
+    """Refresh a standalone function's values and inferred result signature."""
+    TypeInferVisitor(ranges=True).visit(fn, ctx)
+    if fn.body is not None:
+        fn.return_type = fn.body.type
+    fn.type = callable_type_for(fn.params, fn.return_type)
+    return fn
+
+
 def inference_type(
     expr: Expr,
     ctx: TypeInferContext | None = None,
@@ -380,4 +417,5 @@ def inference_type(
 __all__ = [
     "TypeInferVisitor",
     "inference_type",
+    "infer_function",
 ]

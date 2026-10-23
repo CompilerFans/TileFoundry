@@ -1,7 +1,3 @@
-# analysis target=nvidia.h200_sxm module=FP8_BLOCK_SCALED_GEMM function=gemm topology=cta wave=1/1
-# selection requested=memory executed=memory
-# memory traffic=gmem:r130.02KiB/w64.00KiB@logical,r130.02KiB/w64.00KiB@total,r130.02KiB/w64.00KiB@cta,r128.05KiB/w32.12KiB@thread;rmem:r1.35MiB/w1.16MiB@logical,r1.35MiB/w1.35MiB@total,r1.35MiB/w1.35MiB@cta,r5.17KiB/w4.92KiB@thread;smem:r128.00KiB/w128.00KiB@logical,r128.00KiB/w128.00KiB@total,r128.00KiB/w128.00KiB@cta,r17.00KiB/w128.00KiB@thread footprint=a:16.00KiB;a_scale:512B;b:16.00KiB;b_scale:4B;v24:110:32.00KiB footprint-precision=exact peak=gmem:162.02KiB;rmem:128.50KiB;smem:64.00KiB persistent=gmem:130.02KiB
-
 from __future__ import annotations
 
 from tilefoundry.dsl import *
@@ -188,13 +184,9 @@ def gemm(
                         shape=(128, 128),
                     )
                     T.binary(value_9, value_7, value_8, kind=BinaryKind.MUL)
-                    tile_scale_dst = T.alloc_tensor(
-                        tensor_type=Tensor[(1, 1), "f32", (1, 1), "rmem"]
-                    )
+                    tile_scale_dst = T.alloc_tensor(tensor_type=Tensor[(1, 1), "f32", "rmem"])
                     value_10 = T.tensor_view(
-                        T.ptr_of(b_scale[kb:kb + 1, 0:0 + 1]),
-                        layout=((1, 1), (0, 0)),
-                        shape=(1, 1),
+                        T.ptr_of(b_scale[kb:kb + 1, 0:0 + 1]), layout=(1, 1), shape=(1, 1)
                     )
                     value_11 = T.tensor_view(
                         T.ptr_of(tile_scale_dst), layout=(1, 1), shape=(1, 1)

@@ -5,9 +5,9 @@ from __future__ import annotations
 import dataclasses
 from typing import TypeVar
 
-FactsT = TypeVar("FactsT")
+from tilefoundry.ir.types.storage import TARGET_MEMORY_OWNER
 
-TARGET_MEMORY_OWNER = "target"
+FactsT = TypeVar("FactsT")
 
 
 @dataclasses.dataclass(frozen=True)

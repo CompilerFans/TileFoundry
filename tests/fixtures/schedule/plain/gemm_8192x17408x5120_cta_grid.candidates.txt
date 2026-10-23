@@ -10,11 +10,15 @@ target nvidia.h200_sxm
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout((*execution_shape,), (*execution_strides,))))
     refused     T.copy_async_tensor
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((*_, 32),), ((*_, 1),))))
+    refused     T.copy_reduce_async_tensor
+                  mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((*_, 32),), ((*_, 1),))))
     refused     T.copy
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout((*execution_shape,), (*execution_strides,))))
     refused     T.ldmatrix
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((4, 8),), ((1, 4),))))
-  bt:33  tf.reshard  per cta  x=Tensor[(64, 17408), "bf16", (64, 17408)]  result=Tensor[(64, 17408), "bf16",
+    refused     T.stmatrix
+                  mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((*g, 8, 4),), ((*gs, 4, 1),))))
+  bt:33  tf.reshard  per cta  x=Tensor[(64, 17408), "bf16"]  result=Tensor[(64, 17408), "bf16",
     ShardLayout(
         layout=Layout((64, 68, 256), (256, 0, 1)),
         attrs=(B(), S(1)),
@@ -24,10 +28,14 @@ target nvidia.h200_sxm
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout((*execution_shape,), (*execution_strides,))))
     refused     T.copy_async_tensor
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((*_, 32),), ((*_, 1),))))
+    refused     T.copy_reduce_async_tensor
+                  mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((*_, 32),), ((*_, 1),))))
     refused     T.copy
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout((*execution_shape,), (*execution_strides,))))
     refused     T.ldmatrix
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((4, 8),), ((1, 4),))))
+    refused     T.stmatrix
+                  mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((*g, 8, 4),), ((*gs, 4, 1),))))
   part:34  tf.matmul  per cta  lhs=Tensor[(8192, 64), "bf16",
     ShardLayout(
         layout=Layout((64, 128, 64), (0, 64, 1)),
@@ -40,7 +48,7 @@ target nvidia.h200_sxm
         mesh=Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")),
     ), "smem"]  result=Tensor[(8192, 17408), "f32",
     ShardLayout(
-        layout=Layout((64, 128, 68, 256), (2228224, 17408, 256, 1)),
+        layout=Layout((64, 128, 68, 256), (0, 256, 0, 1)),
         attrs=(S(0), S(2)),
         mesh=Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")),
     ), "rmem"]
@@ -52,17 +60,17 @@ target nvidia.h200_sxm
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((*g, 4, 8),), ((*gs, 1, 4),))))
   acc:35  tf.binary  per cta  lhs=Tensor[(8192, 17408), "f32",
     ShardLayout(
-        layout=Layout((64, 128, 68, 256), None),
+        layout=Layout((64, 128, 68, 256), (0, 256, 0, 1)),
         attrs=(S(0), S(2)),
         mesh=Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")),
     ), "rmem"]  rhs=Tensor[(8192, 17408), "f32",
     ShardLayout(
-        layout=Layout((64, 128, 68, 256), (2228224, 17408, 256, 1)),
+        layout=Layout((64, 128, 68, 256), (0, 256, 0, 1)),
         attrs=(S(0), S(2)),
         mesh=Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")),
     ), "rmem"]  result=Tensor[(8192, 17408), "f32",
     ShardLayout(
-        layout=Layout((64, 128, 68, 256), (2228224, 17408, 256, 1)),
+        layout=Layout((64, 128, 68, 256), (0, 256, 0, 1)),
         attrs=(S(0), S(2)),
         mesh=Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")),
     ), "rmem"]
@@ -70,12 +78,12 @@ target nvidia.h200_sxm
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout((*execution_shape,), (*execution_strides,))))
   <value>:36  tf.cast  per cta  x=Tensor[(8192, 17408), "f32",
     ShardLayout(
-        layout=Layout((64, 128, 68, 256), None),
+        layout=Layout((64, 128, 68, 256), (0, 256, 0, 1)),
         attrs=(S(0), S(2)),
         mesh=Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")),
     ), "rmem"]  result=Tensor[(8192, 17408), "bf16",
     ShardLayout(
-        layout=Layout((64, 128, 68, 256), None),
+        layout=Layout((64, 128, 68, 256), (0, 256, 0, 1)),
         attrs=(S(0), S(2)),
         mesh=Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")),
     ), "rmem"]
@@ -83,15 +91,19 @@ target nvidia.h200_sxm
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout((*execution_shape,), (*execution_strides,))))
   <value>:36  tf.reshard  per cta  x=Tensor[(8192, 17408), "bf16",
     ShardLayout(
-        layout=Layout((64, 128, 68, 256), None),
+        layout=Layout((64, 128, 68, 256), (0, 256, 0, 1)),
         attrs=(S(0), S(2)),
         mesh=Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")),
-    ), "rmem"]  result=Tensor[(8192, 17408), "bf16", (8192, 17408)]
+    ), "rmem"]  result=Tensor[(8192, 17408), "bf16"]
     refused     T.copy_async
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout((*execution_shape,), (*execution_strides,))))
     refused     T.copy_async_tensor
+                  mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((*_, 32),), ((*_, 1),))))
+    refused     T.copy_reduce_async_tensor
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((*_, 32),), ((*_, 1),))))
     refused     T.copy
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout((*execution_shape,), (*execution_strides,))))
     refused     T.ldmatrix
                   mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((4, 8),), ((1, 4),))))
+    refused     T.stmatrix
+                  mesh: Mesh((Topology("cta", 4352),), layout=(64, 68), names=("bm", "bn")) does not match Mesh(('thread',), ComposedLayout(None, p0, Layout(((*g, 8, 4),), ((*gs, 4, 1),))))

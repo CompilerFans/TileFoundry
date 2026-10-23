@@ -20,8 +20,6 @@ from tilefoundry.analysis import MemoryMetadata, analyze
 from tilefoundry.analysis.access import AliasKind, buffer_alias, forwarded_leaves
 from tilefoundry.analysis.allocation import AllocationSummaryMetadata
 from tilefoundry.analysis.check import check_program
-from tilefoundry.inspection.analysis_report import render_analysis
-from tilefoundry.inspection.values import ReportIdentity, ReportSelection
 from tilefoundry.ir.core import (
     BindingMetadata,
     Call,
@@ -30,7 +28,6 @@ from tilefoundry.ir.core import (
     SourceSpanMetadata,
     Tuple,
     Var,
-    attach_metadata,
     get_metadata,
     op_identifier,
 )
@@ -42,24 +39,26 @@ from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.math.binary import Binary as HirBinary
 from tilefoundry.ir.hir.mesh_region import MeshRegion
-from tilefoundry.ir.hir.schedule import ScheduleOp, operand_relations
+from tilefoundry.ir.hir.schedule import ScheduleOp
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
 from tilefoundry.ir.hir.specialize import origin_of
 from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
-from tilefoundry.ir.isl_interop import isl_to_dim
+from tilefoundry.ir.isl_interop import isl_to_dim, layout_to_isl_map
 from tilefoundry.ir.tir.arith import Binary as TirBinary
-from tilefoundry.ir.tir.async_copy import CopyAsync, is_indexed_copy
 from tilefoundry.ir.tir.memory import AllocTensor, Copy, Fill, PtrOf, TensorView
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Evaluate, For, LetStmt, MeshScope, Sequential
 from tilefoundry.ir.types import (
+    Broadcast,
     ComposedLayout,
     DType,
     Layout,
     Mesh,
+    Partial,
     PointerType,
     ShardLayout,
+    Split,
     StorageKind,
     Swizzle,
     TensorType,
@@ -74,12 +73,15 @@ from tilefoundry.ir.types.dim import (
     is_dim_op_call,
     simplify_dim,
 )
-from tilefoundry.ir.types.layout import flatten, resolve_layout
+from tilefoundry.ir.types.int_tuple import flatten as flatten_tuple
+from tilefoundry.ir.types.layout import flatten
+from tilefoundry.ir.types.layout import get as get_layout
 from tilefoundry.ir.types.layout_algebra import composition
-from tilefoundry.ir.types.layout_correspondence import layout_correspondence
-from tilefoundry.ir.types.shard_layout import shard_layout_of, split_target_axes
-from tilefoundry.ir.types.stride import compact_row_major
+from tilefoundry.ir.types.mesh import axis_keys
+from tilefoundry.ir.types.shard_layout import local_layout, shard_layout_of, split_target_axes
+from tilefoundry.ir.types.stride import compact_row_major, crd2idx
 from tilefoundry.ir.types.utils import (
+    _participant_frame,
     i64_const,
     leaves_of,
     participant_layout,
@@ -93,7 +95,6 @@ from tilefoundry.visitor_registry.access_relation import (
     affine_term,
     identity_access,
     leaf_paths,
-    projected_axes,
     relations_of,
 )
 from tilefoundry.visitor_registry.buffer_alias import aliased_operand
@@ -161,20 +162,16 @@ class TirBuilder:
         return var
 
     def build(self, region=None):
-        body = ()
-        for entry in reversed((region or self.blocks[-1]).entries):
-            body = (
-                (LetStmt(*entry, Sequential(body)),) if isinstance(entry, tuple) else (entry, *body)
-            )
-        return Sequential(body)
+        return Sequential(tuple(
+            LetStmt(*entry) if isinstance(entry, tuple) else entry
+            for entry in (region or self.blocks[-1]).entries
+        ))
 
     @contextmanager
     def region(self, *, owner=None, mesh=None, binding=None, loop=None):
         if mesh is not None and owner is None:
             current = self.blocks[-1].mesh
-            if current is not None and replace(
-                current, layout=resolve_layout(current.layout)
-            ) == replace(mesh, layout=resolve_layout(mesh.layout)):
+            if current is not None and current == mesh:
                 mesh = None
         if mesh is not None or loop is not None:
             region = TirScope(mesh if mesh is not None else self.blocks[-1].mesh, owner)
@@ -260,15 +257,17 @@ class TirBuilder:
                 elements = prod(tuple(storage_type.shape))
                 scratch = Var(
                     ctx.names.fresh("scratch"),
-                    type=TensorType((elements,), storage_type.dtype, None, StorageKind.GMEM),
+                    type=TensorType(
+                        (elements,),
+                        storage_type.dtype,
+                        Layout((elements,)),
+                        StorageKind.GMEM,
+                    ),
                 )
                 ctx.scratch.append(scratch)
                 storage_type = replace(
                     storage_type,
-                    layout=Layout(
-                        tuple(storage_type.shape),
-                        tuple(compact_row_major(tuple(storage_type.shape))),
-                    ),
+                    layout=Layout(tuple(storage_type.shape)),
                 )
                 view = View(scratch, (i64_const(0),), (elements,), storage_type, stem)
                 return view
@@ -808,7 +807,16 @@ class StoragePlan:
                 windows.append(current)
             current = answer.partner
 
-    def operand(self, value, desired, *, starts=None, sizes=None, stem="tile", whole_tensor=False):
+    def operand(
+        self,
+        value,
+        desired,
+        *,
+        starts=None,
+        sizes=None,
+        stem="tile",
+        whole_tensor=False,
+    ):
         """Choose an existing operand or the window required at its use."""
         held = value.type
         if not isinstance(held, TensorType):
@@ -820,7 +828,6 @@ class StoragePlan:
         ):
             starts = None
         if starts is None:
-            comparable = replace(desired, layout=resolve_layout(desired.layout, desired.shape))
             actual = (
                 held
                 if whole_tensor
@@ -828,8 +835,7 @@ class StoragePlan:
                 if isinstance(held.layout, ShardLayout)
                 else held
             )
-            actual = replace(actual, layout=resolve_layout(actual.layout, actual.shape))
-            if actual == comparable or (
+            if actual == desired or (
                 not whole_tensor
                 and not isinstance(desired.layout, ShardLayout)
                 and held.shape == desired.shape
@@ -850,15 +856,15 @@ class StoragePlan:
             raise LoweringError(
                 f"a rank-{len(held.shape)} buffer is windowed by {len(view.starts)} starts"
             )
-        if desired.layout is None:
-            desired = replace(desired, layout=resolve_layout(None, desired.shape))
         source = base
         if not view.whole_tensor:
             keys = Tuple(view.starts, type=TupleType(tuple(start.type for start in view.starts)))
             source = Call(
                 Slice(sizes=tuple(view.sizes), strides=(1,) * len(view.sizes)),
                 (base, keys),
-                type=TensorType(tuple(view.sizes), held.dtype, None, held.storage),
+                type=TensorType(
+                    tuple(view.sizes), held.dtype, Layout(tuple(view.sizes)), held.storage
+                ),
             )
             inferred = typeinfer_registry.lookup(Slice)(
                 source,
@@ -873,21 +879,12 @@ class StoragePlan:
             TensorView(layout=desired.layout, shape=tuple(desired.shape)), (pointer,), type=desired
         )
 
-    def window(self, target, desired, starts, *, instruction=False):
+    def window(self, target, desired, starts):
         """Derive a window at already lowered coordinates.
 
         The layout offset is relative to the sliced pointer: reduce the
         displacement modulo the swizzle period; the pointer holds its full offset.
         """
-        physical = (
-            desired.layout.layout if isinstance(desired.layout, ShardLayout) else desired.layout
-        )
-        if instruction and not (
-            target.type.storage is StorageKind.SMEM
-            and isinstance(physical, ComposedLayout)
-            and isinstance(physical.inner, Swizzle)
-        ):
-            return starts, desired
         keys = Tuple(starts, type=TupleType(tuple(value.type for value in starts)))
         cut = Call(
             Slice(sizes=tuple(desired.shape), strides=(1,) * len(desired.shape)),
@@ -903,12 +900,6 @@ class StoragePlan:
             swizzle = layout.inner
             period = 1 << (swizzle.bits + swizzle.base + swizzle.shift)
             layout = replace(layout, offset=layout.offset % period)
-        if instruction and isinstance(desired.layout, ShardLayout):
-            if isinstance(layout, ComposedLayout) and isinstance(
-                desired.layout.layout, ComposedLayout
-            ):
-                layout = replace(desired.layout.layout, offset=layout.offset)
-            return starts, replace(desired, layout=replace(desired.layout, layout=layout))
         if isinstance(type_.layout, ShardLayout):
             layout = replace(type_.layout, layout=layout)
         return starts, replace(desired, layout=layout, storage=target.type.storage)
@@ -929,18 +920,12 @@ class StoragePlan:
             )
 
         def addresses(shape, layout):
-            flat = flatten(resolve_layout(layout, shape))
-            coordinates = [f"c{axis}" for axis in range(len(shape))]
-            digits = layout_correspondence(flat.shape, tuple(shape)).coordinates(coordinates)
-            linear = (
-                " + ".join(
-                    f"{stride} * ({digit})"
-                    for stride, digit in zip(flat.strides, digits, strict=True)
-                )
-                or "0"
-            )
+            flat = flatten(layout)
+            coordinates = layout_to_isl_map(tuple(shape), flat, {}, divided=lambda _: ())
             offset = layout.offset if isinstance(layout, ComposedLayout) else 0
-            return isl.map(f"{{ [{', '.join(coordinates)}] -> [{offset} + {linear}] }}")
+            linear = " + ".join(f"{stride} * p{axis}" for axis, stride in enumerate(flat.strides)) or "0"
+            address = isl.map(f"{{ [{', '.join(f'p{i}' for i in range(len(flat.shape)))}] -> [{offset} + {linear}] }}")
+            return coordinates.apply_range(address)
 
         relation = address.relation
         if relation.is_identity() and tuple(desired.shape) == tuple(target.type.shape):
@@ -953,11 +938,10 @@ class StoragePlan:
             return View(
                 target, zeros, tuple(target.type.shape), desired, "value", whole_tensor=True
             )
-        layout = resolve_layout(
+        layout = (
             target.type.layout.layout
             if isinstance(target.type.layout, ShardLayout)
-            else target.type.layout,
-            target.type.shape,
+            else target.type.layout
         )
         placed = relation.apply_range(addresses(tuple(target.type.shape), layout))
         try:
@@ -1099,7 +1083,15 @@ class IssuePlan:
             projection = project(op, types, mesh, repeat=repeat, order=order)
             owner = next(
                 (
-                    participant_layout(type_.layout).mesh
+                    participant_layout(
+                        replace(
+                            type_.layout,
+                            attrs=tuple(
+                                Broadcast() if isinstance(attr, Partial) else attr
+                                for attr in type_.layout.attrs
+                            ),
+                        )
+                    ).mesh
                     for type_ in types
                     if isinstance(type_.layout, ShardLayout)
                 ),
@@ -1109,27 +1101,30 @@ class IssuePlan:
         except (ScheduleRefusal, ValueError) as error:
             raise LoweringError(str(error)) from error
 
-    def source_layout(self, type_):
-        return resolve_layout(type_.layout, type_.shape)
-
-    def points(self, projection, op):
-        serial = tuple(
-            count // bind for count, bind in zip(projection.repeat, projection.bind, strict=True)
-        )
-        step = tuple(
-            size * bind for size, bind in zip(projection.shape, projection.bind, strict=True)
-        )
-        axes = tuple(
-            projected_axes(boundary)
-            for boundary in operand_relations(op, projection.operands)[: len(projection.params)]
-        )
-        for counters in product(*(range(serial[axis]) for axis in projection.order)):
-            offsets = tuple(
-                dict(zip(projection.order, counters, strict=True))[axis] * step[axis]
-                for axis in range(len(serial))
-            )
-            yield tuple(tuple(i64_const(offsets[axis]) for axis in mapped) for mapped in axes)
-
+    def points(self, plan):
+        for ordered in product(*(range(plan.serial[axis]) for axis in plan.order)):
+            point = dict(zip(plan.order, ordered, strict=True))
+            windows = []
+            for logical, masks, axes in zip(
+                plan.logical_rests, plan.bind_masks, plan.axes, strict=True
+            ):
+                starts = []
+                for index, (axis, mask) in enumerate(zip(axes, masks, strict=True)):
+                    mode = get_layout(logical, index)
+                    selected = tuple(
+                        (width, stride)
+                        for width, stride, bound in zip(
+                            flatten_tuple(mode.shape),
+                            flatten_tuple(mode.strides),
+                            flatten_tuple(mask),
+                            strict=True,
+                        )
+                        if not bound
+                    )
+                    shape, strides = zip(*selected) if selected else ((), ())
+                    starts.append(i64_const(crd2idx(point.get(axis, 0), shape, strides)))
+                windows.append(tuple(starts))
+            yield tuple(windows)
 
 @dataclass(kw_only=True)
 class LoweringContext(TypeInferContext):
@@ -1554,23 +1549,6 @@ class Lowering(ValuationVisitor[Expr | View]):
             ):
                 value = ctx.storage.operand(value, types[params.index(param)], whole_tensor=True)
             if (
-                isinstance(op, CopyAsync)
-                and is_indexed_copy(call.args)
-                and param.name == "src"
-                and (
-                    value.type.layout is None
-                    or any(
-                        value is self._memo[id(argument)][1]
-                        for argument in ctx.function.params
-                    )
-                )
-            ):
-                type_ = replace(
-                    value.type,
-                    layout=ctx.issues.source_layout(value.type),
-                )
-                value = ctx.storage.operand(value, type_, stem="source", whole_tensor=True)
-            if (
                 isinstance(value.type, TensorType)
                 and value.type.shape == ()
                 and value.type.storage is StorageKind.UMAT
@@ -1601,8 +1579,13 @@ class Lowering(ValuationVisitor[Expr | View]):
             else type_
             for type_ in types
         )
-        atom = getattr(op, "atom", None)
-        if atom is None:
+        declaration = getattr(op, "atom", op)
+        required = (
+            declaration.execution_mesh
+            if isinstance(declaration, type)
+            else getattr(declaration, "required_execution_mesh", None)
+        )
+        if required is None:
             if mesh is None:
                 raise LoweringError(f"{_label(call)} instruction issue has no lexical mesh")
             with ctx.builder.region(
@@ -1633,29 +1616,121 @@ class Lowering(ValuationVisitor[Expr | View]):
                 if result_param.effect & MemoryEffect.READ
                 else written
             )
-        for windows in ctx.issues.points(plan, op):
-            issued = []
-            for (role, value), desired, starts in zip(
-                issued_operands, plan.issued, windows, strict=True
-            ):
-                logical_type = types[
-                    next(index for index, param in enumerate(params) if param.name == role)
-                ]
-                if tuple(logical_type.shape) == tuple(desired.shape):
-                    item = ctx.builder.value(
-                        ctx.storage.operand(value, desired, stem=f"{role}_view"), ctx=ctx
+        for region in ctx.builder.blocks[:-1]:
+            for key, value in region.views.items():
+                ctx.builder.blocks[-1].views.setdefault(key, value)
+        frame, _dropped = _participant_frame(owner or mesh, required)
+        locals_ = []
+        unit_coordinates = {}
+        for (role, value), type_, rest in zip(issued_operands, types, plan.rests, strict=True):
+            base = ctx.builder.value(ctx.storage.operand(value, type_, whole_tensor=True), ctx=ctx)
+            binding_mesh = rest.mesh if isinstance(rest, ShardLayout) else frame
+            _frame, dropped = _participant_frame(binding_mesh, required)
+            source = shard_layout_of(base.type.layout)
+            attrs = (
+                list(source.attrs)
+                if source is not None
+                else [Broadcast()] * len(axis_keys(binding_mesh))
+            )
+            coords = [None] * len(attrs)
+            for mesh_axis, (topology, _name) in enumerate(axis_keys(binding_mesh)[:dropped]):
+                attr = rest.attrs[mesh_axis]
+                attrs[mesh_axis] = attr
+                coordinate = 0
+                if isinstance(attr, Split) and not ctx.target.storage_owners.private(
+                    type_.storage, topology
+                ):
+                    key = id(binding_mesh), mesh_axis
+                    if key not in unit_coordinates:
+                        coord = Call(
+                            MeshCoord(mesh=binding_mesh), (i64_const(mesh_axis),), type=_BINDING
+                        )
+                        unit_coordinates[key] = ctx.builder.bind(
+                            Var(ctx.names.fresh("unit"), type=_BINDING), coord
+                        )
+                    coordinate = unit_coordinates[key]
+                coords[mesh_axis] = coordinate
+            address = source.layout if source is not None else base.type.layout
+            local, offset = local_layout(
+                ShardLayout(address, tuple(attrs), binding_mesh), base.type.shape, tuple(coords)
+            )
+            if any(isinstance(attr, Split) for attr in attrs[:dropped]):
+                primitive = local.layout if isinstance(local, ShardLayout) else local
+                outer = primitive.outer if isinstance(primitive, ComposedLayout) else primitive
+                local_shape = tuple(prod(flatten_tuple(mode)) for mode in outer.shape)
+                original = address.outer if isinstance(address, ComposedLayout) else address
+                if not any(isinstance(mode, tuple) for mode in original.shape):
+                    flat = flatten(outer)
+                    primitive = (
+                        replace(primitive, outer=flat)
+                        if isinstance(primitive, ComposedLayout)
+                        else flat
                     )
-                else:
-                    base = ctx.builder.value(value, ctx=ctx)
-                    starts, physical = ctx.storage.window(base, desired, starts, instruction=True)
-                    item = ctx.builder.value(
-                        ctx.storage.operand(
-                            base, physical, starts=starts, sizes=desired.shape, stem=f"{role}_view"
+                if static_dim_value(offset) != 0:
+                    primitive = ComposedLayout(None, offset, primitive)
+                local = (
+                    replace(local, layout=primitive)
+                    if source is not None and isinstance(local, ShardLayout)
+                    else primitive
+                )
+                local_type = replace(base.type, shape=local_shape, layout=local)
+                pointer_type = PointerType(base.type.dtype, base.type.storage)
+                pointer = ctx.builder.bind(
+                    Var(ctx.names.fresh(f"{role}_pointer"), type=pointer_type),
+                    Call(PtrOf(), (base,), type=pointer_type),
+                )
+                base = Call(TensorView(layout=local, shape=local_shape), (pointer,), type=local_type)
+            locals_.append(base)
+        with ctx.builder.region(mesh=frame, binding=Var(ctx.names.fresh("threads"), type=_BINDING)):
+            locals_ = [
+                ctx.builder.bind(Var(ctx.names.fresh(f"{role}_local"), type=base.type), base)
+                if isinstance(base, Call) and isinstance(base.target, TensorView)
+                else base
+                for (role, _value), base in zip(issued_operands, locals_, strict=True)
+            ]
+            for windows in ctx.issues.points(plan):
+                issued = []
+                for (role, _value), base, desired, starts in zip(
+                    issued_operands, locals_, plan.tiles, windows, strict=True
+                ):
+                    keys = Tuple(starts, type=TupleType(tuple(start.type for start in starts)))
+                    window = Call(
+                        Slice(sizes=tuple(desired.shape), strides=(1,) * len(desired.shape)),
+                        (base, keys),
+                        type=desired,
+                    )
+                    inferred = typeinfer_registry.lookup(Slice)(
+                        window,
+                        TypeInferContext(
+                            memo={id(arg): (arg, arg.type) for arg in (base, *starts)},
+                            loops=ctx.builder.loops,
                         ),
-                        ctx=ctx,
                     )
-                issued.append(item)
-            ctx.builder.add(Evaluate(op, tuple(issued)))
+                    window.type = getattr(inferred, "type", inferred)
+                    item = window
+                    if window.type != desired:
+                        pointer = Call(
+                            PtrOf(), (window,), type=PointerType(desired.dtype, desired.storage)
+                        )
+                        address = (
+                            window.type.layout.layout
+                            if isinstance(window.type.layout, ShardLayout)
+                            else window.type.layout
+                        )
+                        placement = desired.layout
+                        layout = (
+                            replace(placement, layout=address)
+                            if isinstance(placement, ShardLayout)
+                            else address
+                        )
+                        type_ = replace(window.type, layout=layout)
+                        item = Call(
+                            TensorView(layout=layout, shape=tuple(type_.shape)), (pointer,), type=type_
+                        )
+                    issued.append(
+                        ctx.builder.bind(Var(ctx.names.fresh(f"{role}_view"), type=item.type), item)
+                    )
+                ctx.builder.add(Evaluate(op, tuple(issued)))
         result_param = next(param for param in params if param.effect & MemoryEffect.WRITE)
         if result_param.effect & MemoryEffect.READ:
             return read_values[result_param.name]
@@ -1687,12 +1762,8 @@ class ConvertHIRToTIR(ModulePass):
             authored,
             lowered,
         )
-        root = lowering.lowered = lowering.run()
+        lowering.lowered = lowering.run()
         lowered[id(result.function)] = lowering
-        root.metadata = result.function.metadata
-        for record in render_analysis(result).summary:
-            if isinstance(record, (ReportIdentity, ReportSelection)):
-                attach_metadata(root, record)
         modules = set()
 
         def lower_module(node):

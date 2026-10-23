@@ -10,14 +10,14 @@ from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir._helpers import resolve_anchor_storage
 from tilefoundry.ir.hir._shard_checks import check_multilinear_partials
 from tilefoundry.ir.pattern import is_ranked_tensor
-from tilefoundry.ir.types import DType, FloatDType, Layout, StorageKind, TensorType
+from tilefoundry.ir.types import DType, FloatDType, StorageKind, TensorType
+from tilefoundry.ir.types.layout import Layout
 from tilefoundry.ir.types.shard_layout import (
     ShardLayout,
-    canonical_shard_layout,
     shard_layout_of,
     split_target_axes,
 )
-from tilefoundry.ir.types.stride import try_compact_major
+from tilefoundry.ir.types.storage import StorageOwners
 from tilefoundry.utils.lazy import torch
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
@@ -140,6 +140,8 @@ def matmul_result_shape_and_layout(call: "Call", ctx: "TypeInferContext") -> tup
             relation,
             out_shape,
             partial_reduction_dims=frozenset({k_domain_dim}),
+            ctx=ctx,
+            storage=lhs.storage,
         )
     except ValueError as e:
         ctx.error(call, str(e))
@@ -147,11 +149,19 @@ def matmul_result_shape_and_layout(call: "Call", ctx: "TypeInferContext") -> tup
     if layout is None:
         held = shard_layout_of(lhs.layout) or lhs.layout
         if isinstance(held, ShardLayout):
-            layout = canonical_shard_layout(out_shape, held.mesh, held.attrs)
-        elif held is None or tuple(held.shape) == tuple(out_shape):
+            layout = ShardLayout.default(
+                out_shape,
+                held.mesh,
+                held.attrs,
+                storage=lhs.storage,
+                owners=ctx.target.storage_owners
+                if ctx is not None and ctx.target is not None
+                else StorageOwners((), {}),
+            )
+        elif tuple(held.shape) == tuple(out_shape):
             layout = held
         else:
-            layout = Layout(shape=out_shape, strides=try_compact_major(out_shape))
+            layout = Layout(out_shape)
     return out_shape, layout
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum
 
 from tilefoundry.ir.core.inspection import Printable, PrinterBase
@@ -23,7 +23,7 @@ from tilefoundry.ir.pattern import (
     predicates as P,
 )
 from tilefoundry.ir.pattern.utils import declared_shape, selected_pattern
-from tilefoundry.ir.types import ComposedLayout, DType, Layout, Mesh, ShardLayout
+from tilefoundry.ir.types import ComposedLayout, DType, Layout, Mesh, ShardLayout, TensorType
 from tilefoundry.ir.types.layout_algebra import coalesce
 from tilefoundry.ir.types.mesh import levels, starts
 from tilefoundry.ir.types.storage import StorageKind
@@ -76,6 +76,7 @@ class MmaAtom(Printable):
     A: object
     B: object
 
+    roles = ("C", "A", "B")
     parameters: tuple[ParamDef, ...] = ()
     reference_name: str = ""
 
@@ -126,11 +127,15 @@ class MmaAtom(Printable):
     def role(self, role: str):
         return getattr(type(self), role)
 
+    def match_view(self, param_name: str, type_: TensorType) -> TensorType:
+        """Return a temporary pattern view; projection and emission keep the original type."""
+        return type_
+
     def operand_shapes(self) -> tuple[tuple[int, ...], ...]:
         """Return the declared C, A, and B shapes for one atom issue."""
         shapes = tuple(
             declared_shape(selected_pattern(self.role(role), self.bindings), self.bindings)
-            for role in ("C", "A", "B")
+            for role in self.roles
         )
         if any(shape is None for shape in shapes):
             raise ValueError(f"{self.reference_name} does not declare fixed operand shapes")
@@ -238,14 +243,10 @@ def physical_frames_match(left: Mesh, right: Mesh) -> bool:
     def frame(mesh):
         if isinstance(mesh.layout, ComposedLayout) and mesh.layout.inner is not None:
             return None
-        from tilefoundry.ir.types.layout import resolve_layout  # noqa: PLC0415
 
-        mesh = replace(mesh, layout=resolve_layout(mesh.layout))
         try:
             arranged = levels(mesh)
         except (IndexError, TypeError, ValueError):
-            return None
-        if any(layout.strides is None for layout in arranged):
             return None
         return starts(mesh), tuple(coalesce(_reverse(layout)) for layout in arranged)
 

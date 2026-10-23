@@ -8,17 +8,16 @@ from tilefoundry.ir.core import Op
 from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.pattern import is_ranked_tensor
-from tilefoundry.ir.types import Broadcast, Layout, Partial, ShardLayout, TensorType, TupleType
-from tilefoundry.ir.types.layout import flatten
+from tilefoundry.ir.types import Broadcast, Partial, ShardLayout, TensorType, TupleType
+from tilefoundry.ir.types.int_tuple import compatible_profile, mode_axes
+from tilefoundry.ir.types.layout import Layout, flatten
 from tilefoundry.ir.types.shard_layout import Split as ShardSplit
 from tilefoundry.ir.types.shard_layout import Split as SplitAttr
 from tilefoundry.ir.types.shard_layout import (
-    canonical_shard_layout,
-    layout_axis_to_tensor_axis,
     shard_layout_of,
     split_target_axes,
 )
-from tilefoundry.ir.types.stride import try_compact_major
+from tilefoundry.ir.types.storage import StorageOwners
 from tilefoundry.ir.types.utils import static_dim_value
 from tilefoundry.utils.lazy import torch
 from tilefoundry.visitor_registry import register_typeinfer
@@ -88,7 +87,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TupleType:
     part_shape[axis] = part_len
     part_shape = tuple(part_shape)
     if isinstance(x_ty.layout, ShardLayout):
-        layout_to_tensor = layout_axis_to_tensor_axis(x_ty.layout.layout.shape, x_ty.shape)
+        layout_to_tensor = mode_axes(compatible_profile(x_ty.layout.layout.shape, x_ty.shape))
         attrs = tuple(
             SplitAttr(layout_to_tensor[attr.axis])
             if isinstance(attr, SplitAttr)
@@ -97,11 +96,17 @@ def _(call: "Call", ctx: "TypeInferContext") -> TupleType:
             else Broadcast()
             for attr in x_ty.layout.attrs
         )
-        part_layout = canonical_shard_layout(part_shape, x_ty.layout.mesh, attrs)
-    elif x_ty.layout is None:
-        part_layout = None
+        part_layout = ShardLayout.default(
+            part_shape,
+            x_ty.layout.mesh,
+            attrs,
+            storage=x_ty.storage,
+            owners=ctx.target.storage_owners
+            if ctx is not None and ctx.target is not None
+            else StorageOwners((), {}),
+        )
     else:
-        part_layout = Layout(shape=part_shape, strides=try_compact_major(part_shape))
+        part_layout = Layout(part_shape)
     part_ty = TensorType(
         shape=part_shape, dtype=x_ty.dtype, layout=part_layout, storage=x_ty.storage
     )

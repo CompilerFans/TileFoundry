@@ -65,7 +65,14 @@ class TensorType:
         layout: "LayoutBase | None" = None,
         storage: StorageKind = StorageKind.UMAT,
     ) -> "TensorType":
-        return TensorType(shape=(), dtype=dtype, layout=layout, storage=storage)
+        from .layout import Layout  # noqa: PLC0415
+
+        return TensorType(
+            shape=(),
+            dtype=dtype,
+            layout=Layout(()) if layout is None else layout,
+            storage=storage,
+        )
 
     @staticmethod
     def umat_scalar(dtype: DType = DType.i64) -> "TensorType":
@@ -74,19 +81,18 @@ class TensorType:
         Shape elements and dimension arithmetic results use this single form
         so structural type equality holds across construction sites.
         """
-        from .layout import EMPTY_LAYOUT  # noqa: PLC0415 - cycle guard
-
-        return TensorType(shape=(), dtype=dtype, layout=EMPTY_LAYOUT, storage=StorageKind.UMAT)
+        return TensorType.scalar(dtype)
 
     @staticmethod
     def umat_tensor(shape: tuple, dtype: DType = DType.i64) -> "TensorType":
         """Canonical ranked value whose residency is not decided."""
-        from .layout import EMPTY_LAYOUT  # noqa: PLC0415 - cycle guard
+        from .layout import Layout  # noqa: PLC0415
 
+        shape = tuple(shape)
         return TensorType(
-            shape=tuple(shape),
+            shape=shape,
             dtype=dtype,
-            layout=EMPTY_LAYOUT,
+            layout=Layout(shape),
             storage=StorageKind.UMAT,
         )
 

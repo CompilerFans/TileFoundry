@@ -8,12 +8,12 @@ from tilefoundry.ir.hir.sharding.reshard import Reshard
 from tilefoundry.ir.hir.tensor.index_select import IndexSelect
 from tilefoundry.ir.tir.async_copy import CopyAsync
 from tilefoundry.ir.tir.cuda.memory.copy_async_tensor import CopyAsyncTensor
+from tilefoundry.ir.tir.cuda.memory.copy_reduce_async_tensor import CopyReduceAsyncTensor
 from tilefoundry.ir.tir.cuda.memory.ldmatrix import LdMatrix
+from tilefoundry.ir.tir.cuda.memory.stmatrix import StMatrix
 from tilefoundry.ir.tir.cuda.nn.mma import TiledMma
 from tilefoundry.ir.types import ComposedLayout, Layout, ShardLayout, Split
-from tilefoundry.ir.types.int_tuple import flatten
-from tilefoundry.ir.types.layout import resolve_layout
-from tilefoundry.ir.types.shard_layout import layout_axis_to_tensor_axis
+from tilefoundry.ir.types.int_tuple import compatible_profile, flatten, mode_axes
 
 from . import register_candidates
 
@@ -24,14 +24,11 @@ def _matrix_type(type_, reverse):
         return type_
 
     def permuted(layout):
-        layout = resolve_layout(layout, type_.shape)
         if isinstance(layout, ComposedLayout):
             return replace(layout, outer=permuted(layout.outer))
         shard = layout if isinstance(layout, ShardLayout) else None
         local = shard.layout if shard is not None else layout
-        axes = layout_axis_to_tensor_axis(
-            tuple(prod(flatten(mode)) for mode in local.shape), type_.shape
-        )
+        axes = mode_axes(compatible_profile(tuple(prod(flatten(mode)) for mode in local.shape), type_.shape))
         order = tuple(
             index
             for axis in reversed(range(len(type_.shape)))
@@ -40,7 +37,7 @@ def _matrix_type(type_, reverse):
         )
         result = Layout(
             tuple(local.shape[index] for index in order),
-            None if local.strides is None else tuple(local.strides[index] for index in order),
+            tuple(local.strides[index] for index in order),
         )
         if shard is None:
             return result
@@ -62,7 +59,7 @@ def _matmul_operands(call, instruction):
     return {}, (call.type, lhs, rhs)
 
 
-register_candidates(Reshard, (CopyAsync, CopyAsyncTensor, LdMatrix))
+register_candidates(Reshard, (CopyAsync, CopyAsyncTensor, CopyReduceAsyncTensor, LdMatrix, StMatrix))
 
 
 @register_candidates(IndexSelect, (CopyAsync,))

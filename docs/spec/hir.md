@@ -43,7 +43,8 @@ class Function(Expr):
         name: attribute; the function name; call sites resolve through Module's symbol table.
         params: attribute; each Var carries a type annotation.
         body: attribute; a single Expr — typically a Call DAG; None for a dispatch prototype.
-        return_type: attribute; TensorType for single output, TupleType for multi.
+        return_type: attribute; concrete TensorType for single output, TupleType for multi.
+        return_annotation: attribute; authored return declaration, or None.
         specializations: attribute; Dispatch patterns carried by a variant.
         variants: attribute; Shape-specialized implementations carried by a prototype.
         converters: attribute; Weight names paired with offline converter functions.
@@ -53,6 +54,7 @@ class Function(Expr):
     params: tuple[Var, ...]
     body: Expr | None
     return_type: Type
+    return_annotation: Type | None = None
     specializations: tuple[Pattern, ...] = field(default_factory=tuple)
     variants: tuple["Function", ...] = field(default_factory=tuple)
     converters: tuple[tuple[str, "Function"], ...] = field(default_factory=tuple)
@@ -120,7 +122,9 @@ declares, but it MUST NOT create a level or change one's extent.
 **Return type.** `Function.return_type` is the HIR result `Type`: a
 `TensorType` for one result or a `TupleType` for multiple results. It is part of
 the function signature and is the result component projected into
-`Function.type`.
+`Function.type`. `Function.return_annotation` retains the authored declaration,
+including an omitted tensor layout. Binding a standalone declaration constructs
+the concrete return type once; calls read that type without filling defaults.
 
 **Value type.** `Function.type` is the IR-level `CallableType`
 ([types §7](./types.md#7-callabletype)) projected from `params` +
@@ -199,13 +203,12 @@ separate operation that produces a derived `Function`; such a derived
 function records its origin and chosen dimensions as specified by the
 **Function specialization API** below.
 
-The placement sugar in a signature emits `Layout(strides=None)`
-([parser.md §2.1](./parser.md#21-syntax)). Under the recursive rule, this leaves
-only `strides` undecided: the layout's stated shape, mesh, and shard attributes
-remain constraints, while the argument's concrete strides bind into the
-callee. A verbose `Layout(strides=tuple)` states a concrete stride contract and
-MUST match exactly. Signature binding does not materialize either form into a
-different layout.
+A wholly omitted tensor layout remains `None` in a parameter or return
+annotation and imposes no layout constraint. A stated layout or placement is
+concrete when constructed and MUST match exactly; unwritten strides use the
+default constructor with the enclosing storage and target. Parameter `type`
+and function `return_type` store concrete value types, separately from their
+authored annotations.
 
 **SSA shape**. HIR is pure **SSA-as-DAG** — sharing of intermediate
 results is expressed by Python object identity:
@@ -282,7 +285,8 @@ freeze** below).
   MUST choose a valid source binding so the emitted definition remains
   importable.
 - Every variant of a base MUST share the base's `name`, `params`, and
-  `return_type`: a variant specializes the body, not the signature. A variant
+  parameter annotations and `return_annotation`: a variant specializes the body,
+  not the authored signature. A variant
   runs in the same execution domain as its base because both are owned by the
   same `Module`.
 - `.specialize(pattern, *, mesh=None)` accepts an explicit function mesh with
@@ -702,7 +706,9 @@ second presentation of the result.
   for that logical shape under the existing layout-position-to-tensor-axis rules.
   Both layouts MUST be plain `Layout` / `ComposedLayout` without `ShardLayout`
   components, or both MUST be rmem `ShardLayout` on the same mesh containing
-  only `Split` attributes. Every `Layout` component MUST have stated strides.
+  only `Split` attributes. Omitted authored strides MUST be materialized at
+  Bitcast type inference using the same default and storage-owner rules as
+  Reshard and TensorView; every resulting `Layout` component has concrete strides.
   For rmem shards, an address is the owning mesh coordinate paired with the
   offset within that unit; the two address sets MUST be equal, so every element
   stays in its original unit and register. `Broadcast` and `Partial` shards
@@ -727,39 +733,34 @@ second presentation of the result.
   loop's window by a compile-time offset. That start is an address computed where
   it is read, not a value some op produces, so a walk over compute ops MUST leave
   it alone.
-- A plain-layout `Slice` with static starts MUST produce a `ComposedLayout`: its
-  offset is the source offset plus the starts multiplied by the source strides,
-  and its outer layout carries the sliced shape and retained strides (multiplied
-  by any slice step).
-- A source axis written as a group of modes has no single stride: its start
-  MUST be read through the group as a mixed-radix coordinate, and the window
-  MUST be the group's least-stepping modes, as many as its size takes, in the
-  order the group wrote them. A start that is not a multiple of the size, a
-  size landing on no mode boundary, and a step MUST each be refused.
-- `ShardLayout` slices and instruction projection MUST use one window derivation.
-  On a logical axis containing a Split mode, the window MUST be one complete
-  suffix block in the logical row-major mode order. A mode `(a*b):(d)` MAY be
-  factored as `(a,b):(b*d,d)`. Every Split mode MUST remain in the suffix,
-  with its stride and mesh attribute preserved, and the slice step MUST be 1.
-  The start MUST be a multiple of the block size: constants are checked directly,
-  and induction expressions MUST be proved aligned with isl over the enclosing
-  loop domain carried by type inference. Prefix coordinates contribute a
-  per-thread displacement; they MUST NOT change which thread owns an element.
-- On an axis without Split modes, the existing representable affine-window
-  rules remain: a primitive mode takes the window size and stepped stride.
-  This includes an unsplit `6 -> 4` QKV group window, non-unit steps, and runtime
-  starts. Static nonzero offsets wrap the retained shard layout in a
-  `ComposedLayout`; runtime starts without a known displacement preserve the
-  bare distribution. A window crossing a Split mode or lacking its required
-  alignment proof MUST be refused.
+- A `Slice` of a plain `Layout` or `ShardLayout` MUST return the window layout
+  without introducing a `ComposedLayout` offset. Analysis and lowering derive
+  the address from the start operands, including through nested slices. If the
+  source already has a `ComposedLayout`, the result preserves it and updates its
+  offset; a swizzle acts on the address including that offset. The window retains
+  the source strides, multiplied by any slice step.
+- A whole logical axis MUST keep its authored mode tree. A cut axis MUST use
+  `composition` with a tiler built from that axis's own modes, retaining authored
+  unit modes. Inner modes MUST divide; the outermost mode takes the remaining
+  count, which MUST fit its extent. A Split leaf MUST take either one element or
+  its full extent, and retained Splits MUST be remapped to the surviving modes.
+- For an axis with multiple modes or a Split, type inference MUST prove that
+  every source mode digit advances by the window digit times its step, without
+  carrying across a mode boundary or Split block. This proof uses the Slice
+  access relation and the shared enclosing loop domain; physical strides do
+  not enter the check. An unprovable window MUST fail with the Slice alignment
+  diagnostic. Single-mode axes without Splits need no digit proof and support
+  non-unit steps and runtime starts.
+- A start outside the affine subset MUST remain a parameter bounded by the
+  window's reach inside the source. Such a start is valid on a single-mode axis
+  without Splits; a multi-mode or Split axis still requires the digit proof.
+  Runtime starts move the address without adding an offset to the result type
+  of a plain or sharded source.
 - `ComposedLayout(inner=None, outer=ShardLayout(...))` is a sharded view.
   Relation-driven consumers, local projection, execution-domain discovery, and
   Partial checks MUST read distribution from its outer layout. Its offset is
   input addressing and MUST NOT be copied to a consumer's newly produced value;
   another view MAY compose and preserve that offset.
-- Narrowing a logical axis targeted by any `Split` MUST fail type inference:
-  the window need not align with that mesh division. A narrowed axis represented
-  by more than one factored layout position MUST also fail rather than guess.
 - Runtime starts MUST remain ordinary Call operands. They move the view's base
   address, not its strides: a plain input therefore still produces a result
   `Layout`, while the runtime offset is not carried by that layout. A safe
@@ -787,15 +788,16 @@ Type inference derives fresh output ownership from those access maps. A
 propagation proves a zero-offset projection. A `Split` on the concatenated axis
 MUST be rejected, including when it appears only on the zero-offset first
 input, and the diagnostic MUST require an explicit `Reshard` before `Concat`.
-Dynamic ownership, incompatible meshes, nonuniform `Partial` states, and an
-unrepresentable derived layout MUST likewise fail with the `Reshard` remedy.
+Dynamic ownership, incompatible meshes, and nonuniform `Partial` states MUST
+likewise fail with the `Reshard` remedy. Compatible propagated ownership receives
+concrete default strides; the input's physical layout need not be reused.
 An output with no real sharding receives a fresh C-order `Layout`.
 
 ##### Rank and ShapeOf
 
 - `Rank` produces a rank-0 `i64`; `ShapeOf` produces a rank-1 `i64` vector with
   one entry per input axis.
-- Both results are host shape metadata with `layout=EMPTY_LAYOUT` and
+- Both results are host shape metadata with `layout=default_layout(shape)` and
   `storage=umat`, not device-resident tensors.
 - Evaluation MUST read the concrete runtime tensor rank and extents. A symbolic
   input `TensorType.shape` is the result bound, not the value returned at
@@ -996,10 +998,11 @@ class Stack(Op):
     propagation derives any representable ownership from that relation.
   - Compatible `Split` ownership carries to the shifted old logical axis. A
     fully replicated input contributes no sharding. Incompatible input meshes
-    or per-axis states, a non-uniform `Partial` across result slices, and an
-    unrepresentable result layout MUST fail naming the conflicting input and
-    requiring an explicit `Reshard`; typeinfer MUST NOT select input zero's
-    layout or silently discard real ownership.
+    or per-axis states, and a non-uniform `Partial` across result slices MUST
+    fail naming the conflicting input and requiring an explicit `Reshard`;
+    typeinfer MUST NOT select input zero's layout or silently discard real
+    ownership. Compatible ownership receives concrete default result strides
+    rather than requiring reuse of an input's physical layout.
 
 ##### TupleGetItem
 
@@ -1621,11 +1624,15 @@ class Reshard(Op):
   - The output preserves the input logical `TensorType.shape`.
   - Supplied `layout` is a `LayoutBase` (`Layout` / `ComposedLayout` / `ShardLayout`).
   - Memory analysis and lowering MUST treat a Reshard as a view iff storage
-    is unchanged, the shape is literal, and both structural address boxes agree.
-    A box records each zero-stride Split's mesh axis, logical tensor axis,
-    position within that axis, and extent. Its physical address layout is the
-    coalesced layout after removing these independent modes; swizzle and offset
-    are preserved. No element or participant enumeration is required.
+    is unchanged, the shape is literal, both structural address boxes agree,
+    and the conversion does not change any mesh axis's `Partial` state.
+    A Split on a mesh axis of extent 1 places nothing: the box neither records
+    it nor treats its tensor mode as independent. A box records every other
+    zero-stride Split's mesh axis, logical tensor axis, position within that
+    axis, and extent. Its physical address layout is the coalesced layout after
+    removing these independent modes; swizzle and offset are preserved. Source
+    offsets are derived from starts along the registered view chain, independently
+    of the offset-free types of plain slices. No element or participant enumeration is required.
     The result MUST reuse the source buffer, lower to a view, and require no
     instruction candidate. Broadcast and nonzero-stride Split ownership do not
     change a shared address, including a device ownership change with the same

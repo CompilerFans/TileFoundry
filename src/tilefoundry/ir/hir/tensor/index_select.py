@@ -15,7 +15,7 @@ from tilefoundry.ir.types.shard_layout import (
     Split,
     split_target_axes,
 )
-from tilefoundry.ir.types.stride import compact_col_major, compact_row_major
+from tilefoundry.ir.types.stride import compact_col_major
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
     AccessRelation,
@@ -53,7 +53,7 @@ def _index_select_shard_layout(call, ctx, x_ty, dim: int, out_shape: tuple):
     """
     sl = x_ty.layout
     if isinstance(sl, Layout):
-        return Layout(shape=out_shape, strides=compact_row_major(out_shape))
+        return Layout(out_shape)
     if not isinstance(sl, ShardLayout):
         return sl
     if not isinstance(sl.layout, Layout):

@@ -12,9 +12,10 @@ from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir._shard_checks import reject_partials
 from tilefoundry.ir.pattern import is_ranked_tensor
-from tilefoundry.ir.types import Layout, TensorType
-from tilefoundry.ir.types.shard_layout import canonical_shard_layout, shard_layout_of
-from tilefoundry.ir.types.stride import try_compact_major
+from tilefoundry.ir.types import TensorType
+from tilefoundry.ir.types.layout import Layout
+from tilefoundry.ir.types.shard_layout import ShardLayout, shard_layout_of
+from tilefoundry.ir.types.storage import StorageOwners
 from tilefoundry.utils.lazy import torch
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
@@ -70,11 +71,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
             new_shape.pop(a)
     out_shape = tuple(new_shape)
 
-    new_layout = (
-        None
-        if x_ty.layout is None
-        else Layout(shape=out_shape, strides=try_compact_major(out_shape))
-    )
+    new_layout = Layout(out_shape)
     source_shard = shard_layout_of(x_ty.layout)
     if source_shard is not None:
         relation = relations_of(call, ctx)
@@ -84,11 +81,21 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
             out_shape,
             complete_reduction_dims=frozenset(reduced),
             fresh_strides=True,
+            ctx=ctx,
+            storage=x_ty.storage,
         )
         new_layout = (
             derived
             if derived is not None
-            else canonical_shard_layout(out_shape, source_shard.mesh, source_shard.attrs)
+            else ShardLayout.default(
+                out_shape,
+                source_shard.mesh,
+                source_shard.attrs,
+                storage=x_ty.storage,
+                owners=ctx.target.storage_owners
+                if ctx is not None and ctx.target is not None
+                else StorageOwners((), {}),
+            )
         )
 
     return TensorType(

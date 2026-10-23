@@ -86,12 +86,17 @@ class TensorType:
 - constraints:
   - A *scalar* is `TensorType(shape=(), ...)` — a rank-0 tensor. There
     is no separate `Scalar` type.
-  - `layout` is either `None` or one member of the `LayoutBase` hierarchy
-    defined by [shard §2](./shard.md#2-layout-hierarchy).
-    Concrete layout readers MUST use `resolve_layout(layout, logical_shape)`:
-    `None` and omitted strides mean compact row-major. The reader recursively
-    resolves ShardLayout and ComposedLayout while retaining mesh, attributes,
-    swizzle, offset, and explicit strides; it does not mutate the stored type.
+  - After type inference, each tensor value MUST carry a concrete `LayoutBase`
+    from [shard §2](./shard.md#2-layout-hierarchy), with no omitted Layout strides.
+    Parameter annotations retain the authored constraint, including a completely omitted layout. Authored layouts receive concrete
+    strides at construction; standalone inference gives an omitted layout a
+    separate default value type.
+    Function calls continue to compare arguments against the annotation.
+    Verification reports an incomplete value type with its source location.
+    Concrete layout readers MUST consume the stored layout directly: defaults
+    are materialized by producers or standalone annotation binding, never by
+    consumers. `Layout(shape)` supplies compact row-major strides, symbolic
+    products, and stride zero on statically unit leaves.
     In signature compatibility, a declared `layout=None` instead imposes no
     layout constraint. This is a signature rule, not a physical layout.
   - `storage` is a `StorageKind` (`gmem` / `smem` / `rmem` / `host` / `tmem` /
@@ -345,7 +350,7 @@ The canonical descriptors are:
 - a `core_ir.dim.*` `Expr` (e.g. `DimAdd` / `DimMul`) for derived
   dim expressions, returning a rank-0 integer `Expr` of dtype
   `i64` and `storage=umat`. This rank-0 unmaterialized scalar type
-  (`shape=()`, `layout=EMPTY_LAYOUT`, `storage=umat`) has exactly one
+  (`shape=()`, `layout=Layout((), ())`, `storage=umat`) has exactly one
   constructor, `TensorType.umat_scalar(dtype)`.
 
 ```python
@@ -688,7 +693,7 @@ def make_shard_tensor_type(
     fields to `TensorType`.
   - `make_shard_tensor_type` MUST return a plain tensor type when `mesh` is
     `None` or `attrs` is empty; otherwise it MUST build the layout through
-    `canonical_shard_layout`.
+    `ShardLayout.default`.
 
 ## 9. Callable type projection
 

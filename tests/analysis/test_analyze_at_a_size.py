@@ -103,6 +103,7 @@ class _PersistentScheduleExpectation:
 
 
 EXPECTED_MEMORY_PEAKS = {
+    "hand_checked.CausalStartReuse.read[static]": {"gmem": 64, "rmem": 16},
     "cyclic_split_weight.CyclicSplitWeight.read[static]": {"gmem": 8 * 4 // 4},
     "cyclic_split_weight.MeshOrderWeight.read[static]": {"gmem": 32 * 4 // 32},
     "two_dimvar_reshape.TwoDimVarReshape.squeeze[C=128,T=128]": {"gmem": 128 * 128 * 4},
@@ -240,7 +241,7 @@ EXPECTED_MEMORY_PEAKS = {
         "rmem": 0,
         "smem": 1_408,
     },
-    "mesh_slice_start.OutOfWindow.oob[static]": {"gmem": 4_096, "rmem": 0},
+    "mesh_slice_start.OutOfWindow.oob[static]": {"gmem": 5_120, "rmem": 0},
     "mesh_slice_start.Strided.scan[static]": {
         "gmem": 4_352,
         "rmem": 8,
@@ -297,7 +298,7 @@ EXPECTED_MEMORY_PEAKS = {
     "prefill_decode_attention.PrefillDecodeAttention.attend[ctx=128,seq=128]": {
         "gmem": 1_310_720,
         "rmem": 128 * 128 * 4,
-        "smem": 309376,
+        "smem": 231424,
     },
     "qwen3_1_7b_pd.PrefillLayer.layer_decode[ctx_len=128,seq=128]": {
         "gmem": 152_184_080,

@@ -1,7 +1,3 @@
-# analysis target=nvidia.h200_sxm module=StridedReturnWindow function=gemm topology=cta wave=32/32
-# selection requested=memory executed=memory
-# memory traffic=gmem:r12.00KiB/w0@logical,r384.00KiB/w0@total,r12.00KiB/w0@cta,r12.00KiB/w0@thread;rmem:r32B/w12.00KiB@logical,r1.00KiB/w384.00KiB@total,r32B/w12.00KiB@cta,r32B/w12.00KiB@thread footprint=x:384.00KiB footprint-precision=exact peak=gmem:896.00KiB;rmem:12.00KiB persistent=gmem:896.00KiB
-
 from __future__ import annotations
 
 from tilefoundry.dsl import *
@@ -9,7 +5,7 @@ from tilefoundry.target import CudaTarget
 
 
 @prim_func(target=CudaTarget("nvidia.h200_sxm"))
-def gemm(x: Tensor[(32, 14336), "bf16"], out: Tensor[(24, 256), "bf16", (24, 256), "rmem"]):
+def gemm(x: Tensor[(32, 14336), "bf16"], out: Tensor[(24, 256), "bf16", "rmem"]):
     with Mesh((Topology("cta", 32),), layout=(32,), names=("d0",)) as cta:
         with Mesh((Topology("thread", 1),), layout=(1,), names=("d0",)) as scope:
             value = T.tensor_view(

@@ -5,7 +5,9 @@ from __future__ import annotations
 import enum
 import json
 import math
+from collections.abc import Mapping
 from contextlib import contextmanager
+from dataclasses import fields, is_dataclass
 
 from tilefoundry.ir.core import (
     Call,
@@ -18,7 +20,9 @@ from tilefoundry.ir.core import (
     op_identifier,
 )
 from tilefoundry.ir.core.param_def import MISSING
+from tilefoundry.ir.core.values import TripInterval
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
+from tilefoundry.ir.hir.sharding.reshard import Reshard
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.mesh_scope import device_layout
 from tilefoundry.ir.pattern import Pattern, RangePattern
@@ -44,6 +48,21 @@ from tilefoundry.ir.types.utils import participant_layout, static_dim_value
 from tilefoundry.ir.visitor import ExprFunctor, TypeFunctor
 from tilefoundry.target import Target
 from tilefoundry.utils.python_source import PythonExpr
+from tilefoundry.utils.units import format_bytes
+
+PAIR, PER_UNIT, ENTRY, ENTRIES, FIELD, FIELDS, PARTS, TRIPS = (
+    "/",
+    "@",
+    ":",
+    ",",
+    "=",
+    " ",
+    "; ",
+    "*",
+)
+
+_UNSET = object()
+
 
 _DIM_INFIX_OPS: dict[type, str] = {
     DimAdd: "+",
@@ -61,6 +80,216 @@ _DIM_FUNC_OPS: dict[type, str] = {
 
 class PythonPrinter(PrinterBase, ExprFunctor[str], TypeFunctor[str]):
     """Render the Python DSL with one dispatch root for expressions and types."""
+
+    def print_SSAValue(self, value):
+        return self.print(value)
+
+    def comment(self, record, *, opt_in=frozenset()) -> str | None:
+        method = getattr(self, f"print_{type(record).__name__}", None)
+        return (method(record, opt_in=opt_in) or None) if method else None
+
+    def comment_value(self, value):
+        method = getattr(self, f"print_{type(value).__name__}", None)
+        if method:
+            return method(value)
+        if is_dataclass(value):
+            return ENTRIES.join(
+                f"{item.name}{ENTRY}{self.comment_value(getattr(value, item.name))}"
+                for item in fields(value)
+            )
+        if isinstance(value, Mapping):
+            return ";".join(f"{k}{ENTRY}{self.comment_value(v)}" for k, v in value.items())
+        if isinstance(value, (tuple, list)):
+            return ENTRIES.join(self.comment_value(v) for v in value)
+        return str(value)
+
+    def print_Prose(self, value):
+        return json.dumps(str(value))
+
+    def print_AnalysisPrecision(self, value):
+        return value.value
+
+    def print_TrafficBytes(self, value):
+        return f"r{format_bytes(value.read)}{PAIR}w{format_bytes(value.write)}"
+
+    def print_TripInterval(self, value):
+        if value.trips <= 1:
+            return f"[{value.start},{value.end})"
+        offset = f"{value.stride}t+"
+        return f"[{offset}{value.start},{offset}{value.end}){TRIPS}{value.trips}"
+
+    @staticmethod
+    def _empty_without_default(value):
+        if isinstance(value, Mapping | tuple | list):
+            return not value
+        return False
+
+    def _record(self, family, values):
+        out = []
+        for item in values:
+            key, value = item[:2]
+            default = item[2] if len(item) == 3 else _UNSET
+            if default is not _UNSET:
+                if value == default:
+                    continue
+            elif self._empty_without_default(value):
+                continue
+            out.append(f"{key.replace('_', '-')}={self.comment_value(value)}")
+        if not family:
+            return FIELDS.join(out)
+        return FIELDS.join([family, *out]) if out else ""
+
+    def _single(self, family, value, default=_UNSET):
+        if default is not _UNSET and value == default:
+            return ""
+        if default is _UNSET and self._empty_without_default(value):
+            return ""
+        return f"{family}{FIELD}{self.comment_value(value)}"
+
+    def _spread(self, spread, topologies, *, logical=True):
+        values = []
+        if logical:
+            values.append(f"{self.comment_value(spread.logical)}@logical")
+        values.append(f"{self.comment_value(spread.total)}@total")
+        values.extend(
+            f"{self.comment_value(value)}@{topology}"
+            for topology, value in zip(topologies, spread.per_unit, strict=False)
+        )
+        return self.comment_value(values)
+
+    def _breakdown(self, held, topologies, *, logical=True):
+        return {
+            kind: self._spread(spread, topologies, logical=logical) for kind, spread in held.kinds
+        }
+
+    def _footprint(self, footprint):
+        if footprint is None:
+            return {}
+        return {
+            "/".join((*ownership, self.comment_value(value))): format_bytes(sum(spread.logical for _level, spread in breakdown.kinds))
+            for value, ownership, breakdown in footprint.buffers
+        }
+
+    def print_ComputeCostMetadata(self, record, **_):
+        return self._record(
+            "compute-cost",
+            (
+                ("flops", self._breakdown(record.flops, record.topologies)),
+                ("other_ops", self._breakdown(record.other_ops, record.topologies)),
+                ("precision", record.precision),
+            ),
+        )
+
+    def print_MemoryMetadata(self, record, *, opt_in=frozenset()):
+        traffic = self._breakdown(record.traffic.storage, record.topologies)
+        values = [("traffic", traffic), ("footprint", self._footprint(record.footprint))]
+        if record.footprint is not None:
+            values.append(("footprint_precision", record.footprint.precision))
+        if "operands" in opt_in:
+            last = len(record.operands) - 1
+            operands = {
+                "result" if index == last else str(index): moved
+                for index, moved in enumerate(record.operands)
+            }
+            values.append(("operands", operands))
+        return self._record("memory", values)
+
+    def print_RegionMemoryMetadata(self, record, **_):
+        return self._record(
+            "memory",
+            (
+                ("traffic", self._breakdown(record.traffic.storage, record.topologies)),
+                ("footprint", self._footprint(record.footprint)),
+                (
+                    "footprint_precision",
+                    record.footprint.precision if record.footprint else None,
+                    None,
+                ),
+                (
+                    "peak",
+                    {item.memory_level: format_bytes(item.peak_bytes) for item in record.peaks},
+                ),
+                (
+                    "persistent",
+                    {
+                        item.memory_level: format_bytes(item.persistent_bytes)
+                        for item in record.peaks
+                        if item.persistent_bytes
+                    },
+                ),
+            ),
+        )
+
+    def print_ReuseWindow(self, record, **_):
+        return self._record(
+            "",
+            (
+                ("buffer", "/".join((*record.ownership, self.comment_value(record.buffer)))),
+                ("holds", format_bytes(record.holds_bytes)),
+                ("time", record.time or "none"),
+                ("space", record.space or "none"),
+                (
+                    "reuse",
+                    "unknown" if record.reuse_bytes is None else format_bytes(record.reuse_bytes),
+                ),
+                ("fits", "yes" if record.fits else "no"),
+                ("precision", record.precision),
+            ),
+        )
+
+    def print_RooflineMetadata(self, record, **_):
+        return self._record(
+            "roofline", (("ideal_ns", record.ideal_ns, 0), ("bound_by", record.bound_by, "none"))
+        )
+
+    def print_PerformanceMetadata(self, record, **_):
+        interval = TripInterval(
+            record.timeline.start_ns,
+            record.timeline.end_ns,
+            record.timeline.stride_ns,
+            record.timeline.trips,
+        )
+        return self._single("performance", interval)
+
+    def print_PerformanceSummaryMetadata(self, record, **_):
+        predicted = record.timeline.end_ns - record.timeline.start_ns
+        wave = "/".join(map(str, record.wave))
+        return self._record("performance", (("predicted_ns", predicted), ("wave", wave)))
+
+    def print_SourceSpanMetadata(self, record, **_):
+        return self._single("source", f"{record.file}:{record.line}:{record.column}")
+
+    def print_ReportIdentity(self, record, **_):
+        return self._record(
+            "analysis",
+            (
+                ("target", record.target, ""),
+                ("module", record.module, ""),
+                ("function", record.function, ""),
+                ("topology", record.topology, "none"),
+            ),
+        )
+
+    def print_ReportSelection(self, record, **_):
+        return self._record(
+            "selection", (("requested", record.requested, ()), ("executed", record.executed, ()))
+        )
+
+    def print_AdvisorySummary(self, record, **_):
+        return self._single("advisory", record.text)
+
+    def print_ErrorSummary(self, record, **_):
+        return self._single("error", record.text)
+
+    def print_PerformanceSummaryView(self, record, **_):
+        return self._record(
+            "performance",
+            (
+                ("root", record.root, ""),
+                ("predicted_ns", record.predicted_ns, 0),
+                ("wave", record.wave, ""),
+            ),
+        )
 
     def __init__(self) -> None:
         ExprFunctor.__init__(self)
@@ -217,7 +446,7 @@ class PythonPrinter(PrinterBase, ExprFunctor[str], TypeFunctor[str]):
             return None
         return added.args[0], divisor
 
-    def shard_surface(self, value: ShardLayout, ctx=None) -> str | None:
+    def shard_surface(self, value: ShardLayout, ctx=None, *, storage=None) -> str | None:
         """Render placement sugar only when every mesh axis has a scope binding.
 
         The sugar states one extent per tensor axis, each a dimension
@@ -229,7 +458,7 @@ class PythonPrinter(PrinterBase, ExprFunctor[str], TypeFunctor[str]):
         operand = None
         if isinstance(layout, ComposedLayout) and isinstance(layout.outer, Layout):
             operand = "(" + self.layout_surface(layout, ctx) + ")"
-        elif isinstance(layout, Layout) and layout.strides is not None:
+        elif isinstance(layout, Layout):
             operand = self.layout_surface(layout, ctx)
         if ctx is not None and all(isinstance(attr, Broadcast) for attr in value.attrs):
             current = ctx.current_mesh
@@ -273,7 +502,16 @@ class PythonPrinter(PrinterBase, ExprFunctor[str], TypeFunctor[str]):
             return operand + " @ {" + ", ".join(partials) + "}"
         states = partials
 
-        explicit = layout.strides is not None
+        explicit = True
+        if storage is not None and ctx is not None and ctx.target is not None:
+            default = ShardLayout.from_modes(
+                value.layout.shape,
+                value.mesh,
+                value.attrs,
+                storage=storage,
+                owners=ctx.target.storage_owners,
+            )
+            explicit = layout != default.layout
         if explicit and any(
             axis in splits and self.dim_entry(dim, ctx, nested=True) != self.dim_entry(dim, ctx)
             for axis, dim in enumerate(layout.shape)
@@ -304,13 +542,13 @@ class PythonPrinter(PrinterBase, ExprFunctor[str], TypeFunctor[str]):
             f'{self.shape_tuple(value.shape, ctx)}, "{self.dtype_str(value.dtype, ctx)}"'
         )
         if isinstance(value.layout, ShardLayout):
-            surface = self.shard_surface(value.layout, ctx)
+            surface = self.shard_surface(value.layout, ctx, storage=value.storage)
             if surface is not None:
                 result += f", {surface}"
             else:
                 with self.type_surface(indent=self._indent + "    "):
                     result += f",\n{self._indent}{self.visit(value.layout, ctx)}"
-        elif value.layout is not None:
+        elif value.layout is not None and value.layout != Layout(value.shape):
             result += f", {self.layout_surface(value.layout, ctx)}"
         if value.storage is not StorageKind.GMEM:
             result += f', "{value.storage.name.lower()}"'
@@ -381,19 +619,22 @@ class PythonPrinter(PrinterBase, ExprFunctor[str], TypeFunctor[str]):
         return "None"
 
     def visit_Layout(self, value: Layout, ctx=None) -> str:
-        strides = self.shape_tuple(value.strides, ctx) if value.strides is not None else "None"
-        return f"Layout({self.shape_tuple(value.shape, ctx)}, {strides})"
+        return (
+            f"Layout({self.shape_tuple(value.shape, ctx)}, {self.shape_tuple(value.strides, ctx)})"
+        )
 
     def visit_Swizzle(self, value: Swizzle, ctx=None) -> str:
         return f"Swizzle({value.bits}, {value.base}, {value.shift})"
 
-    def layout_surface(self, value: LayoutBase, ctx=None) -> str:
+    def layout_surface(self, value: LayoutBase, ctx=None, *, storage=None) -> str:
         """Use composition operators only where the parser expects a layout."""
         if isinstance(value, ShardLayout):
-            return self.shard_surface(value, ctx) or self.visit(value, ctx)
-        if isinstance(value, Layout) and not any(isinstance(entry, tuple) for entry in (*value.shape, *(value.strides or ()))):
+            return self.shard_surface(value, ctx, storage=storage) or self.visit(value, ctx)
+        if isinstance(value, Layout) and not any(
+            isinstance(entry, tuple) for entry in (*value.shape, *value.strides)
+        ):
             shape = self.shape_tuple(value.shape, ctx)
-            if value.strides is None or value.strides == compact_row_major(value.shape):
+            if value.strides == Layout(value.shape).strides:
                 return shape
             return f"({shape}, {self.shape_tuple(value.strides, ctx)})"
         if not isinstance(value, ComposedLayout) or not isinstance(value.outer, Layout):
@@ -412,6 +653,7 @@ class PythonPrinter(PrinterBase, ExprFunctor[str], TypeFunctor[str]):
         indent: str = "",
         *,
         suppressed: frozenset[str] = frozenset(),
+        storage=None,
     ) -> list[str]:
         """Render attribute ParamDefs in declaration order, omitting defaults."""
         attrs = []
@@ -422,11 +664,16 @@ class PythonPrinter(PrinterBase, ExprFunctor[str], TypeFunctor[str]):
             if param.default is not MISSING and attr == param.default:
                 continue
             with self.type_surface(indent=indent):
-                rendered = (
-                    self.layout_surface(attr, ctx)
-                    if isinstance(attr, LayoutBase)
-                    else self.print(attr, ctx, indent)
-                )
+                if isinstance(value, Reshard) and isinstance(attr, ShardLayout):
+                    rendered = self.shard_surface(
+                        attr, ctx, storage=storage or value.storage
+                    ) or self.visit(attr, ctx)
+                else:
+                    rendered = (
+                        self.layout_surface(attr, ctx)
+                        if isinstance(attr, LayoutBase)
+                        else self.print(attr, ctx, indent)
+                    )
             attrs.append(f"{param.name}={rendered}")
         return attrs
 

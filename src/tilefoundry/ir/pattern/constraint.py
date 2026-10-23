@@ -5,11 +5,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import prod
 
-from tilefoundry.ir.types import Broadcast, ComposedLayout, Layout, ShardLayout, Swizzle
+from tilefoundry.ir.types import Broadcast, ComposedLayout, Layout, Partial, ShardLayout, Swizzle
 from tilefoundry.ir.types.layout import flatten
 from tilefoundry.ir.types.tensor_type import TensorType
 
 from .match import _named
+
+
+def strided_arrangement(layout, *, allow_partial=False):
+    """Read a strided address layout beneath permitted value-state wrappers."""
+    if isinstance(layout, ShardLayout):
+        if not all(
+            isinstance(attr, Broadcast) or (allow_partial and isinstance(attr, Partial))
+            for attr in layout.attrs
+        ):
+            return None
+        layout = layout.layout
+    if isinstance(layout, ComposedLayout):
+        if layout.inner is not None and not isinstance(layout.inner, Swizzle):
+            return None
+        layout = layout.outer
+    return layout if isinstance(layout, Layout) else None
 
 
 @dataclass(frozen=True)
@@ -68,7 +84,10 @@ class SameConstraint(Constraint):
 class SameModesConstraint(Constraint):
     """Require two tensor layouts to run along the same final mode of one axis."""
 
-    def __init__(self, left: str, right: str):
+    allow_partial: bool = False
+
+    def __init__(self, left: str, right: str, *, allow_partial=False):
+        object.__setattr__(self, "allow_partial", allow_partial)
         object.__setattr__(self, "field", "layout")
         object.__setattr__(self, "left", left)
         object.__setattr__(self, "right", right)
@@ -78,19 +97,11 @@ class SameModesConstraint(Constraint):
         return None if any(not isinstance(value, TensorType) for value in held) else held
 
     @staticmethod
-    def reading(tensor: TensorType, arrangement=None):
-        layout = tensor.layout if arrangement is None else arrangement
-        if isinstance(layout, ShardLayout):
-            if not all(isinstance(attr, Broadcast) for attr in layout.attrs):
-                layout = None
-            else:
-                layout = layout.layout
-        if isinstance(layout, ComposedLayout):
-            if layout.inner is not None and not isinstance(layout.inner, Swizzle):
-                layout = None
-            else:
-                layout = layout.outer
-        if not isinstance(layout, Layout) or layout.strides is None:
+    def reading(tensor: TensorType, arrangement=None, *, allow_partial=False):
+        layout = strided_arrangement(
+            tensor.layout if arrangement is None else arrangement, allow_partial=allow_partial
+        )
+        if layout is None:
             return None, f"{tensor.layout!r} is no strided arrangement"
         shape, strides = tuple(layout.shape), tuple(layout.strides)
         extents = tuple(tensor.shape)
@@ -127,7 +138,7 @@ class SameModesConstraint(Constraint):
         else:
             arrangements = (None, None)
         return tuple(
-            self.reading(value, arrangement)
+            self.reading(value, arrangement, allow_partial=self.allow_partial)
             for value, arrangement in zip(pair, arrangements)
         )
 

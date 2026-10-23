@@ -17,10 +17,10 @@ from tilefoundry.ir.hir._shard_checks import (
 )
 from tilefoundry.ir.isl_interop import normalize_dim_entries
 from tilefoundry.ir.pattern import is_ranked_tensor
-from tilefoundry.ir.types import Layout, Split, TensorType
+from tilefoundry.ir.types import Split, TensorType
 from tilefoundry.ir.types.dim import DimAdd, simplify_dim
+from tilefoundry.ir.types.layout import Layout
 from tilefoundry.ir.types.shard_layout import shard_layout_of, split_target_axes
-from tilefoundry.ir.types.stride import try_compact_major
 from tilefoundry.utils.lazy import torch
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
@@ -144,7 +144,14 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     _reject_concat_axis_splits(call, ctx, types, axis)
     try:
         relation = relations_of(call, ctx)
-        layout = derive_output_shard_layout(tuple(types), relation, new_shape, fresh_strides=True)
+        layout = derive_output_shard_layout(
+            tuple(types),
+            relation,
+            new_shape,
+            fresh_strides=True,
+            ctx=ctx,
+            storage=base.storage,
+        )
     except ValueError as error:
         ctx.error(
             call,
@@ -152,19 +159,8 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
         )
     if layout is not None:
         require_uniform_partial_slices(ctx, call, types, layout, "Concat")
-        if getattr(layout.layout, "strides", None) is None:
-            first = next(
-                index
-                for index, type_ in enumerate(types)
-                if shard_layout_of(type_.layout) is not None
-            )
-            ctx.error(
-                call,
-                f"input {first} ownership produces an unrepresentable result "
-                "layout; use an explicit Reshard before Concat",
-            )
     else:
-        layout = Layout(shape=new_shape, strides=try_compact_major(new_shape))
+        layout = Layout(new_shape)
     storage = resolve_anchor_storage(ctx, call, *(t.storage for t in types))
     return TensorType(shape=new_shape, dtype=base.dtype, layout=layout, storage=storage)
 

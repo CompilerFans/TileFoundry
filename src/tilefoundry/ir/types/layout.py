@@ -5,7 +5,6 @@ from typing import Optional
 
 from .int_tuple import flatten as _flat
 from .int_tuple import product
-from .stride import compact_col_major
 
 
 class LayoutBase:
@@ -26,6 +25,35 @@ class Layout(LayoutBase):
 
     shape: tuple["ShapeDim", ...]
     strides: Optional[tuple["ShapeDim", ...]] = None
+
+    def __post_init__(self):
+        if self.strides is not None:
+            return
+        from .stride import compact_row_major  # noqa: PLC0415
+
+        def canonical(mode):
+            if isinstance(mode, tuple):
+                return tuple(canonical(child) for child in mode)
+            if isinstance(mode, int):
+                return mode
+            from .dim import Constant  # noqa: PLC0415
+
+            return (
+                mode.value if isinstance(mode, Constant) and isinstance(mode.value, int) else mode
+            )
+
+        def multiply(a, b):
+            if isinstance(a, int) and isinstance(b, int):
+                return a * b
+            from .dim import DimMul, simplify_dim  # noqa: PLC0415
+
+            return simplify_dim(DimMul, (a, b))
+
+        shape = canonical(tuple(self.shape))
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(
+            self, "strides", _normalize_strides(shape, compact_row_major(shape, mul=multiply))
+        )
 
 
 @dataclass(frozen=True)
@@ -135,19 +163,14 @@ class ComposedLayout(LayoutBase):
         return domain.shape
 
 
-EMPTY_LAYOUT = Layout(shape=(), strides=())
-
-
 def flat_shape(layout: Layout) -> tuple[int, ...]:
     """Return CuTe ``flatten(layout.shape())`` as a flat tuple."""
     return _flat(layout.shape)
 
 
 def flat_stride(layout: Layout) -> tuple[int, ...]:
-    """Flatten stated strides, or synthesize the compact column-major default."""
-    if layout.strides is not None:
-        return _flat(layout.strides)
-    return compact_col_major(flat_shape(layout))
+    """Flatten a concrete layout's strides."""
+    return _flat(layout.strides)
 
 
 def apply(layout: Layout | ComposedLayout, coord: int) -> int:
@@ -196,11 +219,11 @@ def flatten(layout):
     if not isinstance(layout, LayoutBase):
         return _flat(layout)
     if isinstance(layout, ComposedLayout):
-        return flatten(layout.outer) if layout.outer is not None else EMPTY_LAYOUT
-    strides = getattr(layout, "strides", None)
+        return flatten(layout.outer) if layout.outer is not None else Layout((), ())
+    strides = layout.strides
     return Layout(
         shape=_flat(layout.shape),
-        strides=None if strides is None else _flat(strides),
+        strides=_flat(strides),
     )
 
 
@@ -208,10 +231,10 @@ def unflatten(layout: LayoutBase, profile) -> "Layout":
     """CuTe ``unflatten``: a flat arrangement nested to *profile*'s shape."""
     from .int_tuple import unflatten as unflatten_tuple  # noqa: PLC0415 - cycle guard
 
-    strides = getattr(layout, "strides", None)
+    strides = layout.strides
     return Layout(
         shape=unflatten_tuple(tuple(layout.shape), profile),
-        strides=None if strides is None else unflatten_tuple(tuple(strides), profile),
+        strides=unflatten_tuple(tuple(strides), profile),
     )
 
 
@@ -223,21 +246,19 @@ def rank(layout: LayoutBase) -> int:
 def get(layout: LayoutBase, index: int) -> "Layout":
     """CuTe ``get<I>``: one mode of a layout, as a layout of its own."""
     shape = layout.shape[index]
-    strides = layout.strides[index] if getattr(layout, "strides", None) is not None else None
+    strides = layout.strides[index]
     return Layout(
         shape=shape if isinstance(shape, tuple) else (shape,),
-        strides=None
-        if strides is None
-        else (strides if isinstance(strides, tuple) else (strides,)),
+        strides=strides if isinstance(strides, tuple) else (strides,),
     )
 
 
 def take(layout: LayoutBase, begin: int, end: int) -> "Layout":
     """CuTe ``take<B, E>``: the modes in ``[begin, end)``, as a layout."""
-    strides = getattr(layout, "strides", None)
+    strides = layout.strides
     return Layout(
         shape=tuple(layout.shape[begin:end]),
-        strides=None if strides is None else tuple(strides[begin:end]),
+        strides=tuple(strides[begin:end]),
     )
 
 
@@ -251,51 +272,45 @@ __all__ = [
     "Layout",
     "Swizzle",
     "ComposedLayout",
-    "EMPTY_LAYOUT",
     "flat_shape",
     "flat_stride",
     "get",
     "make_swizzle",
     "rank",
-    "resolve_layout",
+    "normalize_layout",
     "take",
 ]
 
 
-def resolve_layout(layout: LayoutBase | None, shape: tuple | None = None) -> LayoutBase:
-    """Read an omitted layout or stride as compact row-major, without mutating IR.
+def _normalize_strides(shape, strides):
+    if isinstance(shape, tuple):
+        return tuple(
+            _normalize_strides(one, step) for one, step in zip(shape, strides, strict=True)
+        )
+    from .dim import Constant  # noqa: PLC0415
 
-    Concrete address functions, sharding, and nontrivial composition remain
-    explicit. Signature compatibility treats an omitted constraint separately.
-    """
+    extent = shape.value if isinstance(shape, Constant) else shape
+    return (
+        0 if isinstance(extent, int) and not isinstance(extent, bool) and extent == 1 else strides
+    )
+
+
+def normalize_layout(layout: LayoutBase) -> LayoutBase:
+    """Normalize unit leaves without changing modes, placement or addresses."""
     from dataclasses import replace  # noqa: PLC0415
 
-    from .stride import compact_row_major  # noqa: PLC0415
-
-    def multiply(left, right):
-        if isinstance(left, int) and isinstance(right, int):
-            return left * right
-        from .dim import DimMul, simplify_dim  # noqa: PLC0415
-
-        return simplify_dim(DimMul, (left, right))
-
-    if layout is None:
-        if shape is None:
-            raise ValueError("an omitted tensor layout needs its logical shape")
-        return Layout(tuple(shape), compact_row_major(tuple(shape), mul=multiply))
     if isinstance(layout, Layout):
-        return (
-            layout
-            if layout.strides is not None
-            else replace(layout, strides=compact_row_major(layout.shape, mul=multiply))
-        )
+        return replace(layout, strides=_normalize_strides(layout.shape, layout.strides))
     if isinstance(layout, ComposedLayout):
-        inner = layout.inner
-        if isinstance(inner, LayoutBase):
-            inner = resolve_layout(inner)
-        return replace(layout, inner=inner, outer=resolve_layout(layout.outer))
-    from .shard_layout import ShardLayout  # noqa: PLC0415 - staged types
+        return replace(
+            layout,
+            outer=normalize_layout(layout.outer) if layout.outer is not None else None,
+            inner=normalize_layout(layout.inner)
+            if isinstance(layout.inner, LayoutBase)
+            else layout.inner,
+        )
+    from .shard_layout import ShardLayout  # noqa: PLC0415
 
     if isinstance(layout, ShardLayout):
-        return replace(layout, layout=resolve_layout(layout.layout))
+        return replace(layout, layout=normalize_layout(layout.layout))
     raise TypeError(f"not a tensor layout: {type(layout).__name__}")

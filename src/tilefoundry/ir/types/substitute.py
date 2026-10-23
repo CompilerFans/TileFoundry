@@ -156,8 +156,6 @@ def _collect(value: object, found: dict[str, "DimVar"]) -> None:
 
 
 def _collect_layout(layout: object, found: dict[str, "DimVar"]) -> None:
-    if layout is None:
-        return
     Layout, ComposedLayout, ShardLayout, _, _ = _shard_types()
     if isinstance(layout, ShardLayout):
         _collect_layout(layout.layout, found)
@@ -170,8 +168,7 @@ def _collect_layout(layout: object, found: dict[str, "DimVar"]) -> None:
         return
     if isinstance(layout, Layout):
         _collect(layout.shape, found)
-        if layout.strides is not None:
-            _collect(layout.strides, found)
+        _collect(layout.strides, found)
 
 
 def substitute_dims(value: Type, bindings: Mapping[str, int]) -> Type:
@@ -229,8 +226,6 @@ def canonicalize_dims(value: Type) -> Type:
 
 
 def _canonicalize_layout_dims(layout: object) -> object:
-    if layout is None:
-        return layout
     Layout, ComposedLayout, ShardLayout, _, _ = _shard_types()
     if isinstance(layout, ShardLayout):
         inner = _canonicalize_layout_dims(layout.layout)
@@ -247,7 +242,7 @@ def _canonicalize_layout_dims(layout: object) -> object:
         return ComposedLayout(inner=inner, offset=offset, outer=outer)
     if isinstance(layout, Layout):
         shape = _canonicalize_nested(layout.shape)
-        strides = None if layout.strides is None else _canonicalize_nested(layout.strides)
+        strides = _canonicalize_nested(layout.strides)
         if shape == layout.shape and strides == layout.strides:
             return layout
         return Layout(shape=shape, strides=strides)
@@ -300,8 +295,6 @@ def substitute_layout_dims(layout: object, bindings: Mapping[str, int]) -> objec
     A shard layout's Mesh is part of that geometry: its layout and topology
     extents may be derived from the same dimensions as the tensor shape.
     """
-    if layout is None:
-        return layout
     Layout, ComposedLayout, ShardLayout, _, _ = _shard_types()
     if isinstance(layout, ShardLayout):
         inner = substitute_layout_dims(layout.layout, bindings)
@@ -318,7 +311,7 @@ def substitute_layout_dims(layout: object, bindings: Mapping[str, int]) -> objec
         return ComposedLayout(inner=inner, offset=offset, outer=outer)
     if isinstance(layout, Layout):
         shape = _substitute_nested(layout.shape, bindings)
-        strides = None if layout.strides is None else _substitute_nested(layout.strides, bindings)
+        strides = _substitute_nested(layout.strides, bindings)
         if shape == layout.shape and strides == layout.strides:
             return layout
         return Layout(shape=shape, strides=strides)

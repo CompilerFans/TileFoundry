@@ -5,7 +5,7 @@ from __future__ import annotations
 from .dtype import BoolDType, DType, FloatDType, IntegerDType
 from .storage import StorageKind
 from .int_tuple import IntTuple
-from .layout import ComposedLayout, Layout, LayoutBase, Swizzle, resolve_layout
+from .layout import ComposedLayout, Layout, LayoutBase, Swizzle
 from .shard_layout import (
     B,
     Broadcast,
@@ -58,7 +58,6 @@ __all__ = [
     "make_mesh",
     "make_shard_tensor_type",
     "make_tensor_type",
-    "resolve_layout",
 ]
 
 

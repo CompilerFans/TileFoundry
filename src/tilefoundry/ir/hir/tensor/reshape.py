@@ -17,7 +17,6 @@ from tilefoundry.ir.types.shard_layout import (
     Split,
 )
 from tilefoundry.ir.types.storage import StorageKind
-from tilefoundry.ir.types.stride import try_compact_major
 from tilefoundry.ir.types.substitute import dim_vars_in
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
@@ -36,6 +35,7 @@ from ._view_layout import derive_view_layout
 class Reshape(Op):
     x = ParamDef(kind="input", pattern=is_ranked_tensor())
     new_shape = ParamDef(kind="attribute", annotation=tuple)
+
 
 @register_access_relation(Reshape)
 def _reshape_relations(call: "Call", ctx) -> tuple[AccessRelation, ...]:
@@ -121,7 +121,7 @@ def _carry_sharded_reshape(layout: ShardLayout, new_shape: tuple):
                 if ci >= n_axis:
                     return None
                 cs = int(axis_shape[ci])
-                stride = axis_strides[ci] if axis_strides is not None else 0
+                stride = axis_strides[ci]
                 old_pos = ci
                 ci += 1
             new_prod = prod * cs
@@ -166,7 +166,7 @@ def _carry_sharded_reshape(layout: ShardLayout, new_shape: tuple):
             new_attrs.append(attr)
 
     out_shape = tuple(s for s, _, _ in new_positions)
-    out_strides = None if axis_strides is None else tuple(st for _, st, _ in new_positions)
+    out_strides = tuple(st for _, st, _ in new_positions)
     new_layout = Layout(shape=out_shape, strides=out_strides)
     return ShardLayout(layout=new_layout, attrs=tuple(new_attrs), mesh=layout.mesh)
 
@@ -192,20 +192,20 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
                 "not align with the input layout factorization",
             )
         if new_layout is None:
-            new_layout = replace(x_ty.layout, layout=Layout(new_shape, None))
+            new_layout = replace(x_ty.layout, layout=Layout(new_shape))
     else:
+
         def reshaped(layout: Layout) -> Layout | None:
             nonunit = tuple(axis for axis, extent in enumerate(layout.shape) if extent != 1)
             if (
                 len(nonunit) < len(layout.shape)
-                and layout.strides is not None
                 and new_shape == tuple(layout.shape[axis] for axis in nonunit)
             ):
                 return Layout(new_shape, tuple(layout.strides[axis] for axis in nonunit))
-            expected = try_compact_major(layout.shape)
-            if layout.strides is not None and layout.strides != expected:
+            expected = Layout(layout.shape).strides
+            if layout.strides != expected:
                 return None
-            return Layout(new_shape, try_compact_major(new_shape))
+            return Layout(new_shape)
 
         new_layout = derive_view_layout(x_ty, new_shape, reshaped)
     if new_layout is None:

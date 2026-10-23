@@ -18,7 +18,7 @@ from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir._shard_checks import reject_partials
 from tilefoundry.ir.pattern import is_ranked_tensor
-from tilefoundry.ir.types import DType, Layout, TensorType, TupleType
+from tilefoundry.ir.types import DType, TensorType, TupleType
 from tilefoundry.ir.types.dim import (
     DimAdd,
     DimFloorDiv,
@@ -29,13 +29,14 @@ from tilefoundry.ir.types.dim import (
     DimVar,
     is_dim_expr,
 )
+from tilefoundry.ir.types.int_tuple import compatible_profile, mode_axes
+from tilefoundry.ir.types.layout import Layout
 from tilefoundry.ir.types.shard_layout import (
     ShardLayout,
     Split,
-    layout_axis_to_tensor_axis,
     shard_layout_of,
 )
-from tilefoundry.ir.types.stride import try_compact_major
+from tilefoundry.ir.types.storage import StorageOwners
 from tilefoundry.ir.types.tensor_type import ShapeDim
 from tilefoundry.ir.visitor import ExprVisitor
 from tilefoundry.utils.lazy import torch
@@ -141,22 +142,6 @@ def _dim_upper_bound(d) -> "int | None":
     return None
 
 
-def _canonical_shard(sl: "ShardLayout", out_shape) -> "ShardLayout":
-    """Canonical shard.
-
-    Canonical output ``ShardLayout`` for a replicated input (nothing for the
-    generic propagator to carry): C-order strides over ``out_shape``, all-ones
-    when the shape is non-static; ``attrs`` and ``mesh`` pass through.
-    """
-    out_shape = tuple(out_shape)
-    strides = try_compact_major(out_shape) or tuple(1 for _ in out_shape)
-    return ShardLayout(
-        layout=Layout(shape=out_shape, strides=strides),
-        attrs=sl.attrs,
-        mesh=sl.mesh,
-    )
-
-
 @register_typeinfer(TopK)
 def _(call: "Call", ctx: "TypeInferContext") -> TupleType:
     x_ty = ctx.type_of(call.args[0])
@@ -188,7 +173,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TupleType:
             )
     source_shard = shard_layout_of(x_ty.layout)
     if source_shard is not None:
-        la2ta = layout_axis_to_tensor_axis(source_shard.layout.shape, x_ty.shape)
+        la2ta = mode_axes(compatible_profile(source_shard.layout.shape, x_ty.shape))
         if any(isinstance(a, Split) and la2ta[a.axis] == axis for a in source_shard.attrs):
             ctx.error(call, f"selected axis {axis} must not be Split-sharded")
 
@@ -197,16 +182,31 @@ def _(call: "Call", ctx: "TypeInferContext") -> TupleType:
     out_shape[axis] = k
     out_shape = tuple(out_shape)
 
-    new_layout = (
-        None
-        if x_ty.layout is None
-        else Layout(shape=out_shape, strides=try_compact_major(out_shape))
-    )
+    new_layout = Layout(out_shape)
     if source_shard is not None:
         relation = relations_of(call, ctx)
-        derived = derive_output_shard_layout((x_ty,), relation, out_shape, fresh_strides=True)
+        derived = derive_output_shard_layout(
+            (x_ty,),
+            relation,
+            out_shape,
+            fresh_strides=True,
+            ctx=ctx,
+            storage=x_ty.storage,
+        )
 
-        new_layout = derived if derived is not None else _canonical_shard(source_shard, out_shape)
+        new_layout = (
+            derived
+            if derived is not None
+            else ShardLayout.default(
+                out_shape,
+                source_shard.mesh,
+                source_shard.attrs,
+                storage=x_ty.storage,
+                owners=ctx.target.storage_owners
+                if ctx is not None and ctx.target is not None
+                else StorageOwners((), {}),
+            )
+        )
     values_ty = TensorType(
         shape=out_shape, dtype=x_ty.dtype, layout=new_layout, storage=x_ty.storage
     )

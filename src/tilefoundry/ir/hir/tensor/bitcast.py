@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from functools import cache
 from itertools import product
 from math import prod
@@ -22,12 +21,11 @@ from tilefoundry.ir.types import (
     StorageKind,
     TensorType,
 )
-from tilefoundry.ir.types.int_tuple import flatten
-from tilefoundry.ir.types.layout import apply, resolve_layout
-from tilefoundry.ir.types.layout_correspondence import layout_correspondence
+from tilefoundry.ir.types.int_tuple import compatible_profile, flatten, mode_axes
+from tilefoundry.ir.types.layout import apply, unflatten
+from tilefoundry.ir.types.layout import flatten as flatten_layout
 from tilefoundry.ir.types.mesh import levels, starts
 from tilefoundry.ir.types.shard_layout import (
-    layout_axis_to_tensor_axis,
     local_layout_and_offset,
     shard_layout_of,
     split_target_axes,
@@ -59,17 +57,16 @@ def _address_points(layout, count: int, logical_shape: tuple):
     Both byte reinterpretation and storage aliasing read the same factored
     shard domain; their reducers decide whether repeated locations are legal.
     """
-    layout = resolve_layout(layout, logical_shape)
     shard = shard_layout_of(layout)
     base = shard.layout if shard is not None else layout
     whole = {}
-    corresponding = layout_correspondence(base.shape, logical_shape)
-    logical_layout = resolve_layout(None, logical_shape)
-    steps = compact_col_major(corresponding.extents)
+    flat = flatten_layout(base)
+    grouped = unflatten(Layout(flat.shape, compact_col_major(flat.shape)),
+                        compatible_profile(base.shape, logical_shape))
+    logical_steps = compact_col_major(logical_shape)
     for coordinate in range(count):
-        digits = corresponding.digits(apply(logical_layout, coordinate))
-        mode_index = crd2idx(digits, corresponding.extents, steps)
-        address = apply(base, mode_index)
+        logical = idx2crd(coordinate, logical_shape, logical_steps)
+        address = apply(base, crd2idx(logical, grouped.shape, grouped.strides))
         if shard is None:
             yield coordinate, (), address, address
         else:
@@ -100,7 +97,6 @@ def _address_points(layout, count: int, logical_shape: tuple):
 
 def _addresses(layout, count: int, logical_shape: tuple):
     """Require one unique address per logical element for a Bitcast."""
-    layout = resolve_layout(layout, logical_shape)
     if not isinstance(layout, ShardLayout):
         return tuple(point[2] for point in _address_points(layout, count, logical_shape))
     layout = participant_layout(layout)
@@ -132,23 +128,16 @@ def _address_mapping(
     return tuple(source_at[address] for address in result_at)
 
 
-def _stated_strides(layout) -> bool:
-    if isinstance(layout, Layout):
-        return layout.strides is not None
-    if isinstance(layout, ComposedLayout):
-        return _stated_strides(layout.outer) and _stated_strides(layout.inner)
-    return True
-
-
 @register_typeinfer(Bitcast)
 def _(call: Call, ctx) -> TensorType:
     source = ctx.type_of(call.args[0])
-    source = replace(source, layout=resolve_layout(source.layout, source.shape))
     stated_layout = call.target.layout
-    layout = resolve_layout(stated_layout, source.shape)
     if not is_literal_shape(source.shape):
         ctx.error(call, "source tensor shape must be literal")
-    sharded = isinstance(source.layout, ShardLayout) or isinstance(layout, ShardLayout)
+    sharded = isinstance(source.layout, ShardLayout) or isinstance(stated_layout, ShardLayout)
+    shape = source.shape if sharded else tuple(prod(flatten(mode)) for mode in stated_layout.shape)
+    result = TensorType(shape, source.dtype, stated_layout, source.storage)
+    layout = result.layout
     if sharded:
         if source.storage is not StorageKind.RMEM:
             ctx.error(call, "sharded bitcast requires rmem storage")
@@ -165,7 +154,6 @@ def _(call: Call, ctx) -> TensorType:
             inner = held.layout
             if (
                 not isinstance(inner, Layout)
-                or inner.strides is None
                 or any(isinstance(stride, tuple) for stride in inner.strides)
             ):
                 ctx.error(
@@ -175,7 +163,7 @@ def _(call: Call, ctx) -> TensorType:
             if not all(isinstance(attr, Split) for attr in held.attrs):
                 ctx.error(call, f"{end} rmem layout must contain only Split attributes")
             try:
-                axes = layout_axis_to_tensor_axis(held.layout.shape, source.shape)
+                axes = mode_axes(compatible_profile(held.layout.shape, source.shape))
                 split_target_axes(held, source.shape)
                 extents = tuple(prod(flatten(mode)) for mode in held.layout.shape)
                 if any(
@@ -193,11 +181,8 @@ def _(call: Call, ctx) -> TensorType:
             held = held.layout
         if not isinstance(held, (Layout, ComposedLayout)) or shard_layout_of(held) is not None:
             ctx.error(call, f"{end} layout must be plain (without ShardLayout): {held!r}")
-        if not _stated_strides(held):
-            ctx.error(call, f"{end} layout must have strides stated in every Layout component")
         if not is_literal_shape(flatten(held.shape)):
             ctx.error(call, f"{end} layout shape must be literal")
-    shape = source.shape if sharded else tuple(prod(flatten(mode)) for mode in layout.shape)
     count = prod(source.shape)
     layout_count = prod(flatten(layout.shape))
     if layout_count != count:
@@ -208,7 +193,7 @@ def _(call: Call, ctx) -> TensorType:
         _address_mapping(source.layout, layout, count, source.shape, shape)
     except ValueError as error:
         ctx.error(call, str(error))
-    return TensorType(shape, source.dtype, stated_layout, source.storage)
+    return result
 
 
 @register_buffer_alias(Bitcast)

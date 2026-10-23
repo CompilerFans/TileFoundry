@@ -198,7 +198,9 @@ def test_typeinfer_canonicalizes_equivalent_symbolic_shapes() -> None:
 def test_static_typeinfer_does_not_enter_dim_canonicalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    static = TensorType(shape=(8, 128), dtype=DType.f32, layout=None, storage="gmem")
+    static = TensorType(
+        shape=(8, 128), dtype=DType.f32, layout=Layout((8, 128), (128, 1)), storage="gmem"
+    )
 
     def fail_if_called(_):
         raise AssertionError("static types must not enter isl canonicalization")
@@ -236,7 +238,12 @@ def test_a_fully_static_dim_has_one_canonical_int_representation() -> None:
     assert mixed.shape[0] is s
     assert mixed.shape[1] == 128 and isinstance(mixed.shape[1], int)
 
-    param = TensorType(shape=(1, 4, 32, 128), dtype=DType.bf16, layout=None, storage="gmem")
+    param = TensorType(
+        shape=(1, 4, 32, 128),
+        dtype=DType.bf16,
+        layout=Layout((1, 4, 32, 128)),
+        storage="gmem",
+    )
     x = Constant(type=param, value=None)
     starts = Tuple(
         type=TupleType(fields=(TensorType.scalar(DType.i64),) * 4),

@@ -44,7 +44,7 @@ from tilefoundry.ir.hir.specialize import (
     origin_of,
 )
 from tilefoundry.ir.hir.tensor.reshape import Reshape
-from tilefoundry.ir.hir.tensor.slice import Slice, window_base
+from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.isl_interop import normalize_dim
 from tilefoundry.ir.tir.prim_function import PrimFunction
@@ -61,10 +61,9 @@ from tilefoundry.utils.python_source import PythonExpr
 from tilefoundry.visitor_registry.contexts import ValuationContext
 
 from .print_context import HirPrintContext
-from .printer_base import PythonPrinter
+from .printer_base import PARTS, PythonPrinter
 from .tir_printer import _function_block as _tir_function_block
 from .tir_printer import tir_function_to_python, tir_module_to_python
-from .values import PARTS, render_comment
 
 
 class HirPrinter(PythonPrinter):
@@ -97,10 +96,10 @@ class HirPrinter(PythonPrinter):
             return text if owner._function is self._function else f"{owner._function.name}::{text}"
         return super().print(value, ctx, indent)
 
-    def render(self, fn: HirFunction, *, options=None) -> _PythonRendering:
+    def render(self, fn: HirFunction, *, options=None, target=None) -> _PythonRendering:
         if options is not None and options.comment_metadata_types:
-            _render_hir_function(fn, printer=self)
-        return _render_hir_function(fn, options=options, printer=self)
+            _render_hir_function(fn, printer=self, target=target)
+        return _render_hir_function(fn, options=options, printer=self, target=target)
 
     def bind_def(
         self,
@@ -218,7 +217,13 @@ class HirPrinter(PythonPrinter):
 
         alias_name = _kinded_alias_name(target)
         suppressed = frozenset({"kind"}) if alias_name is not None else frozenset()
-        attrs = self.op_attributes(target, ctx, self._indent + "    ", suppressed=suppressed)
+        attrs = self.op_attributes(
+            target,
+            ctx,
+            self._indent + "    ",
+            suppressed=suppressed,
+            storage=getattr(expr.type, "storage", None),
+        )
         schema = getattr(type(target), "_op_schema", None)
         inputs = tuple(param for param in schema.signature if param.kind == "input") if schema else ()
         arguments = (
@@ -286,7 +291,7 @@ def _comments(expr: Expr, options: PythonPrintOptions, printer: PythonPrinter, c
         metadata = get_metadata(expr, metadata_type)
         if metadata is None:
             continue
-        comment = render_comment(metadata, opt_in=options.comment_opt_in, printer=printer)
+        comment = printer.comment(metadata, opt_in=options.comment_opt_in)
         if comment is not None:
             comments.append(comment)
     return f"  # {PARTS.join(comments)}" if comments else ""
@@ -636,13 +641,17 @@ def _emit_def(
 
     def _window_base(start, stride):
         """Recognize an induction window, optionally scaled and shifted by integers."""
-        window, offset = window_base(start)
-        window = _capture_root(window)
+        if (value := static_dim_value(start)) is not None:
+            return None, value, None
+        window, offset = _capture_root(start), 0
         while isinstance(window, Call) and isinstance(window.target, (DimAdd, DimSub)):
             left, right = window.args
             shift = static_dim_value(normalize_dim(_capture_root(right)))
             if shift is None:
-                break
+                shift = static_dim_value(normalize_dim(_capture_root(left)))
+                if shift is None or not isinstance(window.target, DimAdd):
+                    break
+                left = right
             offset += shift if isinstance(window.target, DimAdd) else -shift
             window = _capture_root(left)
         if isinstance(window, Var) and stride == 1:
@@ -832,7 +841,7 @@ def _emit_def(
         name = _names[id(param)]
         if isinstance(param.type, TensorType):
             with printer.type_surface(indent=indent, const=param.is_const):
-                annotation = printer.visit(param.type, ctx)
+                annotation = printer.visit(param.annotation, ctx)
             params.append(f"{indent}{name}: {annotation}")
         else:
             params.append(f"{indent}{name}")
@@ -1055,6 +1064,7 @@ def _emit_def(
 def _new_hir_context(*, target=None) -> HirPrintContext:
     """Create a HIR context with imports owned by the surrounding file."""
     ctx = HirPrintContext()
+    ctx.target = target
     if target is not None:
         rendered = target.to_python()
         ctx.imports.update(rendered.imports)
@@ -1134,6 +1144,7 @@ def _render_hir_function(
     *,
     options: PythonPrintOptions | None = None,
     printer: HirPrinter | None = None,
+    target=None,
 ) -> _PythonRendering:
     """Render a HIR Function and locate every Call equation in the same pass.
 
@@ -1144,6 +1155,7 @@ def _render_hir_function(
     """
     indent = "    "
     ctx = _new_hir_context()
+    ctx.target = target
     ctx.value_printer = printer or HirPrinter()
     statements: dict[int, _PrintedStatement] = {}
     lines = _emit_decorated_defs(
@@ -1187,14 +1199,14 @@ def as_script(
     """
     if isinstance(fn, Module):
         if fn.functions and all(isinstance(item, PrimFunction) for item in fn.functions):
-            return tir_module_to_python(fn, module, options=options)
+            return tir_module_to_python(fn, module)
         return _module_to_python(fn, module, options=options)
     if isinstance(fn, PrimFunction) and module is None:
-        return tir_function_to_python(fn, options=options)
+        return tir_function_to_python(fn)
     if module is not None:
         if isinstance(fn, PrimFunction):
             return tir_module_to_python(
-                Module(name=module, functions=(fn,), entry=fn.name), options=options
+                Module(name=module, functions=(fn,), entry=fn.name)
             )
         return _module_to_python(fn, module, options=options)
     return hir_function_to_python(fn, options=options)
@@ -1300,6 +1312,8 @@ def _emit_module_class(
     to and a class body binds in the order it is written.
     """
     previous_topologies = ctx.topologies
+    previous_target = ctx.target
+    ctx.target = mod.target or previous_target
     ctx.topologies = mod.topologies if mod.topologies is not None else previous_topologies
     lines = [_module_decorator_line(mod, mod.entry, ctx), f"class {module_name}:"]
     ordered = _emission_order(mod)
@@ -1320,6 +1334,7 @@ def _emit_module_class(
             lines.append("")
         lines.extend(f"{indent}{ln}" if ln else ln for ln in block)
     ctx.topologies = previous_topologies
+    ctx.target = previous_target
     return lines
 
 

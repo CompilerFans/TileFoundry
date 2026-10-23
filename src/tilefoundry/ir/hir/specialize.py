@@ -172,6 +172,7 @@ class InstantiateDimensionCloner(ExprCloner):
             params=params,
             body=body,
             return_type=result_type,
+            return_annotation=substitute_dims(chosen.return_annotation, self.dims),
             type=callable_type_for(params, result_type),
             variants=(),
             converters=(),
@@ -203,7 +204,11 @@ class InstantiateDimensionCloner(ExprCloner):
         return cloned
 
     def visit_Var(self, value, ctx=None):
-        return dataclasses.replace(value, type=substitute_dims(value.type, self.dims))
+        return dataclasses.replace(
+            value,
+            type=substitute_dims(value.type, self.dims),
+            annotation=substitute_dims(value.annotation, self.dims),
+        )
 
     def visit_Constant(self, value, ctx=None):
         return dataclasses.replace(value, type=substitute_dims(value.type, self.dims))

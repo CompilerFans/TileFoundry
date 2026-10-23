@@ -1,76 +1,19 @@
 from __future__ import annotations
 
 import math
-from dataclasses import replace
 from typing import Optional
 
-from tilefoundry.ir.types.int_tuple import flatten as flatten_tuple
 from tilefoundry.ir.types.int_tuple import repeat_like
-from tilefoundry.ir.types.layout import flatten, resolve_layout
-from tilefoundry.ir.types.storage import StorageKind
+from tilefoundry.ir.types.layout import Layout, flatten
+from tilefoundry.ir.types.shard_layout import ShardLayout
+from tilefoundry.ir.types.storage import StorageKind, StorageOwners
 
 from .dtype import DType
-from .layout import ComposedLayout, Layout, apply
+from .layout import ComposedLayout, apply
 from .layout_algebra import size
-from .layout_correspondence import layout_correspondence
 from .mesh import Mesh, Topology, make_mesh, separate
-from .shard_layout import (
-    Broadcast,
-    ShardLayout,
-    Split,
-    canonical_shard_layout,
-    shard_layout_of,
-    split_target_axes,
-)
+from .shard_layout import Broadcast, Split, shard_layout_of, split_target_axes
 from .tensor_type import TensorType, TupleType, Type
-
-
-def _inner_layout(
-    layout: Layout, counts: tuple[int, ...], logical_shape: tuple
-) -> tuple[Layout, dict[int, int]]:
-    """Drop each logical axis's outer tile digits using the shared correspondence.
-
-    A unit logical axis retains a physical unit coordinate in grouped layouts.
-    """
-    if isinstance(layout, ComposedLayout):
-        outer, positions = _inner_layout(layout.outer, counts, logical_shape)
-        return replace(layout, outer=outer), positions
-    corresponding = layout_correspondence(layout.shape, logical_shape)
-    if corresponding.groups is None:
-        raise ValueError(f"layout {layout!r} crosses logical axes of {logical_shape}")
-    if len(counts) != len(logical_shape):
-        raise ValueError(f"tile counts {counts} do not match logical shape {logical_shape}")
-    steps = None if layout.strides is None else tuple(flatten_tuple(layout.strides))
-    grouped = any(isinstance(mode, tuple) for mode in layout.shape)
-    shape_modes, stride_modes = [], []
-    positions = {}
-    for axis, (group, count) in enumerate(zip(corresponding.groups, counts, strict=True)):
-        taken, prefix = 1, 0
-        while taken != count and prefix < len(group):
-            extent = static_dim_value(corresponding.extents[group[prefix]])
-            if extent is None:
-                break
-            taken *= extent
-            prefix += 1
-        if taken != count:
-            raise ValueError(
-                f"layout axis {axis} has no leading modes whose product is tile count {count}"
-            )
-        kept = group[prefix:]
-        shapes = tuple(corresponding.extents[position] for position in kept) or (1,)
-        strides = None if steps is None else (tuple(steps[position] for position in kept) or (0,))
-        start = sum(len(tuple(flatten_tuple(mode))) for mode in shape_modes)
-        for offset, position in enumerate(kept):
-            positions[position] = start + offset
-        if grouped:
-            shape_modes.append(shapes if len(shapes) > 1 else shapes[0])
-            if strides is not None:
-                stride_modes.append(strides if len(strides) > 1 else strides[0])
-        else:
-            shape_modes.extend(shapes)
-            if strides is not None:
-                stride_modes.extend(strides)
-    return Layout(tuple(shape_modes), None if steps is None else tuple(stride_modes)), positions
 
 
 def participant_layout(
@@ -139,8 +82,6 @@ def _participant_frame(source: Mesh, required: Mesh) -> tuple[Mesh, int]:
     if not isinstance(source_layout, Layout) or not isinstance(required_layout, Layout):
         raise ValueError("tile participant meshes require concrete layouts")
     source_shape = tuple(source_layout.shape)
-    if source_layout.strides is None or required_layout.strides is None:
-        raise ValueError("tile participant meshes require strided layouts")
     source_strides = tuple(source_layout.strides)
     stated = {apply(required_layout, index) for index in range(size(required_layout))}
     dropped = next(
@@ -173,82 +114,12 @@ def _participant_frame(source: Mesh, required: Mesh) -> tuple[Mesh, int]:
     )
 
 
-def tile_view_layout(
-    type_: TensorType,
-    inner_shape: tuple,
-    *,
-    counts: tuple[int, ...],
-    participant: Mesh | None = None,
-    enclosing: Mesh | None = None,
-    shard_attrs: tuple | None = None,
-) -> object:
-    """Return one tile, removing repeat digits within their own logical axes.
-
-    ``counts`` is the validated repeat projected onto operand axes. Tensor modes
-    follow logical-axis correspondence; mesh participant frames remain physical.
-    """
-    layout = resolve_layout(type_.layout, type_.shape)
-    composed = isinstance(layout, ComposedLayout)
-    inner = layout.inner if composed else None
-    outer = layout.outer if composed else layout
-    if isinstance(outer, ShardLayout):
-        from .window import shard_window_layout  # noqa: PLC0415
-
-        projected = outer if participant is None else participant_layout(outer, participant)
-        mesh, dropped = (
-            (projected.mesh, 0)
-            if participant is None
-            else _participant_frame(projected.mesh, participant)
-        )
-        source = replace(projected, mesh=mesh, attrs=projected.attrs[dropped:])
-        inner_layout = shard_window_layout(
-            source,
-            type_.shape,
-            (0,) * len(type_.shape),
-            tuple(extent // count for extent, count in zip(type_.shape, counts, strict=True)),
-            (1,) * len(type_.shape),
-        )
-    elif isinstance(outer, Layout):
-        inner_layout, _positions = _inner_layout(outer, counts, type_.shape)
-    else:
-        raise ValueError(f"cannot take tile inner modes from {type(outer).__name__}")
-    if composed and inner is not None:
-        inner_layout = ComposedLayout(inner, 0, inner_layout)
-    if shard_attrs is not None and not isinstance(inner_layout, ShardLayout):
-        if participant is None or enclosing is None:
-            raise ValueError("a declared shard fragment needs an enclosing participant mesh")
-        frame, _dropped = _participant_frame(enclosing, participant)
-        inner_layout = ShardLayout(inner_layout, shard_attrs, frame)
-    return inner_layout
-
-
-def tile_inner_type(
-    type_: TensorType,
-    inner_shape: tuple,
-    *,
-    counts: tuple[int, ...],
-    participant: Mesh | None = None,
-    enclosing: Mesh | None = None,
-    shard_attrs: tuple | None = None,
-) -> TensorType:
-    """Take the inner fragment after leading CuTe tile modes are removed."""
-    layout = tile_view_layout(
-        type_,
-        inner_shape,
-        counts=counts,
-        participant=participant,
-        enclosing=enclosing,
-        shard_attrs=shard_attrs,
-    )
-    return TensorType(tuple(inner_shape), type_.dtype, layout, type_.storage)
-
-
 def is_unsharded_layout(layout: object) -> bool:
     """Recognize the three tensor layout forms that carry no distribution."""
     shard = shard_layout_of(layout)
     if shard is not None:
         return all(isinstance(attr, Broadcast) for attr in shard.attrs)
-    return layout is None or isinstance(layout, (Layout, ComposedLayout))
+    return isinstance(layout, (Layout, ComposedLayout))
 
 
 def strip_broadcast_layout(layout):
@@ -288,7 +159,7 @@ def types_compatible(declared: Type, actual: Type) -> bool:
                 and field_compatible(declared_layout.attrs, actual_layout.attrs)
                 and layout_compatible(declared_layout.layout, actual_layout.layout)
             )
-        return actual_layout == resolve_layout(declared_layout)
+        return actual_layout == declared_layout
 
     if isinstance(declared, TensorType):
         if not isinstance(actual, TensorType):
@@ -296,18 +167,14 @@ def types_compatible(declared: Type, actual: Type) -> bool:
         if is_unsharded_layout(declared.layout) and is_unsharded_layout(actual.layout):
             declared_layout = strip_broadcast_layout(declared.layout)
             actual_layout = strip_broadcast_layout(actual.layout)
-            compatible_layout = (
-                declared_layout is None
-                or actual_layout is None
-                or layout_compatible(
-                    declared_layout,
-                    resolve_layout(actual_layout, actual.shape),
-                )
+            compatible_layout = declared_layout is None or layout_compatible(
+                declared_layout,
+                actual_layout,
             )
         else:
             compatible_layout = declared.layout is None or layout_compatible(
                 declared.layout,
-                resolve_layout(actual.layout, actual.shape),
+                actual.layout,
             )
         return (
             declared.shape == actual.shape
@@ -413,7 +280,12 @@ def make_tensor_type(
     layout: object = None,
 ) -> "TensorType":
     """Convenience constructor for a plain (unsharded) ``TensorType``."""
-    return TensorType(shape=tuple(shape), dtype=dtype, layout=layout, storage=storage)
+    return TensorType(
+        shape=tuple(shape),
+        dtype=dtype,
+        layout=Layout(tuple(shape)) if layout is None else layout,
+        storage=storage,
+    )
 
 
 def make_shard_tensor_type(
@@ -426,15 +298,15 @@ def make_shard_tensor_type(
     """Build a canonical sharded ``TensorType`` from its logical description.
 
     ``attrs`` contains one entry per mesh axis. With no mesh or attributes the
-    result is unsharded; otherwise :func:`canonical_shard_layout` supplies the
+    result is unsharded; otherwise `ShardLayout.default` supplies the
     shared canonical representation.
 
     See [shard §7.1.1](docs/spec/shard.md#711-layoutshape).
     """
     shape = tuple(shape)
     if mesh is None or not attrs:
-        return TensorType(shape=shape, dtype=dtype, layout=None, storage=storage)
-    layout = canonical_shard_layout(shape, mesh, attrs)
+        return TensorType(shape=shape, dtype=dtype, layout=Layout(shape), storage=storage)
+    layout = ShardLayout.default(shape, mesh, attrs, storage=storage, owners=StorageOwners((), {}))
     return TensorType(shape=shape, dtype=dtype, layout=layout, storage=storage)
 
 
@@ -467,7 +339,12 @@ def _all_split_local_type(type: Type, *, refuse_indivisible: bool) -> Type | Non
                 f"divisible by its mesh extent {extent}"
             )
         local[tensor_axis] = size // extent
-    return TensorType(shape=tuple(local), dtype=type.dtype, layout=None, storage=type.storage)
+    return TensorType(
+        shape=tuple(local),
+        dtype=type.dtype,
+        layout=Layout(tuple(local)),
+        storage=type.storage,
+    )
 
 
 def try_local_type_of(type: Type) -> Type | None:
@@ -509,8 +386,6 @@ def local_type_of(
     if not isinstance(type, TensorType):
         return type
     layout = type.layout
-    if layout is None:
-        return type
     shard = shard_layout_of(layout)
     if shard is not None:
         return TensorType(
@@ -525,7 +400,7 @@ def local_type_of(
         return type
     raise ValueError(
         f"local_type_of: {type!r} has unresolved layout {layout!r}; local "
-        "projection requires None or a resolved ShardLayout"
+        "projection requires a concrete layout"
     )
 
 

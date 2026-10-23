@@ -273,8 +273,8 @@ def test_quant_drops_fully_broadcast_mesh_ownership() -> None:
     )
     quantized, scale = infer_call(Quant(group=128), source).fields
 
-    assert quantized.layout is None
-    assert scale.layout is None
+    assert quantized.layout == Layout(quantized.shape)
+    assert scale.layout == Layout(scale.shape)
 
 
 _SYMBOLIC_LAST = DimVar("quant_symbolic_last", 1, 1024)

@@ -11,10 +11,10 @@ from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir._shard_checks import check_multilinear_partials
 from tilefoundry.ir.isl_interop import normalize_dim
 from tilefoundry.ir.pattern import is_ranked_tensor
-from tilefoundry.ir.types import Layout, TensorType
+from tilefoundry.ir.types import TensorType
 from tilefoundry.ir.types.dim import DimAdd, DimFloorDiv, DimSub, simplify_dim
+from tilefoundry.ir.types.layout import Layout
 from tilefoundry.ir.types.shard_layout import Split, shard_layout_of, split_target_axes
-from tilefoundry.ir.types.stride import try_compact_major
 from tilefoundry.ir.types.utils import i64_const, static_dim_value
 from tilefoundry.utils.lazy import F
 from tilefoundry.visitor_registry import register_typeinfer
@@ -284,13 +284,15 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
             out_shape,
             partial_reduction_dims=frozenset({4, 5, 6}),
             fresh_strides=True,
+            ctx=ctx,
+            storage=x.storage,
         )
     except ValueError as error:
         ctx.error(
             call,
             f"cannot derive input ownership: {error}; use an explicit Reshard before Conv2D",
         )
-    layout = shard or Layout(shape=out_shape, strides=try_compact_major(out_shape))
+    layout = shard or Layout(out_shape)
     return TensorType(
         shape=out_shape,
         dtype=x.dtype,

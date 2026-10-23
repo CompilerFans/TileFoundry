@@ -27,8 +27,9 @@ from tilefoundry.ir.isl_interop import (
     shape_to_isl_set,
 )
 from tilefoundry.ir.types import TensorType, TupleType, Type
+from tilefoundry.ir.types.int_tuple import compatible_profile, mode_axes
 from tilefoundry.ir.types.layout import flatten
-from tilefoundry.ir.types.shard_layout import layout_axis_to_tensor_axis, shard_layout_of
+from tilefoundry.ir.types.shard_layout import shard_layout_of
 from tilefoundry.ir.types.utils import (
     divided_mesh_axes,
     is_literal_shape,
@@ -36,7 +37,7 @@ from tilefoundry.ir.types.utils import (
     static_dim_value,
     tensor_bytes,
 )
-from tilefoundry.utils.isl_utils import cardinality
+from tilefoundry.utils.isl_utils import as_multi_aff, cardinality
 from tilefoundry.visitor_registry.buffer_alias import aliased_operand
 
 from .registries import DispatchRegistry
@@ -57,6 +58,7 @@ class AccessRelation:
     relation: "isl.map"
     values: IslParamValues = field(default_factory=dict)
     may_access: bool = False
+    affine: isl.multi_aff | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.relation, isl.multi_aff):
@@ -107,7 +109,7 @@ class AccessRelation:
         return f"__tf_{id(ctx.capture_root(expr) if ctx is not None else expr)}"
 
     @staticmethod
-    def affine(expr, ctx=None, *, values=None):
+    def affine_of(expr, ctx=None, *, values=None):
         return dim_to_isl_pw_aff(
             expr,
             {} if values is None else values,
@@ -580,12 +582,12 @@ def logical_axes_of(local: "Type", logical: "Type") -> list[int]:
     """
     layout = getattr(local, "layout", None)
     if shard_layout_of(layout) is None and len(local.shape) == len(logical.shape):
-        return layout_axis_to_tensor_axis(tuple(logical.shape), tuple(logical.shape))
+        return mode_axes(compatible_profile(tuple(logical.shape), tuple(logical.shape)))
     inner = getattr(layout, "layout", None)
     shape = getattr(inner, "shape", None) or getattr(layout, "shape", None)
     if shape is None or len(shape) != len(local.shape):
         return list(range(len(local.shape)))
-    return layout_axis_to_tensor_axis(tuple(shape), tuple(logical.shape))
+    return mode_axes(compatible_profile(tuple(shape), tuple(logical.shape)))
 
 
 def logical_coordinates(local: "Type", logical: "Type") -> dict[int, str]:
@@ -822,10 +824,14 @@ def _held_to(access: AccessRelation, domain: "isl.set", values: IslParamValues) 
             f"and its Op iterates {domain.dim(isl.dim_type.SET)}; one Op states "
             "one coordinate system and every boundary of it answers about that one"
         )
+    try:
+        affine = as_multi_aff(relation) if relation.is_single_valued() else None
+    except ValueError:
+        affine = None
     held = relation.intersect_domain(domain)
     names = _parameter_names(held)
     return AccessRelation(
-        held, {name: values[name] for name in names if name in values}, access.may_access
+        held, {name: values[name] for name in names if name in values}, access.may_access, affine
     )
 
 
@@ -1193,38 +1199,21 @@ def broadcast_all(shapes: tuple[tuple, ...]) -> tuple:
     return out_shape
 
 
-def broadcast_relations(shapes: tuple[tuple, ...]) -> tuple[AccessRelation, ...]:
-    """Map the broadcast domain to each operand and then to the result."""
-    out_shape = broadcast_all(shapes)
-    rank = len(out_shape)
-    dims = [f"d{i}" for i in range(rank)]
-    source = "[" + ", ".join(dims) + "]"
-    maps = []
-    for shape in shapes:
-        pad = rank - len(shape)
-        accessed = [
-            "0" if is_one(shape[i]) and not is_one(out_shape[pad + i]) else dims[pad + i]
-            for i in range(len(shape))
-        ]
-        maps.append(AccessRelation(isl.map(f"{{ {source} -> [{', '.join(accessed)}] }}")))
-    maps.append(AccessRelation(isl.map(f"{{ {source} -> [{', '.join(dims)}] }}")))
-    return tuple(maps)
-
-
 def broadcast_access(result_shape: tuple, operand_shape: tuple) -> AccessRelation:
     """Which coordinate of an operand a result coordinate reads.
 
     An operand of the result's own shape reads the coordinate it is at. A
     shorter one right-aligns, dropping the leading axes it does not have; an
-    axis it holds one of is read at zero however far the result runs along it.
-    Both are still functions of the result coordinate, and both are stated as
+    axis of extent one reads zero when the result axis grows beyond one, and
+    otherwise reads its own coordinate. Both are stated as
     the relation they are.
     """
     rank = len(result_shape)
     dims = [f"d{index}" for index in range(rank)]
     offset = rank - len(operand_shape)
     reads = [
-        "0" if operand_shape[index - offset] == 1 else dims[index] for index in range(offset, rank)
+        "0" if is_one(operand_shape[index - offset]) and not is_one(result_shape[index])
+        else dims[index] for index in range(offset, rank)
     ]
     domain = ", ".join(dims)
     if not reads:
@@ -1439,7 +1428,6 @@ __all__ = [
     "AccessRelation",
     "access_relation_registry",
     "broadcast_all",
-    "broadcast_relations",
     "gather_relations",
     "iterating",
     "identity_access",

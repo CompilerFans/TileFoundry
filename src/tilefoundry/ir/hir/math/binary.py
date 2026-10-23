@@ -19,16 +19,14 @@ from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir._helpers import resolve_anchor_storage
 from tilefoundry.ir.hir._shard_checks import check_multilinear_partials
 from tilefoundry.ir.pattern import TensorPattern
-from tilefoundry.ir.types import DType, Layout, TensorType
-from tilefoundry.ir.types.layout import resolve_layout
+from tilefoundry.ir.types import DType, TensorType
+from tilefoundry.ir.types.layout import Layout
 from tilefoundry.ir.types.shard_layout import (
     Broadcast,
     ShardLayout,
-    canonical_shard_layout,
     shard_layout_of,
 )
-from tilefoundry.ir.types.storage import StorageKind
-from tilefoundry.ir.types.stride import try_compact_major
+from tilefoundry.ir.types.storage import StorageOwners
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
     broadcast_shapes,
@@ -60,22 +58,15 @@ class Binary(Op):
     kind = ParamDef(kind="attribute", annotation=BinaryKind)
 
 
-def _merge_layout(a: object, b: object, out_shape: tuple) -> object:
+def _merge_layout(a: object, b: object, out_shape: tuple, *, ctx=None, storage=None) -> object:
     """Merge two non-sharded operand layouts.
 
-    Merge two non-sharded operand layouts. Equal layouts or one ``None``
-    pass through. Two fully-replicated (all-``Broadcast``) ``ShardLayout``s are
-    mesh-agnostic (the data is replicated everywhere) so the first is kept.
+    Equal layouts pass through. Two fully-replicated (all-``Broadcast``)
+    ``ShardLayout``s are mesh-agnostic, so the first is kept.
     Any other genuine mismatch raises — there is no silent lhs pick; a real
     shard mismatch is propagated through the shard engine, not merged here.
     """
-    if resolve_layout(a, out_shape) == resolve_layout(b, out_shape):
-        if a is None:
-            return None
-        layout = a
-    elif a is None:
-        layout = b
-    elif b is None:
+    if a == b:
         layout = a
     elif not isinstance(a, ShardLayout) and not isinstance(b, ShardLayout):
         return None
@@ -84,7 +75,15 @@ def _merge_layout(a: object, b: object, out_shape: tuple) -> object:
     if layout is not None:
         if isinstance(layout, ShardLayout):
             if all(isinstance(attr, Broadcast) for attr in layout.attrs):
-                return canonical_shard_layout(out_shape, layout.mesh, layout.attrs)
+                return ShardLayout.default(
+                    out_shape,
+                    layout.mesh,
+                    layout.attrs,
+                    storage=storage,
+                    owners=ctx.target.storage_owners
+                    if ctx is not None and ctx.target is not None
+                    else StorageOwners((), {}),
+                )
             return layout
         if tuple(layout.shape) == out_shape:
             return layout
@@ -99,7 +98,15 @@ def _merge_layout(a: object, b: object, out_shape: tuple) -> object:
         not isinstance(layout, ShardLayout) or layout in replicated for layout in (a, b)
     ):
         first = replicated[0]
-        return canonical_shard_layout(out_shape, first.mesh, first.attrs)
+        return ShardLayout.default(
+            out_shape,
+            first.mesh,
+            first.attrs,
+            storage=storage,
+            owners=ctx.target.storage_owners
+            if ctx is not None and ctx.target is not None
+            else StorageOwners((), {}),
+        )
     raise ValueError(f"incompatible operand layouts {a!r} vs {b!r}")
 
 
@@ -145,6 +152,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
         allowed_reduction=allowed_reduction,
         commutes_jointly=commutes_jointly,
     )
+    storage = resolve_anchor_storage(ctx, call, lhs_ty.storage, rhs_ty.storage)
     try:
         relation = relations_of(call, ctx)
         out_shape = shape_from_relation(
@@ -152,7 +160,9 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
         )
         shard = None
         if shard_layout_of(la) is not None or shard_layout_of(lb) is not None:
-            shard = derive_output_shard_layout((lhs_ty, rhs_ty), relation, out_shape)
+            shard = derive_output_shard_layout(
+                (lhs_ty, rhs_ty), relation, out_shape, ctx=ctx, storage=storage
+            )
         layout = (
             shard
             if shard is not None
@@ -160,13 +170,14 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
                 shard_layout_of(la) or la,
                 shard_layout_of(lb) or lb,
                 out_shape,
+                ctx=ctx,
+                storage=storage,
             )
         )
     except ValueError as e:
         ctx.error(call, f"Binary {op.kind.name}: {e}")
-    storage = resolve_anchor_storage(ctx, call, lhs_ty.storage, rhs_ty.storage)
-    if layout is None and storage in (StorageKind.RMEM, StorageKind.SMEM) and out_shape:
-        layout = Layout(shape=out_shape, strides=try_compact_major(out_shape))
+    if layout is None:
+        layout = Layout(out_shape)
     return TensorType(
         shape=out_shape,
         dtype=out_dtype,

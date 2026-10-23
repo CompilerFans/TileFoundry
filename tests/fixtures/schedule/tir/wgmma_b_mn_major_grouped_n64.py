@@ -1,7 +1,3 @@
-# analysis target=nvidia.h200_sxm module=GroupedMnMajorB function=gemm topology=cta wave=1/1
-# selection requested=memory executed=memory
-# memory traffic=gmem:r6.00KiB/w64.00KiB@logical,r6.00KiB/w64.00KiB@total,r6.00KiB/w64.00KiB@cta,r6.00KiB/w32.12KiB@thread;rmem:r64.02KiB/w64.00KiB@logical,r64.02KiB/w64.00KiB@total,r64.02KiB/w64.00KiB@cta,r272B/w256B@thread;smem:r6.00KiB/w6.00KiB@logical,r6.00KiB/w6.00KiB@total,r6.00KiB/w6.00KiB@cta,r576B/w6.00KiB@thread footprint=a:2.00KiB;b:4.00KiB;v7:21:32.00KiB footprint-precision=exact peak=gmem:38.00KiB;rmem:32.00KiB;smem:6.00KiB persistent=gmem:6.00KiB
-
 from __future__ import annotations
 
 from tilefoundry.dsl import *
@@ -45,12 +41,12 @@ def gemm(
                 0,
                 dtype="bf16",
                 storage="smem",
-                layout=Layout(((2, 8), (2, 1, 64)), ((512, 64), (4096, 1024, 1))) | Swizzle(3, 4, 3),
+                layout=Layout(((2, 8), (2, 1, 64)), ((512, 64), (4096, 0, 1))) | Swizzle(3, 4, 3),
                 shape=(16, 128),
             )
             value_5 = T.tensor_view(
                 T.ptr_of(value_3),
-                layout=Layout(((2, 8), (2, 1, 64)), ((512, 64), (4096, 1024, 1))) | Swizzle(3, 4, 3),
+                layout=Layout(((2, 8), (2, 1, 64)), ((512, 64), (4096, 0, 1))) | Swizzle(3, 4, 3),
                 shape=(16, 128),
             )
             T.copy(value_4, value_5)
@@ -78,17 +74,17 @@ def gemm(
                             0,
                             dtype="bf16",
                             storage="smem",
-                            layout=Layout(((2, 8), (2, 1, 64)), ((512, 64), (4096, 1024, 1))) | Swizzle(3, 4, 3),
+                            layout=Layout(((2, 8), (2, 1, 64)), ((512, 64), (4096, 0, 1))) | Swizzle(3, 4, 3),
                             shape=(16, 128),
                         )
                         value_7 = T.tensor_view(
                             T.ptr_of(value_3_2),
-                            layout=Layout(((2, 8), (2, 1, 64)), ((512, 64), (4096, 1024, 1))) | Swizzle(3, 4, 3),
+                            layout=Layout(((2, 8), (2, 1, 64)), ((512, 64), (4096, 0, 1))) | Swizzle(3, 4, 3),
                             shape=(16, 128),
                         )
                         rhs_view = T.tensor_view(
                             T.ptr_of(value_7[0:0 + 16, 0:0 + 128]),
-                            layout=(Layout(((2, 8), (2, 1, 64)), ((512, 64), (4096, 1024, 1))) | Swizzle(3, 4, 3)) @ {B()},
+                            layout=(Layout(((2, 8), (2, 1, 64)), ((512, 64), (4096, 0, 1))) | Swizzle(3, 4, 3)) @ {B()},
                             shape=(16, 128),
                         )
                         T.tiled_mma(

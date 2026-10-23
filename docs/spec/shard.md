@@ -63,8 +63,9 @@ IntTuple = ShapeDim | tuple[IntTuple, ...]    # entry: a static or symbolic exte
 
 A `shape` / `stride` entry is not restricted to a static `int`: it may be a
 symbolic / dynamic dim (a `DimVar` or dim `Expr` — a `ShapeDim`). `None` is not
-a shape extent; only the complete `Layout.strides` field may be `None` while
-strides are not materialized. Consumers that need a concrete integer —
+a shape extent. The complete `Layout.strides` field may be `None` in an
+annotation or before parser default materialization; typed values carry concrete
+strides. Consumers that need a concrete integer —
 `Mesh.__getitem__` and `T.sync` participation ([tir §1.5](./tir.md#15-sync)) —
 require static `int` entries and **fail closed** on a symbolic / dynamic one
 rather than guessing.
@@ -623,9 +624,9 @@ levels containing Split or Partial remain part of the distribution.
 | `where(layout=(_, _, dim) @ {cta @ B()})` | Broadcast constraint on the named topology `cta` |
 
 Placement covers the current composed mesh scope, or the function mesh in a
-signature; unstated axes are Broadcast. `None`, plain `Layout`, and an
-all-Broadcast `ShardLayout` are compatible forms without a split; when both
-layouts are stated, their written shape and stride constraints remain.
+signature; unstated axes are Broadcast. An annotation with `layout=None`
+imposes no layout constraint. Plain `Layout` and an all-Broadcast `ShardLayout`
+are compatible forms without a split; written shape and stride constraints remain.
 Shared-memory distribution belongs to CTA or coarser levels; author-written tiles
 in thread scope use plain layouts. A `where` clause constrains named topologies;
 acceptance rules are generated in [parser §2](./parser.md#2-syntax-and-rules).
@@ -697,7 +698,7 @@ Let `sl: ShardLayout`, `T: TensorType`, and `G = sl.layout.shape`.
   as either factor yields its other factor. Integer quotients MUST be exact;
   undecidable divisions MUST be rejected. Thus `NC * 128` split over `(NC, 64)`
   becomes `(NC, 64, 2)`, with the residual `2` unbound. Symbolic factored shapes
-  keep `strides=None` until specialization.
+  use symbolic products in their concrete default strides until specialization.
 - `local_shape(sl)[k] = G[k] / sl.mesh.layout.shape[a] = 1` iff some mesh axis
   `a` has `sl.attrs[a] = Split(k)`.
 - `local_shape(sl)[k] = G[k]` otherwise.
@@ -710,19 +711,17 @@ Let `sl: ShardLayout`, `S = sl.layout.strides`, and let `engine(i)`
 denote the `ShardTensor.engine` seen by instance index `i` along the
 relevant mesh axis.
 
-- `S` MAY be `None`. `S is None` ⇒ "un-materialized": the layout
-  strides have not yet been fixed; the layout's `shape` /
-  partition is determined but the per-axis stride form is deferred
-  to `Reshard` typeinfer
-  ([hir.md §1.3](./hir.md#13-op)). Surface
-  sugar `(N @ m.a, ...)` always emits `S is None`; verbose
-  `((shape), (strides))` always emits a concrete `S`. After
-  `Reshard` typeinfer has run on a value, `S` reachable from that
-  value MUST be a concrete tuple (the un-materialized form is an
-  intermediate-only signal).
-- `S == ()` is a concrete rank-0 layout (`shape == ()`), not the
-  `None` sentinel; the empty tuple is never overloaded to mean
-  un-materialized.
+- A typed value MUST have a concrete `S`. An annotation MAY omit its layout entirely;
+  authored layouts always construct concrete strides.
+  Placement sugar without strides MUST use `ShardLayout.from_modes` under the
+  target's storage owner rule. A Split at the owner level or a coarser level
+  has stride zero and drops its mesh factor when compact strides for the
+  remaining modes are computed; its local residual remains. A Split inside
+  the owner keeps its row-major stride. The owner comes from the target's
+  memory hierarchy (`umat` uses the rmem owner); a target with no memory
+  hierarchy uses shared strides. Source storage and source stride spelling do
+  not choose the default.
+- `S == ()` is a concrete rank-0 layout (`shape == ()`).
 - When `S` is a concrete tuple, `S[k]` is the element step along
   layout dim `k` on the physical storage held by
   `ShardTensor.engine`; it MUST NOT be an abstract global stride.
@@ -767,18 +766,17 @@ Logical tensor `(2, 1536)` reshards via surface sugar
 `(2 @ m.x, 12 @ m.y, 128 @ m.t)` with `mesh=(x=2, y=4, t=32)`. Parser
 canonicalization ([§7.1.1](#711-layoutshape), [parser §2.1](./parser.md#21-syntax)) expands `12 @ m.y` into
 `(4 @ m.y, 3)` and `128 @ m.t` into `(32 @ m.t, 4)` and emits
-`Layout(shape=(2, 4, 3, 32, 4), strides=None)` — un-materialized
-because the user wrote sugar ([§7.1.2](#712-layoutstrides)). Reshard typeinfer
-then materializes `strides` via the direction rule; the resulting
-form depends on the `(src.storage, dst.storage)` pair.
+`Layout(shape=(2, 4, 3, 32, 4), strides=...)`. The parser fills the strides
+using the destination storage owner ([§7.1.2](#712-layoutstrides)); symbolic
+shapes use symbolic products rather than an omitted tuple.
 
-For `reshard(a:gmem, ..., storage='rmem')` (high → low, per-instance
-default):
+For `storage='rmem'` on a target whose rmem owner is thread, all three
+thread-level Splits are per-instance, regardless of source storage:
 
 ```
 # example
 layout = Layout(shape=(2, 4, 3, 32, 4), strides=(0, 0, 4, 0, 1))
-attrs  = (Split(0), Split(1), Broadcast, Split(3), Broadcast)
+attrs  = (Split(0), Split(1), Split(3))
 mesh   = Mesh((Topology("thread", 256),), Layout(shape=(2, 4, 32), ...))
 ```
 
@@ -788,17 +786,14 @@ axis has `local_shape = 1` by construction, so
 reduces to `0` and every mesh instance receives its own engine
 holding `3 × 4 = 12` elements laid out in C-order.
 
-For `reshard(a:rmem, ..., storage='gmem')` (low → high, shared
-default), the same sugar materializes to C-order strides over the
-canonical global shape — `strides = (1536, 384, 128, 4, 1)` — so the
+For `storage='gmem'` with target-owned memory, all Splits are shared.
+The same sugar materializes to C-order strides over the canonical global shape — `strides = (1536, 384, 128, 4, 1)` — so the
 8 warps write to disjoint offsets of a single underlying gmem
 buffer.
 
-A reshard whose user-provided cute strides are non-default (e.g. an
-SM80 mma fragment) bypasses this materialization step: the layout
-already has a concrete `strides` tuple, so the `Reshard` typeinfer
-rule ([hir.md §1.3](./hir.md#13-op)) preserves
-it verbatim.
+Explicit non-default strides, such as an SM80 mma fragment, retain their
+address map. Parser normalization sets statically unit leaves to stride zero;
+it does not replace the other written strides with defaults.
 
 ### 7.6 `local_layout`
 
@@ -878,6 +873,21 @@ Making the steps of a compact arrangement and reading an index back into the
 coordinate that reaches it are not operations on layouts, so they are filed
 apart from the algebra, as CuTe files `stride.hpp` apart from `layout.hpp`.
 
+`Layout(shape)` is the tensor default constructor. It keeps the authored mode
+profile, uses compact row-major strides (including symbolic products), and
+normalizes each statically known extent-1 leaf to stride zero. Rank zero gives
+`Layout((), ())`. `normalize_layout` applies only that leaf rule to an existing
+tensor layout, preserving every other stride, mode, offset, swizzle and mesh.
+The parser uses it for explicit tensor layouts; mesh layouts and algebra
+intermediates retain their own coordinate conventions.
+
+```python
+class Layout:
+    def __init__(self, shape: tuple, strides: tuple | None = None): ...
+
+def normalize_layout(layout: LayoutBase) -> LayoutBase: ...
+```
+
 ```python
 class NotProjectable(ValueError):
     """Report that a layout cannot serve as a mesh execution scope."""
@@ -925,20 +935,23 @@ def try_c_order_strides(shape: tuple) -> tuple[int, ...] | None:
     ...
 
 
-def canonical_shard_layout(
-    logical_shape: tuple, mesh: Mesh, attrs: tuple[ShardAttr, ...]
-) -> ShardLayout:
-    """Build the canonical factorized sharding layout.
+class StorageOwners:
+    order: tuple[str, ...]  # Target topologies, coarse to fine.
+    owner: Mapping[StorageKind, str]
 
-    Args:
-        logical_shape: Logical tensor shape.
-        mesh: Device mesh.
-        attrs: Shard attributes naming logical axes.
+    def private(self, storage, topology) -> bool: ...
 
-    Returns:
-        The canonical sharding layout.
-    """
-    ...
+
+class ShardLayout:
+    @classmethod
+    def default(cls, shape, mesh, attrs, *, storage, owners) -> ShardLayout:
+        """Factor logical axes by their mesh splits, then call from_modes."""
+        ...
+
+    @classmethod
+    def from_modes(cls, shape, mesh, attrs, *, storage, owners) -> ShardLayout:
+        """Keep authored modes and positional attrs; construct owner strides."""
+        ...
 
 
 def shard_layout_local_shape(
@@ -1029,12 +1042,29 @@ def right_inverse(layout: Layout | ComposedLayout):
 ```
 
 - constraints:
-  - `canonical_shard_layout` MUST factor each logical axis split by one or more
+  - Default strides come from `Layout(shape)`: compact row-major, symbolic
+    products retained, and statically unit leaves zero. A Split whose topology is private under
+    `target.storage_owners` gets stride zero. When compacting the remaining modes, it
+    drops only its mesh factor and keeps its local residual (extent one for a
+    fully factored Split), so one instance has no holes. The target supplies the
+    storage owner and the coarse-to-fine topology order. The owner topology
+    and every coarser topology are private; the owner `target` is shared. Absent
+    memory facts mean an empty owner table. Explicit tensor layouts normalize only unit leaves; mesh layouts
+    and layout-algebra intermediates are not normalized by this tensor rule.
+  - `ShardLayout.default` MUST factor each logical axis split by one or more
     mesh axes in mesh-axis order, remap each `Split` to its factor, and append
     a non-unit residual factor. Symbolic multi-axis splits MUST use successive
     exact integer or structural product quotients as specified in
     [shard §7.1.1](./shard.md#711-layoutshape).
     It MUST reject indivisible or undecidable dynamic multi-axis splits.
+    `ShardLayout.from_modes` MUST keep its input mode tree and positional attrs;
+    the owner stride algorithm exists only in this constructor. Authored mode trees,
+    raw IR producers and printer default comparison use it. Logical placement
+    sugar uses `default`. For an explicit `ShardLayout(Layout(shape), attrs, mesh)`
+    (also with an explicit `None` stride), the parser recognizes the omitted
+    inner strides before construction and calls `from_modes` with the enclosing
+    tensor or operation storage. `Target.storage_owners`
+    projects and validates the owner table once; `umat` uses the rmem owner.
   - `shard_layout_local_shape` MUST multiply the divisors of multiple `Split`
     attributes that name the same layout axis. Equal symbolic split and mesh
     extents produce local extent one. A `DimMul` with the mesh extent as either
@@ -1069,10 +1099,10 @@ def right_inverse(layout: Layout | ComposedLayout):
     All three operations and `complement` MUST interpret traversal order via
     `major="col"` or `major="row"`, without changing their per-mode tile dispatch.
     Overlapping modes in `complement` MUST remain rejected as `NotProjectable`.
-  - `tile_view_layout` and `tile_inner_type` MUST receive operand-axis tile
-    `counts` projected from the caller's validated instruction repeat, rather
-    than infer them from whole and tile shape ratios. Prefix extraction MUST
-    retain the existing grouped and flat mode boundaries and remap `Split`
-    axes to the retained modes. An absent prefix or a removed sharded axis
-    MUST retain its existing diagnostic. Count-one axes MUST retain symbolic
-    extents without requiring division or a static extent.
+  - Instruction projection MUST leave a whole operand axis unchanged, retaining
+    symbolic extents without division or a static-extent requirement. A cut axis
+    MUST use `zipped_divide` with a tiler built from its own mode structure and
+    preserve per-element addresses under row-major reading. The repeat MUST be
+    leftmost within each axis; otherwise projection MUST refuse and name the
+    mode. `Split` MUST be retained and remapped to the kept mode. Repeat modes
+    with a `Split` are bind modes; the others are serial modes.

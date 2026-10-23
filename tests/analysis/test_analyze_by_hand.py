@@ -8,6 +8,7 @@ from pathlib import Path
 import isl
 import pytest
 
+from tests._source import import_dsl
 from tests.fixtures.placed import persistent_gemm_tiled
 from tests.fixtures.placed.data_started_window import C, D, DataStart, MeshStart, W
 from tests.fixtures.placed.gemm_schedules import (
@@ -29,6 +30,7 @@ from tests.fixtures.placed.gemm_schedules import (
 from tests.fixtures.placed.hand_checked import (
     BN,
     CapacityExceeded,
+    CausalStartReuse,
     InvariantReuse,
     N,
     OverlappingReads,
@@ -54,6 +56,7 @@ from tilefoundry.analysis import (
 from tilefoundry.analysis import footprint as footprint_analysis
 from tilefoundry.analysis.check import check_program
 from tilefoundry.analysis.compute_cost import local_duration_ns
+from tilefoundry.analysis.errors import AnalysisError
 from tilefoundry.analysis.footprint import ReachedAddresses, footprint_of, merged
 from tilefoundry.analysis.iteration_scope import build_scopes
 from tilefoundry.analysis.report import report_data
@@ -63,6 +66,7 @@ from tilefoundry.ir.core.expr import SSAValue
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.schedule import ScheduleOp
 from tilefoundry.ir.hir.sharding.reshard import Reshard
+from tilefoundry.ir.hir.specialize import SpecializationError
 from tilefoundry.ir.hir.tensor.insert_slice import InsertSlice
 from tilefoundry.ir.types import DType
 from tilefoundry.ir.visitor import collect_exprs
@@ -631,3 +635,54 @@ def test_a_window_every_position_writes_alike_costs_its_share() -> None:
         assert gmem.total.write == 4 * gmem.at(0).write == 4 * 256
         durations.append(_first_duration(result, InsertSlice))
     assert durations == [3, 7]
+
+
+def test_mesh_started_loop_keeps_an_unknown_reuse_row() -> None:
+    memory = _memory_record(CausalStartReuse)
+    rows = [row for row in memory["reuse_windows"] if row["buffer"] == "x"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["reuse_bytes"] is None
+    assert row["precision"] == "unknown"
+
+
+def test_runtime_loop_start_names_the_unbounded_value() -> None:
+    module = import_dsl('''from tilefoundry.dsl import *
+from tilefoundry.target import CudaTarget
+
+@module(entry="read", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
+class RuntimeStart:
+    @func
+    def read(x: Tensor[(16,), "f32"], start: Tensor[(), "i64"]):
+        with Mesh(("cta",), layout=(1,), names=("block",)) as _cta:
+            result = tf.zeros(Tensor[(4,), "f32", (4,), "rmem"])
+            for n in range(start, 4):
+                result = tf.reshard(x[n * 4 : n * 4 + 4], (4,), "rmem")
+            return result
+''')
+    with pytest.raises(
+        AnalysisError,
+        match=r"loop 'n' takes its start from 'start'.*analysis needs a literal start or a stated value range",
+    ):
+        _memory_record(module)
+
+
+def test_symbolic_divisor_loop_start_does_not_block_typing() -> None:
+    module = import_dsl('''from tilefoundry.dsl import *
+from tilefoundry.target import CudaTarget
+
+NC = DimVar("chunks", 1, 32)
+
+@module(entry="read", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 4),))
+class SymbolicStart:
+    @func
+    def read(x: Tensor[(16,), "f32"]):
+        with Mesh(("cta",), layout=(4,), names=("t",)) as _cta:
+            result = tf.zeros(Tensor[(4,), "f32", (4,), "rmem"])
+            for n in range(16 // NC, 4):
+                result = tf.reshard(x[n * 4 : n * 4 + 4], (4,), "rmem")
+            return result
+''')
+    with pytest.raises(SpecializationError, match=r"still states \['chunks'\] as ranges"):
+        check_program(module, module.entry_function())
+    check_program(module, module.entry_function(), dims={"chunks": 8})

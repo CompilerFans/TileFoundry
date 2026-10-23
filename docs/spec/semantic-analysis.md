@@ -120,6 +120,9 @@ Both use the one `IslParamValues` dictionary, from isl parameter name to IR valu
   domains associate their top-level modes with the corresponding logical axes
   only when the number of top-level modes equals the logical rank and each
   mode's size equals its axis extent; otherwise, the flattened modes regroup.
+- Axis grouping uses `compatible_profile(layout.shape, shape)` to construct a
+  profile without splitting or coalescing authored modes. `unflatten` reads the
+  layout against that profile; `mode_axes` identifies each flat mode's logical axis.
 - `layout_to_isl_map` ([types §11](./types.md#11-isl-interoperability))
   implements this regroup for a `ShardLayout`. A logical axis whose extent is
   the product of consecutive flattened layout positions maps onto them, so a
@@ -127,7 +130,7 @@ Both use the one `IslParamValues` dictionary, from isl parameter name to IR valu
   merging logical axes, MUST be rejected where the type is stated. Type
   inference MUST check function parameters and every Call result with the same
   axis-group rule and report the declaring source location. Canonical
-  `TensorType.umat_tensor` metadata has no physical positions and is exempt.
+  UMAT shape metadata uses the same `default_layout(shape)` as other tensor values.
 - A reader with no topology level addresses logical coordinates. A reader at a
   named topology level addresses the positions one unit of that level holds:
   a position cut by mesh axes at that level or coarser is split into digits,
@@ -155,13 +158,16 @@ def derive_output_shard_layout(
     partial_reduction_dims: frozenset[int] = frozenset(),
     complete_reduction_dims: frozenset[int] = frozenset(),
     fresh_strides: bool = False,
+    ctx=None,
+    storage=None,
 ): ...
 ```
 
 - constraints:
-  - `derive_output_shard_layout` reads only input types, forward-relation maps,
-    the requested output shape, and the explicit reduction/stride controls. It
-    MUST NOT read relation bounds or an already-derived output type.
+  - `derive_output_shard_layout` reads only input types, `AccessRelation.affine`
+    (the Op-written mapping before iteration-domain intersection), the requested
+    output shape, and the explicit reduction/stride controls. It MUST NOT read
+    the bounded `AccessRelation.relation` or an already-derived output type.
   - `partial_reductions_by_axis` returns one entry per mesh axis: the carried
     reduction name for `Partial`, `None` for any other attr, and an empty tuple
     for a non-sharded layout.
@@ -170,8 +176,14 @@ def derive_output_shard_layout(
   - `partial_reduction_dims` turns a reduced split into `Partial("sum")`;
     `complete_reduction_dims` turns it into `Broadcast`. The sets MUST NOT
     overlap.
-  - `fresh_strides=True` requests fresh canonical strides; otherwise a
-    compatible propagated physical layout is preserved when possible.
+  - `fresh_strides=True` uses `default_layout` for fresh row-major strides;
+    statically unit leaves have stride zero, and symbolic strides remain symbolic.
+    Split modes owned per instance by `ctx.target` for the result `storage` also
+    have stride zero. Compacting the remaining
+    modes drops only each Split's mesh factor and retains its local residual
+    (extent one for a fully factored Split). The set comes from the target memory
+    owner and every coarser topology level. With no memory hierarchy it is empty.
+    Otherwise a compatible propagated physical layout is preserved when possible.
   - `ShardLayout.attrs` is indexed by mesh axis. A `Partial(reduction)` is a
     value state at that exact index, not an unordered collection of reductions
     and not a layout position. Every propagation decision MUST retain that

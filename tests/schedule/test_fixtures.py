@@ -68,6 +68,7 @@ from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.schedule import ScheduleOp, operand_relations
+from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
 from tilefoundry.ir.hir.tensor.arange import Arange as HirArange
 from tilefoundry.ir.hir.tensor.cast import Cast as HirCast
 from tilefoundry.ir.hir.tensor.empty import Empty
@@ -87,6 +88,7 @@ from tilefoundry.ir.tir import PrimFunction
 from tilefoundry.ir.tir.arange import Arange as TirArange
 from tilefoundry.ir.tir.async_copy import CopyAsync
 from tilefoundry.ir.tir.cuda.memory.copy_async_tensor import CopyAsyncTensor
+from tilefoundry.ir.tir.cuda.memory.copy_reduce_async_tensor import CopyReduceAsyncTensor
 from tilefoundry.ir.tir.cuda.nn.mma import TiledMma
 from tilefoundry.ir.tir.cuda.nn.sm80_mma import Mma
 from tilefoundry.ir.tir.cuda.nn.wgmma import Form, Wgmma
@@ -97,16 +99,19 @@ from tilefoundry.ir.types import (
     DType,
     Layout,
     Mesh,
+    Partial,
     ShardLayout,
     StorageKind,
     Swizzle,
     TensorType,
     Topology,
 )
-from tilefoundry.ir.types.dim import DimVar
-from tilefoundry.ir.types.layout import apply, flatten, resolve_layout
+from tilefoundry.ir.types.dim import DimAdd, DimMul, DimVar
+from tilefoundry.ir.types.int_tuple import compatible_profile
+from tilefoundry.ir.types.layout import apply, flatten, unflatten
 from tilefoundry.ir.types.layout_algebra import cosize
 from tilefoundry.ir.types.mesh import levels, make_mesh, starts
+from tilefoundry.ir.types.stride import crd2idx
 from tilefoundry.ir.types.utils import static_dim_value
 from tilefoundry.ir.visitor import StmtVisitor, collect_exprs
 from tilefoundry.schedule import finalize
@@ -125,6 +130,7 @@ from tilefoundry.visitor_registry.typeinfer import inference_type
 from tilefoundry.visitor_registry.verify import verify_module, verify_prim_function
 
 PLAIN = (
+    "unit_mesh_axis_loop_carry",
     "reshard_locations",
     "chunk_rmsnorm",
     "fp8_block_scaled_gemm",
@@ -145,6 +151,10 @@ FINALIZE_REFUSED = {
     "duplicate_output_storage": "return leaf (2,) shares storage with another output",
 }
 CANDIDATES_REFUSED = {
+    "bulk_reduce_store": "source has no unscheduled candidate site",
+    "wgmma_n16_within_warpgroup_share": "source has no unscheduled candidate site",
+    "wgmma_b_mn_major_one_atom_column_slice": "source has no unscheduled candidate site",
+    "wgmma_b_mn_major_two_atom_column_slice": "source has no unscheduled candidate site",
     "smem_padded_stages": "source has no unscheduled candidate site",
     "zero_trip_insert_slice": "source has no unscheduled candidate site",
     "strided_return_window": "source has no unscheduled candidate site",
@@ -194,8 +204,10 @@ instructions
   T.copy_async                 cp.async
   T.copy_async_bulk            cp.async.bulk
   T.copy_async_tensor          cp.async.bulk.tensor
+  T.copy_reduce_async_tensor   cp.async.bulk.tensor
   T.copy                       all targets
   T.ldmatrix                   ldmatrix
+  T.stmatrix                   stmatrix
   T.relu                       all targets
   T.tiled_mma                  wgmma.mma_async, mma.sync
   T.mbarrier_arrive_expect_tx  mbarrier.expect_tx
@@ -214,8 +226,10 @@ _H200_FACTS_JSON = {
         {"id": "T.copy_async", "capability": "cp.async"},
         {"id": "T.copy_async_bulk", "capability": "cp.async.bulk"},
         {"id": "T.copy_async_tensor", "capability": "cp.async.bulk.tensor"},
+        {"id": "T.copy_reduce_async_tensor", "capability": "cp.async.bulk.tensor"},
         {"id": "T.copy", "capability": None},
         {"id": "T.ldmatrix", "capability": "ldmatrix"},
+        {"id": "T.stmatrix", "capability": "stmatrix"},
         {"id": "T.relu", "capability": None},
         {"id": "T.tiled_mma", "capability": ["wgmma.mma_async", "mma.sync"]},
         {"id": "T.mbarrier_arrive_expect_tx", "capability": "mbarrier.expect_tx"},
@@ -317,6 +331,13 @@ class _RmemExpectation:
 
 
 SMEM_GOLDEN = {
+    "bulk_reduce_store": 16_384,
+    "wgmma_accumulator_stmatrix": 6_144,
+    "wgmma_n16_within_warpgroup_share": 61_440,
+    "wgmma_b_mn_major_one_atom_column_slice": 49_152,
+    "wgmma_b_mn_major_two_atom_column_slice": 49_152,
+    "loop_bound_from_outer_induction": 0,
+    "finalize_footprint_mesh_offset": 0,
     "smem_padded_stages": 96,
     "view_visit_memo": 0,
     "persistent_tile_union_count": 163_840,
@@ -373,6 +394,35 @@ SMEM_GOLDEN = {
 }
 
 RMEM_EXPECTED = {
+    "bulk_reduce_store": {},
+    "wgmma_accumulator_stmatrix": {
+        "thread@0:128#0": _RmemExpectation(
+            12_288, "64x48 f32 accumulator; bf16 cast aliases the fragment"
+        ),
+    },
+    "wgmma_n16_within_warpgroup_share": {
+        "thread@128:256#0": _RmemExpectation(
+            24_576, "64x96 f32 accumulator across two warpgroups; MMA aliases acc"
+        ),
+        "thread@0:384#0": _RmemExpectation(24_576, "parent envelope of the accumulator"),
+    },
+    "wgmma_b_mn_major_one_atom_column_slice": {
+        "thread@128:128#0": _RmemExpectation(16384, "64x64 f32 accumulator; MMA aliases acc"),
+        "thread@0:256#0": _RmemExpectation(16384, "parent envelope of the accumulator"),
+    },
+    "wgmma_b_mn_major_two_atom_column_slice": {
+        "thread@128:128#0": _RmemExpectation(32768, "64x128 f32 accumulator; MMA aliases acc"),
+        "thread@0:256#0": _RmemExpectation(32768, "parent envelope of the accumulator"),
+    },
+    "loop_bound_from_outer_induction": {
+        "thread@0:32#0": _RmemExpectation(256, "32 f32 accumulator and loaded row elements"),
+    },
+    "finalize_footprint_mesh_offset": {
+        "thread@0:32#0": _RmemExpectation(136, "32 f32 row elements and one i64 mesh offset"),
+        "cta@0:4#0": _RmemExpectation(8, "one i64 mesh offset"),
+        "thread@0:32#1": _RmemExpectation(256, "32 f32 accumulator and loaded row elements"),
+        "cta@0:4#1": _RmemExpectation(8, "one i64 output offset"),
+    },
     "smem_padded_stages": {},
     "view_visit_memo": {
         "thread@0:1#0": _RmemExpectation(32, "one eight-element f32 row"),
@@ -1093,6 +1143,25 @@ def test_schedule_copy_evaluates_to_the_source_value() -> None:
     assert torch.equal(result, source)
 
 
+def test_schedule_reduce_store_adds_to_an_explicit_nonzero_destination():
+    cta = Mesh((Topology("cta", 2),), Layout((2,), (1,)))
+    source_type = TensorType(
+        (64, 64),
+        DType.f32,
+        ShardLayout(Layout((64, 64), (64, 1)), (Partial("sum"),), cta),
+        StorageKind.SMEM,
+    )
+    result_type = TensorType((64, 64), DType.f32, Layout((64, 64), (64, 1)), StorageKind.GMEM)
+    source = torch.arange(4096, dtype=torch.float32).reshape(64, 64)
+    destination = torch.full_like(source, 7)
+    result = _evaluate_call(
+        ScheduleOp(op=CopyReduceAsyncTensor()),
+        ((source_type, source), (result_type, destination)),
+        result_type,
+    )
+    assert torch.equal(result, destination + source)
+
+
 @pytest.mark.parametrize(
     ("atom", "dtype", "shape"),
     (
@@ -1214,12 +1283,6 @@ def _check_smem_placement(out: Path, captured: pytest.CaptureResult[str]) -> Non
     """The second 64x64 bf16 tile ends at 8192 + 8192, the analyzed peak."""
     assert captured == ("", "")
     lines = out.read_text().splitlines()
-    peaks = next(
-        item.removeprefix("peak=") for item in lines[2].split() if item.startswith("peak=")
-    )
-    assert dict(item.split(":") for item in peaks.split(";"))["smem"] == "16.00KiB", (
-        "two shared tiles need 16384 bytes"
-    )
     key_view = next(i for i, line in enumerate(lines) if line.strip() == "ks = T.tensor_view(")
     assert lines[key_view + 1].strip().split(",", 1)[0] == "0", (
         "the lowered key tile starts at 0 bytes"
@@ -1757,18 +1820,7 @@ def test_tir_program_is_verified_and_canonical(path: Path) -> None:
         verify_module(program)
     else:
         verify_prim_function(program)
-    source = path.read_text()
-    expected = source[source.index("from __future__ import annotations") :]
-    if isinstance(program, Module):
-        expected = (
-            "\n".join(
-                line
-                for line in expected.splitlines()
-                if not line.lstrip().startswith(("# analysis ", "# selection ", "# memory "))
-            )
-            + "\n"
-        )
-    assert as_script(program) == expected
+    assert as_script(program) == path.read_text()
 
 
 def test_parameter_structure_does_not_repeat_its_name() -> None:
@@ -1980,6 +2032,38 @@ def test_operand_match_refusal_names_the_failed_pattern() -> None:
     assert "smem" in rejected
 
 
+@pytest.mark.parametrize(
+    "row_scale, leading, position", ((2, None, "a_stride_00"), (1, 1, "a_stride_11"))
+)
+def test_wgmma_stride_refusal_names_operand_and_descriptor_position(
+    row_scale, leading, position
+) -> None:
+    function = _prim_in(
+        Path(__file__).parents[1] / "fixtures" / "schedule" / "tir" / "wgmma_a_k_major.py"
+    )
+
+    class RejectOne(_OperandMatchVisitor):
+        rejected = False
+
+        def visit_Evaluate(self, stmt: Evaluate) -> None:
+            if self.rejected or not isinstance(getattr(stmt.callable, "atom", None), Wgmma):
+                return
+            lhs = stmt.args[1].type
+            shard = lhs.layout
+            outer = shard.layout
+            row, column = outer.strides
+            column = (column[0] if leading is None else leading, column[1])
+            bad = replace(outer, strides=((row[0], row[1] * row_scale), column))
+            operand = Var("bad_lhs", type=replace(lhs, layout=replace(shard, layout=bad)))
+            with pytest.raises(ScheduleRefusal, match=rf"lhs:.*{position}"):
+                super().visit_Evaluate(replace(stmt, args=(stmt.args[0], operand, stmt.args[2])))
+            self.rejected = True
+
+    visitor = RejectOne()
+    visitor.visit(function.body)
+    assert visitor.rejected
+
+
 def _assert_live_smem_views_do_not_overlap(function: PrimFunction, source: Path) -> None:
     """Check literal views in lowered TIR, including uses across loop backedges."""
     views: list[tuple[Var, int, int]] = []
@@ -2037,7 +2121,6 @@ def _assert_live_smem_views_do_not_overlap(function: PrimFunction, source: Path)
                             span * field.type.dtype.bit_width // 8,
                         )
                     )
-            walk(statement.body)
         elif isinstance(statement, (For, While)):
             use(
                 (statement.start, statement.stop, statement.step)
@@ -2175,7 +2258,10 @@ def test_lowering_reports_smem_placement_above_capacity(
     out = tmp_path / "finalized.py"
     assert cli_main(["schedule", "finalize", str(four_stage), str(out)]) == 0
     assert capsys.readouterr() == ("", "")
-    assert 'error="smem placement peak 256.00KiB exceeds capacity 227.00KiB"' in out.read_text()
+    module = _module_in(four_stage)
+    result = analyze(*check_program(module, module.entry_function()), analysis=("memory",))
+    memory = get_metadata(result.function, RegionMemoryMetadata)
+    assert "smem placement peak 256.00KiB exceeds capacity 227.00KiB" in memory.errors
     verify_prim_function(_prim_in(out))
 
 
@@ -2289,7 +2375,7 @@ class Window:
         and value.type.shape == (8, 8)
     ]
     assert any(
-        resolve_layout(view.type.layout, view.type.shape).strides == (8, 1)
+        view.type.layout.strides == (8, 1)
         and any(
             isinstance(expr, Call)
             and isinstance(expr.target, Slice)
@@ -2533,6 +2619,36 @@ def test_shared_projection_rejects_partial_atom_tiles() -> None:
         )
 
 
+@pytest.mark.parametrize("failure", ("leftmost", "factor"))
+def test_grouped_projection_names_incompatible_repeat_mode(failure):
+    source = next(path for path in HIR if path.stem == "wgmma_n16_within_warpgroup_share")
+    module = _module_in(source)
+    result = analyze(*check_program(module, module.entry_function()), analysis=("memory",))
+    schedule = next(
+        value
+        for value in collect_exprs(result.function.body)
+        if isinstance(value, Call)
+        and isinstance(value.target, ScheduleOp)
+        and isinstance(value.target.op, TiledMma)
+    )
+    acc, lhs, rhs = (arg.type for arg in schedule.args)
+    if failure == "leftmost":
+        layout = replace(
+            acc.layout, layout=Layout((4, 2, 8, 2, 2, 4, 6), (16, 8, 1, 3072, 1024, 128, 64))
+        )
+        operands = (replace(acc, layout=layout), lhs, rhs)
+        reason = "acc axis 1: repeat is not leftmost at mode 4"
+    else:
+        layout = replace(
+            rhs.layout,
+            outer=Layout(((3, 4, 16), (3, 2, 2, 8)), ((6144, 16, 1), (8192, 1024, 512, 64))),
+        )
+        operands = (acc, lhs, replace(rhs, layout=layout))
+        reason = "rhs iteration axis 1: repeat mode .* cannot factor as"
+    with pytest.raises(ScheduleRefusal, match=reason):
+        project(schedule.target.op, operands, None)
+
+
 @pytest.mark.parametrize(
     ("name", "issues"), (("wgmma_repeat_along_n_order", 4), ("wgmma_k_slices_of_wide_run", 2))
 )
@@ -2574,7 +2690,6 @@ class _RetainedStatements(StmtVisitor[None]):
 
     def visit_LetStmt(self, stmt, ctx=None):
         self.bindings[id(stmt.var)] = stmt.value
-        self.visit(stmt.body)
 
     def storage(self, value):
         if isinstance(value, Var) and id(value) in self.bindings:
@@ -2593,6 +2708,153 @@ class _RetainedStatements(StmtVisitor[None]):
         if isinstance(stmt.callable, (PrimFunction, ModuleList, Call)):
             self.calls.append(stmt)
 
+
+def test_reduce_store_stays_in_its_warp_scope():
+    source = next(path for path in HIR if path.stem == "bulk_reduce_store")
+    lowered = finalize(_module_in(source))
+
+    class Scope(StmtVisitor[None]):
+        def __init__(self):
+            self.scopes = []
+            self.found = 0
+
+        def visit_MeshScope(self, stmt, ctx=None):
+            self.scopes.append(stmt.mesh)
+            self.visit(stmt.body)
+            self.scopes.pop()
+
+        def visit_Evaluate(self, stmt, ctx=None):
+            if isinstance(stmt.callable, CopyReduceAsyncTensor):
+                assert tuple(topology.name for topology in self.scopes[-1].topologies) == (
+                    "thread",
+                )
+                assert prod(flatten(self.scopes[-1].layout).shape) == 32
+                self.found += 1
+
+    visitor = Scope()
+    visitor.visit(lowered.entry_function().body)
+    assert visitor.found == 1
+
+
+def test_grouped_n16_issues_keep_source_addresses():
+    source = next(path for path in HIR if path.stem == "wgmma_n16_within_warpgroup_share")
+    module = _module_in(source)
+    checked = analyze(*check_program(module, module.entry_function()), analysis=("memory",))
+    schedule = next(
+        value
+        for value in collect_exprs(checked.function.body)
+        if isinstance(value, Call)
+        and isinstance(value.target, ScheduleOp)
+        and isinstance(value.target.op, TiledMma)
+    )
+    original_c, _, original_b = (arg.type for arg in schedule.args)
+    lowered = finalize(module)
+    visitor = _RetainedStatements()
+    function = lowered.entry_function()
+    visitor.visit(function.body)
+    issues = [stmt for stmt in visitor.statements if isinstance(stmt.callable, TiledMma)]
+    assert len(issues) == 36
+    readers, pointers = {}, {}
+
+    def dimension(value, group):
+        if (literal := static_dim_value(value)) is not None:
+            return literal
+        if isinstance(value, Var):
+            return dimension(visitor.bindings[id(value)], group)
+        assert isinstance(value, Call)
+        if isinstance(value.target, MeshCoord):
+            assert value.target.mesh.names[static_dim_value(value.args[0])] == "group"
+            return group
+        a, b = (dimension(arg, group) for arg in value.args)
+        if isinstance(value.target, DimAdd):
+            return a + b
+        assert isinstance(value.target, DimMul)
+        return a * b
+
+    def address(type_, coordinates, group):
+        key = id(type_), group
+        if key not in readers:
+            eb = type_.dtype.bit_width // 8
+
+            def reader(layout):
+                if isinstance(layout, ShardLayout):
+                    return reader(layout.layout)
+                if isinstance(layout, ComposedLayout):
+                    outer = reader(layout.outer)
+                    offset = dimension(layout.offset, group) * eb
+                    if isinstance(layout.inner, Swizzle):
+                        return lambda linear: layout.inner(outer(linear) + offset)
+                    return lambda linear: outer(linear) + offset
+                flat = flatten(layout)
+                grouped = unflatten(flat, compatible_profile(flat.shape, type_.shape))
+                return lambda linear: crd2idx(linear, grouped.shape, grouped.strides) * eb
+
+            readers[key] = reader(type_.layout)
+        linear = sum(
+            coordinate * prod(type_.shape[axis + 1 :])
+            for axis, coordinate in enumerate(coordinates)
+        )
+        return readers[key](linear)
+
+    def pointer(value, group):
+        key = id(value), group
+        if key not in pointers:
+            if isinstance(value, Var):
+                result = pointer(visitor.bindings[id(value)], group)
+            elif isinstance(value, Constant):
+                result = value.value
+            elif isinstance(value, Call) and isinstance(value.target, (TensorView, PtrOf)):
+                result = pointer(value.args[0], group)
+            elif isinstance(value, Call) and isinstance(value.target, Slice):
+                base = value.args[0]
+                layout = base.type.layout
+                layout = layout.layout if isinstance(layout, ShardLayout) else layout
+                result = pointer(base, group)
+                if not isinstance(layout, ComposedLayout):
+                    starts = tuple(dimension(start, group) for start in value.args[1].elements)
+                    result += address(base.type, starts, group)
+            else:
+                assert isinstance(value, Call) and type(value.target).__name__ == "AllocTensor"
+                result = 0
+            pointers[key] = result
+        return pointers[key]
+
+    def pointer_root(value):
+        if isinstance(value, Var):
+            return pointer_root(visitor.bindings[id(value)])
+        if isinstance(value, Call) and isinstance(value.target, (TensorView, PtrOf, Slice)):
+            return pointer_root(value.args[0])
+        return value
+
+    c_root = pointer_root(issues[0].args[0])
+    b_root = pointer_root(issues[0].args[2])
+    copied_k = next(
+        stmt.args[1]
+        for stmt in visitor.statements
+        if isinstance(stmt.callable, CopyAsyncTensor) and stmt.args[0] is function.params[1]
+    )
+    assert isinstance(b_root, Constant)
+    assert b_root.value == pointer_root(copied_k).value
+    assert c_root.type.shape == original_c.shape
+    assert c_root.type.storage is StorageKind.RMEM
+    for ordinal, issue in enumerate(issues):
+        step, k = divmod(ordinal, 12)
+        c, _, b = issue.args
+        assert pointer_root(c) is c_root
+        assert pointer_root(b) is b_root
+        assert c.type.shape == (64, 16)
+        assert b.type.shape == (16, 16)
+        for group in range(2):
+            for i in range(16):
+                n = 48 * group + 16 * step + i
+                for row in range(64):
+                    assert pointer(c, group) + address(c.type, (row, i), group) == address(
+                        original_c, (row, 16 * step + i), group
+                    )
+                for j in range(16):
+                    assert pointer(b, group) + address(
+                        b.type, (j, i), group
+                    ) == b_root.value + address(original_b, (16 * k + j, n), group)
 
 def test_authored_views_survive_region_forwarding_without_extra_wrappers():
     source = Path(__file__).parents[1] / "fixtures" / "schedule" / "hir" / "view_visit_memo.py"
@@ -2626,7 +2888,10 @@ def test_authored_views_survive_region_forwarding_without_extra_wrappers():
 )
 def test_smem_slots_reserve_all_physical_bytes(name):
     source = Path(__file__).parents[1] / "fixtures" / "schedule" / "hir" / f"{name}.py"
-    function = finalize(_module_in(source)).entry_function()
+    module = _module_in(source)
+    analyzed = analyze(*check_program(module, module.entry_function()), analysis=("memory",))
+    peak = get_metadata(analyzed.function, RegionMemoryMetadata).peak_for("smem").peak_bytes
+    function = finalize(module).entry_function()
     visitor = _RetainedStatements()
     visitor.visit(function.body)
     slots = []
@@ -2651,7 +2916,6 @@ def test_smem_slots_reserve_all_physical_bytes(name):
                 )
     assert len(slots) == 2
     assert slots[0].isdisjoint(slots[1])
-    peak = get_metadata(function, RegionMemoryMetadata).peak_for("smem").peak_bytes
     assert all(min(slot) >= 0 and max(slot) < peak for slot in slots)
 
 

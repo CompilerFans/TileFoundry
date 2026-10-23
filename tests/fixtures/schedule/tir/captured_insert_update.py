@@ -1,8 +1,3 @@
-# analysis target=nvidia.h200_sxm module=CapturedInsertUpdate function=gemm topology=cta wave=1/1
-# selection requested=memory executed=memory
-# memory traffic=gmem:r32B/w0@logical,r32B/w0@total,r32B/w0@cta,r32B/w0@thread;rmem:r48B/w0@logical,r48B/w0@total,r48B/w0@cta,r48B/w0@thread;smem:r16B/w48B@logical,r16B/w48B@total,r16B/w48B@cta,r16B/w48B@thread footprint=idx:8B;x:8B footprint-precision=exact peak=gmem:48B;rmem:0;smem:24B persistent=gmem:48B
-#   buffer=x holds=16B time=r space=none reuse=8B fits=yes precision=exact
-
 from __future__ import annotations
 
 from tilefoundry.dsl import *
@@ -11,7 +6,7 @@ from tilefoundry.target import CudaTarget
 
 @prim_func(target=CudaTarget("nvidia.h200_sxm"))
 def gemm(
-    x: Tensor[(4, 4), "bf16"], idx: Tensor[(2,), "i64"], out: Tensor[(2, 4), "bf16", (2, 4), "smem"]
+    x: Tensor[(4, 4), "bf16"], idx: Tensor[(2,), "i64"], out: Tensor[(2, 4), "bf16", "smem"]
 ):
     with Mesh((Topology("cta", 1),), layout=(1,), names=("d0",)) as cta:
         with Mesh((Topology("thread", 32),), layout=(32,), names=("d0",)) as scope:
@@ -23,7 +18,7 @@ def gemm(
                     16, dtype="bf16", storage="smem", layout=(1, 4), shape=(1, 4)
                 )
                 value_1 = T.tensor_view(T.ptr_of(row_dst), layout=(1, 4), shape=(1, 4))
-                value_2 = T.tensor_view(T.ptr_of(idx[r:r + 1]), layout=((1,), (0,)), shape=(1,))
+                value_2 = T.tensor_view(T.ptr_of(idx[r:r + 1]), layout=(1,), shape=(1,))
                 T.copy_async(source, value_1, value_2, fill=0)
                 with scope[:] as scope_1:
                     row_dst_2 = T.tensor_view(

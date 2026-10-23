@@ -15,18 +15,17 @@ from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir._shard_checks import reject_partials
 from tilefoundry.ir.pattern import is_ranked_tensor
-from tilefoundry.ir.types import DType, Layout, ShardLayout, TensorType, TupleType
+from tilefoundry.ir.types import DType, ShardLayout, TensorType, TupleType
 from tilefoundry.ir.types.dim import DimFloorDiv, simplify_dim
-from tilefoundry.ir.types.layout import flatten
+from tilefoundry.ir.types.int_tuple import compatible_profile, mode_axes
+from tilefoundry.ir.types.layout import Layout, flatten
 from tilefoundry.ir.types.shard_layout import (
     Broadcast,
     Split,
-    canonical_shard_layout,
-    layout_axis_to_tensor_axis,
     shard_layout_local_shape,
     split_target_axes,
 )
-from tilefoundry.ir.types.stride import try_compact_major
+from tilefoundry.ir.types.storage import StorageOwners
 from tilefoundry.ir.types.utils import static_dim_value
 from tilefoundry.utils.lazy import torch
 from tilefoundry.visitor_registry import register_typeinfer
@@ -65,12 +64,12 @@ def _logical_shard_attrs(call, ctx, x_ty, group: int):
     if last_axis in targets:
         try:
             local_shape = shard_layout_local_shape(layout)
-            layout_axes = layout_axis_to_tensor_axis(layout.layout.shape, x_ty.shape)
+            layout_axes = mode_axes(compatible_profile(layout.layout.shape, x_ty.shape))
             strides = layout.layout.strides
             global_factors = []
             local_factors = []
             for physical_axis, logical_axis in enumerate(layout_axes):
-                if logical_axis != last_axis or strides is None:
+                if logical_axis != last_axis:
                     continue
                 size = static_dim_value(layout.layout.shape[physical_axis])
                 local_size = static_dim_value(local_shape[physical_axis])
@@ -115,23 +114,37 @@ def _logical_shard_attrs(call, ctx, x_ty, group: int):
 def _result_layouts(call, ctx, x_ty, scale_shape, group: int):
     if isinstance(x_ty.layout, ShardLayout):
         if all(isinstance(attr, Broadcast) for attr in x_ty.layout.attrs):
-            return None, None
+            return Layout(x_ty.shape), Layout(scale_shape)
         attrs = _logical_shard_attrs(call, ctx, x_ty, group)
         try:
             return (
-                canonical_shard_layout(x_ty.shape, x_ty.layout.mesh, attrs),
-                canonical_shard_layout(scale_shape, x_ty.layout.mesh, attrs),
+                ShardLayout.default(
+                    x_ty.shape,
+                    x_ty.layout.mesh,
+                    attrs,
+                    storage=x_ty.storage,
+                    owners=ctx.target.storage_owners
+                    if ctx is not None and ctx.target is not None
+                    else StorageOwners((), {}),
+                ),
+                ShardLayout.default(
+                    scale_shape,
+                    x_ty.layout.mesh,
+                    attrs,
+                    storage=x_ty.storage,
+                    owners=ctx.target.storage_owners
+                    if ctx is not None and ctx.target is not None
+                    else StorageOwners((), {}),
+                ),
             )
         except ValueError as error:
             ctx.error(
                 call,
                 f"cannot derive result sharding: {error}; use an explicit Reshard before Quant",
             )
-    if x_ty.layout is None:
-        return None, None
     return (
-        Layout(shape=x_ty.shape, strides=try_compact_major(x_ty.shape)),
-        Layout(shape=scale_shape, strides=try_compact_major(scale_shape)),
+        Layout(x_ty.shape),
+        Layout(scale_shape),
     )
 
 

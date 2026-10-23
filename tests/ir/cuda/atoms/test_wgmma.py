@@ -6,10 +6,12 @@ from tilefoundry.ir.types import ComposedLayout, Layout, Swizzle
 
 from ._cute_reference import (
     cute_reference,
+    reference_threads,
     reference_tv,
     smem_atoms,
     smem_key,
     to_byte_layout,
+    to_thread_layout,
     to_tv_layout,
     tv_configs,
     tv_key,
@@ -40,7 +42,8 @@ def _atom_slices(dtype, major, swizzle, role, raw):
         suffix = "k_major_sliced"
         shape = ((extent // 8, 8), issue_k)
         strides = ((leading, width), 1)
-    factory = getattr(wgmma, f"_{role.lower()}_{suffix}_smem_pattern")
+    major_mode = wgmma.Major.MN if major == "MN" else wgmma.Major.K
+    pattern = wgmma._smem_pattern(eb, major_mode, b_operand=role == "B")
     ref_shape = tuple(raw["layout"]["shape"])
     ref_strides = tuple(raw["layout"]["strides"])
     offsets = range(0, ref_shape[1], issue_k) if suffix == "k_major_sliced" else (0,)
@@ -52,7 +55,8 @@ def _atom_slices(dtype, major, swizzle, role, raw):
                 shape if role == "A" else shape[::-1], strides if role == "A" else strides[::-1]
             ),
         )
-        assert factory(eb).match(ours, {"n": extent}) is not None, (
+        canonical = wgmma.canonical_smem_layout(ours, eb, major_mode, b_operand=role == "B")
+        assert pattern.match(canonical, {"n": extent}) is not None, (
             dtype,
             major,
             swizzle,
@@ -92,6 +96,7 @@ def test_wgmma_atom():
             a_major=wgmma.Major.K,
             b_major=wgmma.Major.K,
         )
+        assert to_thread_layout(atom) == reference_threads(reference[key]["ThrID"])
         for role in ("A", "B", "C"):
             broadcast = role == "B" or role == "A" and form == wgmma.Form.SS
             if not broadcast:

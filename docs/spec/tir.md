@@ -63,17 +63,15 @@ class Sequential(Stmt):
     body: tuple[Stmt, ...]
 
 class LetStmt(Stmt):
-    """Bind a variable to an expression before a nested body.
+    """Bind a variable for the following statements of its enclosing Sequential.
 
     Attributes:
         var: attribute; Bound variable.
         value: attribute; Bound expression.
-        body: attribute; Nested statements.
     """
 
     var: Var
     value: Expr
-    body: Sequential
 
 class For(Stmt):
     """Represent a counted loop.
@@ -176,8 +174,10 @@ parameters; omitting it means one output.
   by more than one `LetStmt` / `For` / `MeshScope` across the
   function. Parameters seed the bound set.
 - **Lexical uses**. A `Var` MUST be visible in the scope that binds it. Let
-  values and loop bounds are checked before their binders enter scope; branch,
-  loop, and mesh bindings do not escape. Every variant uses its own parameters.
+  values and loop bounds are checked before their binders enter scope. A
+  `LetStmt` variable is visible from the next statement to the end of its
+  enclosing `Sequential`; branch, loop, and mesh bindings do not escape.
+  Every variant uses its own parameters.
   Expression fields, including intrinsic statements and Return, MUST contain
   IR nodes; lowering recipes are rejected. Op, PrimFunction, and SymbolRef
   callables are permitted.
@@ -1303,6 +1303,32 @@ class CopyAsyncTensor(Op):
     CUDA codegen MUST reject it until host-encoded tensor-map construction
     exists; this stage does not silently lower it to another copy instruction.
 
+##### CopyReduceAsyncTensor
+
+```python
+class CopyReduceAsyncTensor(Op):
+    src: Tensor
+    dst: Tensor
+    kind: str = "add"
+    execution_mesh: Mesh | None = None
+```
+
+- constraints:
+  - The source is a shared-memory TMA box and MAY carry `Partial` state;
+    the destination is an explicit global tensor-map operand, read and written.
+    Shape, dtype and contiguous tile modes MUST agree. Ordinary tensor-map
+    copies continue to reject `Partial` state.
+  - Only `kind="add"` is supported. The logical result is `dst + src`;
+    the evaluator's source already represents the sum of its parts.
+  - One aligned warp participates, with the same execution-mesh declaration as
+    `CopyAsyncTensor`. The capability is `cp.async.bulk.tensor` and the resource
+    is `tma_engine`. Partial state MUST NOT select instruction owner levels;
+    owner selection treats Partial as Broadcast while retaining Split placement.
+  - Cost MUST charge one source read and one destination write per unit, no
+    destination read and no FLOPs. The hardware addition occurs in L2; analysis
+    reports the write as gmem traffic under the existing leaf-storage rule.
+  - CUDA codegen MUST reject it until host-encoded tensor-map support exists.
+
 ##### LdMatrix
 
 ```python
@@ -1315,10 +1341,29 @@ class LdMatrix(Op):
 - constraints:
   - `src` is a shared-memory `(16, 16)` bf16 tile and `dst` is exactly the
     register A fragment declared by `T.cuda.sm80.Mma()`; their dtype and shape
-    agree under the ordinary `Copy` verifier.
+    agree through explicit between-operand constraints.
   - One canonical SM80 warp issues the operation. It requires the target's
     `ldmatrix` capability and lowers to `tilefoundry::ops::ldmatrix`.
-  - The destination layout is the atom's declaration.
+  - The source and destination TV layouts follow CuTe `SM75_U32x4_LDSM_N`.
+
+##### StMatrix
+
+```python
+class StMatrix(Op):
+    src: Tensor
+    dst: Tensor
+    execution_mesh: Mesh | None = None
+```
+
+- constraints:
+  - `src` is a bf16 or f16 `(16, 16)` register fragment with the per-thread
+    ownership of CuTe `SM90_U32x4_STSM_N`: four 32-bit registers per thread.
+  - `dst` is shared memory with whole contiguous 16-byte vectors. Source and
+    destination shape and dtype MUST agree.
+  - One warp (32 threads) issues the CuTe `SM90_U32x4_STSM_N` transfer
+    of a 16-by-16 b16 tile. Larger scheduled operands are projected into warp
+    issues. The capability is `stmatrix` and the resource is `tensor_core_engine`.
+  - CUDA codegen MUST reject it until stmatrix runtime support exists.
 
 #### Barrier object Ops (`tir.sync.mbarrier_*`)
 

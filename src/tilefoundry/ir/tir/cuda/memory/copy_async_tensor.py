@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from enum import Enum
 
-from tilefoundry.evaluator.registry import register_schedule_eval
-from tilefoundry.evaluator.value import TensorValue
 from tilefoundry.ir.core import Op, OpCapability
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
@@ -26,13 +24,9 @@ from tilefoundry.ir.pattern import (
 from tilefoundry.ir.pattern import (
     predicates as P,
 )
-from tilefoundry.ir.types import Mesh, Swizzle, UnitType
+from tilefoundry.ir.tir.memory.copy import register_copy_semantics
+from tilefoundry.ir.types import Mesh, Swizzle
 from tilefoundry.ir.types.storage import StorageKind as S
-from tilefoundry.visitor_registry import register_typeinfer
-from tilefoundry.visitor_registry.access_relation import (
-    identity_relations,
-    register_access_relation,
-)
 
 TMA_RANK = 5
 BOX_EXTENT = 256
@@ -71,7 +65,7 @@ def _dim_range(name: str) -> tuple:
     return dim >= 1, dim <= BOX_EXTENT
 
 
-def TmaBoxPattern(dtype: str) -> SwitchPattern:
+def TmaBoxPattern(dtype: str, *, allow_partial=False) -> SwitchPattern:
     rest = tuple(_dim(f"dim{index}") for index in range(1, TMA_RANK))
     rest_formulas = tuple(
         formula for index in range(1, TMA_RANK) for formula in _dim_range(f"dim{index}")
@@ -80,8 +74,8 @@ def TmaBoxPattern(dtype: str) -> SwitchPattern:
     boxes = {
         TmaSwizzle.NONE: LayoutPattern(
             predicates=(
-                P.PlainArrangement(),
-                P.BoxDims(plain_dims, dtype, BOX_EXTENT),
+                P.PlainArrangement(allow_partial=allow_partial),
+                P.BoxDims(plain_dims, dtype, BOX_EXTENT, allow_partial=allow_partial),
                 *_dim_formulas("dim0", dtype),
                 *rest_formulas,
             )
@@ -99,12 +93,13 @@ def TmaBoxPattern(dtype: str) -> SwitchPattern:
             0,
             LayoutPattern(
                 predicates=(
-                    P.PlainArrangement(),
+                    P.PlainArrangement(allow_partial=allow_partial),
                     P.BoxDims(
                         dims,
                         dtype,
                         BOX_EXTENT,
                         span=mode.value,
+                        allow_partial=allow_partial,
                     ),
                     *_dim_formulas(leading, dtype, span=mode.value),
                     *rest_formulas,
@@ -189,18 +184,7 @@ class CopyAsyncTensor(Op):
     )
 
 
-@register_typeinfer(CopyAsyncTensor)
-def _(call: "Call", ctx: "TypeInferContext") -> UnitType:
-    return UnitType()
-
-
-register_access_relation(CopyAsyncTensor)(identity_relations)
-
-
-@register_schedule_eval(CopyAsyncTensor)
-def _eval_scheduled_copy_async_tensor(ctx):
-    return TensorValue(data=ctx.args[0].data, type=ctx.result_type)
-
+register_copy_semantics(CopyAsyncTensor, verify=False)
 
 __all__ = [
     "BOX_EXTENT",
