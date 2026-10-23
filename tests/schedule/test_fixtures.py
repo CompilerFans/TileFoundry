@@ -138,6 +138,7 @@ PLAIN = (
     "gemm_relu_gemm_smem_staged",
     "gemm_relu_gemm_tiled",
     "gemm_relu_gemm_untiled",
+    "sm89_e4m3_gemm",
     "sparse_decode",
 )
 PLAIN_DIMS = {"chunk_rmsnorm": {"chunks": 16}}
@@ -179,6 +180,7 @@ CANDIDATES_REFUSED = {
     "staged_nested": "source has no unscheduled candidate site",
     "captured_insert_update": "source has no unscheduled candidate site",
     "loop_carry_from_param": "source has no unscheduled candidate site",
+    "sm89_e4m3_gemm": "source has no unscheduled candidate site",
 }
 TIR = tuple(sorted((Path(__file__).parents[1] / "fixtures" / "schedule" / "tir").glob("*.py")))
 HIR = tuple(sorted((Path(__file__).parents[1] / "fixtures" / "schedule" / "hir").glob("*.py")))
@@ -358,6 +360,7 @@ SMEM_GOLDEN = {
     "gemm_8192x17408x5120_register_store": 196_608,
     "gemm_8192x17408x5120_tma_store": 212_992,
     "sm80_mma_ldmatrix": 1_536,
+    "sm89_e4m3_gemm": 512,
     "wgmma_a_k_major": 6_144,
     "wgmma_a_mn_major": 6_144,
     "wgmma_b_nk": 2_560,
@@ -575,6 +578,12 @@ RMEM_EXPECTED = {
             512, "analysis coalesces the f32 loop result and bf16 cast: max(512, 256)"
         ),
         "thread@0:64#0": _RmemExpectation(1_280, "parent envelope of accumulator/fragments"),
+    },
+    "sm89_e4m3_gemm": {
+        "thread@0:32#0": _RmemExpectation(
+            1_280,
+            "512-byte f32 accumulator plus 512-byte lhs and 256-byte rhs e4m3 fragments",
+        ),
     },
     "wgmma_a_k_major": {
         "thread@128:128#0": _RmemExpectation(8_192, "64x32 f32 zero accumulator"),
@@ -1298,6 +1307,24 @@ def _check_attention(out: Path, captured: pytest.CaptureResult[str]) -> None:
     )
 
 
+def _e4m3_gemm_tensor(name: str) -> torch.Tensor:
+    """Integer inputs in [-4, 4] keep every partial sum of the product exact."""
+    generator = torch.Generator().manual_seed(0)
+    a = torch.randint(-4, 5, (16, 128), generator=generator).float().to(torch.float8_e4m3fn)
+    weight = torch.randint(-4, 5, (8, 128), generator=generator).float().to(torch.float8_e4m3fn)
+    return {"a": a, "b": weight.t(), "expected": a.float() @ weight.float().t()}[name]
+
+
+def _check_e4m3_gemm(out: Path, captured: pytest.CaptureResult[str]) -> None:
+    report = _quiet_json(out, captured)
+    comparison = report["runs"][0]["outputs"][0]["fns"][0]
+    assert comparison["fn"] == "allclose"
+    assert comparison["rtol"] == 0 and comparison["atol"] == 0
+    assert report["passed"] and comparison["passed"], (
+        "K slicing, the (K, N) view of B and the accumulation across slices match torch"
+    )
+
+
 def _check_golden(out: Path, captured: pytest.CaptureResult[str], *, golden: Path) -> None:
     assert captured == ("", "")
     if golden.suffix == ".json":
@@ -1532,6 +1559,37 @@ FIXTURES = (
         for name, stage in (
             ("plain sparse attention matches torch", "plain"),
             ("scheduled sparse attention matches torch", "hir"),
+        )
+    ),
+    *(
+        FixtureCase(
+            name,
+            (
+                "check",
+                f"tests/fixtures/schedule/{stage}/sm89_e4m3_gemm.py:SM89_E4M3_GEMM",
+                "--inputs",
+                "files:{tmp}/a.pt,{tmp}/b.pt",
+                "--expected",
+                "{tmp}/expected.pt",
+                "--device",
+                "cpu",
+                "--out",
+                "output",
+                "--fn",
+                "allclose",
+                "--atol",
+                "0",
+                "--rtol",
+                "0",
+                "--json",
+                "{out}",
+            ),
+            _check_e4m3_gemm,
+            files={f"{key}.pt": partial(_e4m3_gemm_tensor, key) for key in ("a", "b", "expected")},
+        )
+        for name, stage in (
+            ("plain e4m3 gemm matches torch", "plain"),
+            ("scheduled e4m3 gemm matches torch", "hir"),
         )
     ),
     FixtureCase(
@@ -1857,7 +1915,7 @@ def test_schedule_candidate_reports_cover_every_site(
         if row["op"] == "tf.reshard"
     )
     matmuls = [(name, row) for name, row in sites if row["op"] == "tf.matmul"]
-    assert len(matmuls) == 8
+    assert len(matmuls) == 9
     assert not any(row["candidates"] for _name, row in matmuls)
 
 
