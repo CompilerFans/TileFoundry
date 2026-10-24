@@ -24,12 +24,15 @@ echo CONDA_ENV=tilefoundry-dev > .dev-env
 
 ```sh
 git submodule update --init --recursive   # third_party/cutlass
-python -m pip install -e '.[test]'
+python -m pip install -e '.[test]' -e targets/nvidia -e targets/apple
 ```
 
-`pyproject.toml` declares runtime deps (`apache-tvm-ffi`, `torch`),
-the `[test]` extra (`pytest`), and the jinja `*.j2` templates as
-package data. After this `import tilefoundry` resolves to
+When upgrading a checkout from before the distribution split, delete the
+repository-root `tilefoundry.egg-info` before reinstalling all three editable projects.
+
+The core distribution declares runtime deps (`apache-tvm-ffi`, `torch`) and
+the `[test]` extra (`pytest`). Each target distribution provides its own package
+data and registration entry point. After this `import tilefoundry` resolves to
 `src/tilefoundry/...` and plain `pytest tests/` works from repo root.
 **Do not set `PYTHONPATH`** — in particular `PYTHONPATH=tests:src`
 shadows stdlib `types` via `tests/types/__init__.py`.
@@ -57,9 +60,9 @@ CI uses `/__w/tf-cache` as its cache root.
 Common inner loops:
 
 ```sh
-pytest tests/passes tests/ir tests/ir_types -q   # IR / passes edits
-pytest tests/codegen tests/runtime -q            # codegen-text edits
-pytest tests/e2e -q                              # runtime header / host wrapper edits
+pytest tests/core/passes tests/core/ir tests/nvidia/cuda/ir -q  # IR / passes edits
+pytest tests/nvidia/cuda/codegen tests/nvidia/cuda/runtime -q  # codegen-text edits
+pytest tests/nvidia/cuda/integration -q  # runtime header / host wrapper edits
 ```
 
 ## 4. Development workflow
@@ -178,3 +181,11 @@ short bullet list — keep it that way.
 - Headers: each target's preamble directly includes its package-owned runtime
   header. There is no umbrella header or target-selection macro. Device headers
   use `.cuh` where required by their compiler; ordinary C++ headers use `.h`.
+
+## 6. Writing a target
+
+Use [targets/apple](../targets/apple) as a minimal example and
+[targets/nvidia](../targets/nvidia) as the complete compiler/runtime reference.
+Follow the [target loading and extension contract](spec/target.md#13-target-loading-and-extensions)
+in §1.3 for packaging, entry points, and registration.
+Keep tests in `tests/<vendor>/<target>/`.

@@ -1,5 +1,7 @@
 # Making one step fast
 
+This page requires the NVIDIA target. Install it with `pip install "tilefoundry[nvidia]"`.
+
 `analyze` says what a program costs before any kernel exists, so a placement decision can
 be priced before anyone writes a kernel for it. This page takes the step from
 `tilefoundry tutorial migrate` and makes it fast, measuring after each change instead of
@@ -40,7 +42,7 @@ pair and each row of the pair to one group of 128 threads.
 """The step from the migrate page, placed two ways: with a boundary, and without."""
 
 from tilefoundry.dsl import *
-from tilefoundry_cuda import CudaTarget
+from tilefoundry_nvidia import CudaTarget
 
 PAIR = 2  # rows one CTA normalizes
 CTAS = 132  # one CTA per SM of the H200, so the grid is one wave

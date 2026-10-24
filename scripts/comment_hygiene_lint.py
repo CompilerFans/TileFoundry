@@ -21,7 +21,13 @@ from pathlib import Path
 MAX_PROSE_LINES = 8
 MAX_COLUMNS = 100
 MAX_ASSERT_MESSAGE = 100
-EXEMPT_PREFIXES = ("tests/models/", "examples/", "tests/fixtures/schedule/tir/")
+EXEMPT_PREFIXES = (
+    "tests/nvidia/cuda/models/",
+    "tests/core/models/decode_oracle.py",
+    "tests/core/models/dense_decode.py",
+    "targets/nvidia/tilefoundry_nvidia/cuda/models/",
+    "examples/",
+)
 DIRECTIVE_PREFIXES = ("ruff:", "noqa", "type:", "pragma:", "mypy:", "fmt:", "isort:")
 PYTHON_SUFFIXES = frozenset({".py"})
 C_SUFFIXES = frozenset({".h", ".hpp", ".cuh", ".cu", ".cpp", ".cc"})
