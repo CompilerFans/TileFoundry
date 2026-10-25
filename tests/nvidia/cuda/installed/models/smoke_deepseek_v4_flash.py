@@ -18,24 +18,6 @@ from tests.nvidia.cuda.models.deepseek_v4_flash import reference
 MODEL = "deepseek_v4_flash"
 CASES = contract.model_cases(MODEL)
 
-ANALYSED = [
-    pytest.param(case, selected, id=selected.id) for case in CASES for selected in case.analyze
-]
-SIZED = [pytest.param(case, sized, id=sized.id) for case in CASES for sized in case.sized]
-
-
-@pytest.mark.parametrize(("case", "selected"), ANALYSED)
-def test_every_selected_function_analyses(tf, shipped_source, case, selected) -> None:
-    contract.analysed_every_family(
-        tf, shipped_source(MODEL), case, selected.selector, selected.dims
-    )
-
-
-@pytest.mark.parametrize(("case", "sized"), SIZED)
-def test_every_analysis_answers_at_the_largest_context(tf, shipped_source, case, sized) -> None:
-    """At the ceiling the case states, not at a sample of it."""
-    contract.analysed_every_family(tf, shipped_source(MODEL), case, sized.selector, sized.ceiling)
-
 
 ATOL = RTOL = 2e-3
 
@@ -99,10 +81,10 @@ def _asked(tf, work, source, step, *, out_held):
 
 
 @cuda_only
-def test_the_disagreement_is_smaller_than_the_oracles_own_rounding(
+def test_attention_error_within_oracle_rounding(
     tf, shipped_source, comparison_cache
 ) -> None:
-    """Test the disagreement is smaller than the oracles own rounding.
+    """The kernel's error against an f32 oracle is within the bf16 oracle's own rounding.
 
     Against an f32 accumulation of the same weights, the kernel is at least as
     close as Hugging Face's own bf16 run.
@@ -139,7 +121,7 @@ def test_the_disagreement_is_smaller_than_the_oracles_own_rounding(
 
 @cuda_only
 @pytest.mark.parametrize("ctx_len", CTX_LENGTHS)
-def test_the_step_is_authored_over_a_range_of_context_lengths(
+def test_attention_step_spans_context_lengths(
     tf, shipped_source, comparison_cache, ctx_len
 ) -> None:
     """The same description, at two context lengths, each against its own oracle.
@@ -161,7 +143,7 @@ def test_the_step_is_authored_over_a_range_of_context_lengths(
 
 
 @cuda_only
-def test_the_step_returns_the_cache_entry_to_append(tf, shipped_source, comparison_cache) -> None:
+def test_attention_step_returns_cache_entry(tf, shipped_source, comparison_cache) -> None:
     """The returned latent is this token's cache entry.
 
     The returned latent is this token's cache entry: appending it to the cache the
@@ -184,3 +166,6 @@ def test_the_step_returns_the_cache_entry_to_append(tf, shipped_source, comparis
         step,
         out_held=("allclose", {"atol": _bf16_ulps(want), "rtol": 0.0}),
     )
+
+
+test_model_analysis, test_model_ceiling = contract.analysis_tests(MODEL)

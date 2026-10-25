@@ -20,9 +20,6 @@ from tilefoundry_nvidia.cuda.models.qwen3_1_7b.model import published
 MODEL = "qwen3_1_7b"
 CASES = contract.model_cases(MODEL)
 
-ANALYSED = [
-    pytest.param(case, selected, id=selected.id) for case in CASES for selected in case.analyze
-]
 JSON_CASES = [pytest.param(case, case.analyze[0], id=case.id) for case in CASES]
 SIZED = [pytest.param(case, sized, id=sized.id) for case in CASES for sized in case.sized]
 
@@ -30,21 +27,8 @@ SIZED = [pytest.param(case, sized, id=sized.id) for case in CASES for sized in c
 ZERO_SIZED = frozenset(("k_cache", "v_cache"))
 
 
-@pytest.mark.parametrize(("case", "selected"), ANALYSED)
-def test_every_selected_function_analyses(tf, shipped_source, case, selected) -> None:
-    contract.analysed_every_family(
-        tf, shipped_source(MODEL), case, selected.selector, selected.dims
-    )
-
-
 @pytest.mark.parametrize(("case", "sized"), SIZED)
-def test_every_analysis_answers_at_the_largest_context(tf, shipped_source, case, sized) -> None:
-    """At the ceiling the case states, not at a sample of it."""
-    contract.analysed_every_family(tf, shipped_source(MODEL), case, sized.selector, sized.ceiling)
-
-
-@pytest.mark.parametrize(("case", "sized"), SIZED)
-def test_the_ceiling_is_reasoned_about_at_its_stated_length(
+def test_traffic_grows_at_ceiling(
     tf, shipped_source, case, sized
 ) -> None:
     """What the analysis reports has to grow with the context.
@@ -64,7 +48,7 @@ def test_the_ceiling_is_reasoned_about_at_its_stated_length(
 
 
 @pytest.mark.parametrize(("case", "sized"), SIZED)
-def test_the_open_dimensions_are_analysed_at_zero(tf, shipped_source, case, sized) -> None:
+def test_open_dims_analysed_at_zero(tf, shipped_source, case, sized) -> None:
     """A binding whose whole cost is the context has to cost nothing without one."""
     source = shipped_source(MODEL)
     zero = contract.lifetimes(tf, source, case, sized.selector, {name: 0 for name in sized.dims})
@@ -76,7 +60,7 @@ def test_the_open_dimensions_are_analysed_at_zero(tf, shipped_source, case, size
 
 
 @pytest.mark.parametrize(("case", "selected"), JSON_CASES)
-def test_the_command_reports_a_real_model_as_json(tf, shipped_source, case, selected) -> None:
+def test_analyze_reports_model_json(tf, shipped_source, case, selected) -> None:
     report = contract.analysed(
         tf,
         shipped_source(MODEL),
@@ -91,7 +75,7 @@ def test_the_command_reports_a_real_model_as_json(tf, shipped_source, case, sele
 
 
 @pytest.mark.parametrize("ctx_len", [0, 24])
-def test_the_decode_step_and_the_cache_entry_it_hands_back(
+def test_decode_step_returns_cache_entry(
     tf, shipped_source, comparison_cache, ctx_len
 ) -> None:
     """One decode step of one layer, and the state the step hands back.
@@ -140,7 +124,7 @@ def test_the_decode_step_and_the_cache_entry_it_hands_back(
     assert entry_k.shape[1] == 1 and want_k.shape[1] == ctx_len + 1
 
 
-def test_the_placed_mlp_matches_the_reference(tf, shipped_source, comparison_cache) -> None:
+def test_placed_mlp_matches_reference(tf, shipped_source, comparison_cache) -> None:
     """The performance witness keeps the shipped MLP's numerical boundary."""
     drawn = reference.decode_step_inputs(ctx_len=0, device="cpu")
     want = reference.mlp_reference(drawn.layer, drawn.hidden_new)
@@ -224,7 +208,7 @@ def _holds(reported: int, derived: int, label: str) -> None:
     )
 
 
-def test_the_mlp_costs_its_three_matrices(tf, shipped_source) -> None:
+def test_mlp_costs_three_matrices(tf, shipped_source) -> None:
     """The placed view counts work across its 128-CTA split."""
     source = shipped_source(MODEL)
     authored = _reported(tf, source, "mlp", None)
@@ -240,7 +224,7 @@ def test_the_mlp_costs_its_three_matrices(tf, shipped_source) -> None:
     _holds(placed_flops, _mlp_matmul_flops(), "placed mlp")
 
 
-def test_the_attention_costs_its_projections_and_its_context(tf, shipped_source) -> None:
+def test_attention_costs_projections_and_context(tf, shipped_source) -> None:
     """The four projections plus two passes over a 1024-token context."""
     data = _reported(tf, shipped_source(MODEL), "self_attention", {"ctx_len": CTX})
 
@@ -251,7 +235,7 @@ def test_the_attention_costs_its_projections_and_its_context(tf, shipped_source)
     )
 
 
-def test_the_layer_costs_its_two_halves_and_nothing_else(tf, shipped_source) -> None:
+def test_layer_costs_two_halves(tf, shipped_source) -> None:
     """A decoder layer is the attention and the MLP.
 
     A decoder layer is the attention and the MLP. Asserted against the sum of
@@ -267,7 +251,7 @@ def test_the_layer_costs_its_two_halves_and_nothing_else(tf, shipped_source) -> 
     )
 
 
-def test_the_layer_reads_at_least_its_weights_and_its_cache(tf, shipped_source) -> None:
+def test_layer_reads_weights_and_cache(tf, shipped_source) -> None:
     """Traffic is what a decode step is actually about, so it is checked too.
 
     A lower bound, because an intermediate is charged in full at every consumer
@@ -295,7 +279,7 @@ def test_the_layer_reads_at_least_its_weights_and_its_cache(tf, shipped_source) 
     )
 
 
-def test_a_decode_step_is_bound_by_memory(tf, shipped_source) -> None:
+def test_decode_step_memory_bound(tf, shipped_source) -> None:
     """The conclusion the whole analysis exists to reach, and the one that was wrong.
 
     One token through one layer performs roughly 100 million flops while moving
@@ -312,3 +296,6 @@ def test_a_decode_step_is_bound_by_memory(tf, shipped_source) -> None:
         f"{data["functions"][0]['totals']['flops']['f32']} flops"
     )
     assert bound["ideal_ns"] > 0
+
+
+test_model_analysis, test_model_ceiling = contract.analysis_tests(MODEL)

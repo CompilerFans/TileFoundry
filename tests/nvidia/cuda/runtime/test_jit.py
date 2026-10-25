@@ -6,14 +6,16 @@ while clearing the cache ends that identity. Private key structure is not part o
 the contract.
 """
 
+from pathlib import Path
+
 import pytest
 
-from tests.nvidia.cuda.fixtures.placed.rmsnorm import RmsnormModule
 from tilefoundry import jit
+from tilefoundry.cli.source import load_authored_ir
 from tilefoundry_nvidia import CudaTarget
 
 
-def test_jit_rejects_non_ir_inputs_and_string_targets() -> None:
+def test_jit_rejects_bad_arguments() -> None:
     """Raw Python, authored string Targets, and unexpected kwargs all raise."""
 
     def raw_fn(a):
@@ -22,7 +24,8 @@ def test_jit_rejects_non_ir_inputs_and_string_targets() -> None:
     with pytest.raises(TypeError, match="expected Function or Module"):
         jit(raw_fn, target=CudaTarget("nvidia.h200_sxm"))
 
-    fn = RmsnormModule.entry_function()
+    rmsnorm = Path(__file__).parents[1] / "fixtures/placed/rmsnorm.py"
+    fn = load_authored_ir(f"{rmsnorm}:RmsnormModule").entry_function()
     with pytest.raises(TypeError, match="Target instance, not a string"):
         jit(fn, target="vulkan")
     with pytest.raises(TypeError, match="unexpected keyword argument"):

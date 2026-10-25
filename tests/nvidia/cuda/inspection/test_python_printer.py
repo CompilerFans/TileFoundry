@@ -7,9 +7,12 @@ left-hand side carries, and the target header, whose value must rebuild the
 """
 
 from dataclasses import dataclass, fields, replace
+from pathlib import Path
 
-from tests.core._source import import_dsl
-from tests.nvidia.cuda.fixtures.placed.rmsnorm import RmsnormModule
+import pytest
+
+from tests.core._corpus import Case, case, check_case, reload, special
+from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.dsl import *
 from tilefoundry.inspection import PythonPrintOptions, as_script
 from tilefoundry.ir.core.module import Module
@@ -17,6 +20,9 @@ from tilefoundry.target import Target, register_target
 from tilefoundry.utils.python_source import PythonExpr
 from tilefoundry_nvidia.cuda.target import CudaArchitecture
 from tilefoundry_nvidia.cuda.target import CudaTarget as BuiltinCudaTarget
+
+PLACED = Path(__file__).parents[1] / "fixtures" / "placed"
+RMSNORM = f"{PLACED / 'rmsnorm.py'}:RmsnormModule"
 
 
 class CudaTarget(BuiltinCudaTarget):
@@ -28,17 +34,35 @@ class ExtendedCudaArchitecture(CudaArchitecture):
     thirteenth_field: int
 
 
-def test_inspection_types_are_opt_in_same_line_comments():
-    fn = RmsnormModule.entry_function()
-    canonical = as_script(fn)
-    annotated = as_script(fn, options=PythonPrintOptions(show_types=True))
+class PythonPrinterCase(Case):
+    """A program checked by the source the printer emits for it."""
 
-    assert canonical != annotated
-    assert "# Tensor[" in annotated
 
-    assert all(
-        line.split("# Tensor[")[0].strip() for line in annotated.splitlines() if "# Tensor[" in line
-    )
+@case
+class TypesAreOptInComments(PythonPrinterCase):
+    path: Path = PLACED / "rmsnorm.py"
+
+    def guard(self, state, problems):
+        fn = state.entry_function()
+        canonical = as_script(fn)
+        annotated = as_script(fn, options=PythonPrintOptions(show_types=True))
+
+        assert canonical != annotated
+        assert "# Tensor[" in annotated
+
+        assert all(
+            line.split("# Tensor[")[0].strip()
+            for line in annotated.splitlines()
+            if "# Tensor[" in line
+        )
+
+
+CASES = special(PythonPrinterCase)
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
+def test_python_printer_case(case: PythonPrinterCase) -> None:
+    check_case(case)
 
 
 def _rebuild(rendered: PythonExpr):
@@ -48,7 +72,7 @@ def _rebuild(rendered: PythonExpr):
     return namespace["result"]
 
 
-def test_an_installed_target_reports_its_public_constructor():
+def test_installed_target_prints_constructor():
     installed = BuiltinCudaTarget("nvidia.h200_sxm")
     rendered = installed.to_python()
 
@@ -59,7 +83,7 @@ def test_an_installed_target_reports_its_public_constructor():
     assert _rebuild(rendered) == installed
 
 
-def test_direct_hardware_values_keep_added_fields_in_canonical_source():
+def test_hardware_values_keep_added_fields():
     installed = BuiltinCudaTarget("nvidia.h200_sxm")
     architecture = ExtendedCudaArchitecture(
         **{
@@ -85,8 +109,8 @@ def test_direct_hardware_values_keep_added_fields_in_canonical_source():
     assert rebuilt.architecture.thirteenth_field == 13
 
 
-def test_external_same_named_cuda_target_keeps_its_provider_in_module_source():
-    function = RmsnormModule.entry_function()
+def test_external_cuda_target_keeps_provider():
+    function = load_authored_ir(RMSNORM).entry_function()
     register_target(CudaTarget)
     target = CudaTarget("nvidia.h200_sxm")
     module = Module("external", (function,), function.name, target=target)
@@ -94,19 +118,19 @@ def test_external_same_named_cuda_target_keeps_its_provider_in_module_source():
 
     assert "from tests.nvidia.cuda.inspection.test_python_printer import CudaTarget" in canonical
     assert "from tilefoundry_nvidia.cuda.target import CudaTarget" not in canonical
-    rebuilt = import_dsl(canonical)
+    rebuilt = reload(canonical, "external")
     assert type(rebuilt.target) is CudaTarget
     assert rebuilt.target == target
 
 
-def test_printer_emits_provider_expression_without_interpreting_it():
+def test_printer_emits_provider_expression():
     class UninterpretableTarget(Target):
         name = "tests.printer.uninterpretable"
 
         def to_python(self) -> PythonExpr:
             return PythonExpr(("from nobody import unknown",), "unknown !!!")
 
-    function = RmsnormModule.entry_function()
+    function = load_authored_ir(RMSNORM).entry_function()
     canonical = as_script(
         Module(
             "uninterpretable",

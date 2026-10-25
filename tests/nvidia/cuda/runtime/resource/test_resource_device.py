@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 
+from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.runtime.resource import DrawnResource, _resolved_device
 
 
@@ -13,20 +16,20 @@ def cpu_gen() -> torch.Generator:
 
 
 def test_drawn_resource_never_redraws():
-    from tests.nvidia.cuda.fixtures.placed.leaf_weights import Small  # noqa: PLC0415
-
+    leaf_weights = Path(__file__).parents[2] / "fixtures/placed/leaf_weights.py"
+    Small = load_authored_ir(f"{leaf_weights}:Small")
     resource = DrawnResource(Small, cpu_gen(), "cpu")
     assert resource.load("w") is resource.load("w")
 
 
-def test_a_bare_cuda_resolves_to_the_device_the_process_selected() -> None:
+def test_bare_cuda_resolves_current_device() -> None:
     if not torch.cuda.is_available():
         assert _resolved_device("cuda") == "cuda"
         return
     assert _resolved_device("cuda") == f"cuda:{torch.cuda.current_device()}"
 
 
-def test_it_follows_the_selection_rather_than_reading_it_once() -> None:
+def test_resolved_device_tracks_set_device() -> None:
     """The resolved device tracks a later `set_device`.
 
     The resolved device tracks a later `set_device`, so a worker assigned a card

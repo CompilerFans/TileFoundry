@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from tests.core._source import import_dsl
-from tests.nvidia.cuda.fixtures.logical.gqa_static import static_online_attend
+from pathlib import Path
+
+from tests.core._corpus import reload
+from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.inspection import as_script
 from tilefoundry.ir.core import Call, Tuple
 from tilefoundry.ir.hir.loop_region import LoopRegion
@@ -34,7 +36,9 @@ def _walk_ir(expr, seen=None):
         yield from _walk_ir(expr.body, seen)
 
 
-def test_static_fixture_has_one_fixed_online_softmax_region() -> None:
+def test_static_online_softmax_region_fixed() -> None:
+    gqa_static = Path(__file__).parents[2] / "fixtures/logical/gqa_static.py"
+    static_online_attend = load_authored_ir(f"{gqa_static}:static_online_attend")
     regions = tuple(
         expr
         for expr in _walk_ir(static_online_attend.entry_function().body)
@@ -49,7 +53,7 @@ def test_static_fixture_has_one_fixed_online_softmax_region() -> None:
         (topology.name, topology.size) for topology in static_online_attend.effective_topologies()
     ) == (("cta", 132),)
 
-    imported = import_dsl(as_script(static_online_attend))
+    imported = reload(as_script(static_online_attend), "static_online_attend")
     imported_regions = tuple(
         expr
         for expr in _walk_ir(imported.entry_function().body)

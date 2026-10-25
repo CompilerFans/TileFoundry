@@ -7,17 +7,23 @@ from pathlib import Path
 
 import pytest
 
-from tests.core.parser._fixtures import check_parsed_call_sources, fixture_cases
-from tilefoundry.dsl import *
+from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.inspection import as_script
 from tilefoundry.parser import ParseError
 
+FIXTURES = Path(__file__).parents[1] / "fixtures"
+LOOP_ITERATORS = {
+    "tf.tile(10)": "parser_tile_one_argument.py",
+    "tf.tile(1, 2, 3, 4)": "parser_tile_four_arguments.py",
+    "range(1, 2, 3, 4)": "parser_range_four_arguments.py",
+    "steps(1, 2)": "parser_unknown_loop_iterator.py",
+}
 
-def test_a_function_may_have_a_leading_docstring() -> None:
-    @func
-    def documented(x: Tensor[(4,), "f32"]) -> Tensor[(4,), "f32"]:
-        """This is documentation, not an HIR statement."""
-        return x
+
+def test_function_accepts_leading_docstring() -> None:
+    documented = load_authored_ir(
+        f"{FIXTURES}/parser/documented_function.py:Documented"
+    ).entry_function()
 
     assert "This is documentation" not in as_script(documented)
 
@@ -34,50 +40,11 @@ def test_a_function_may_have_a_leading_docstring() -> None:
         ("steps(1, 2)", "loop iterator must be tf.tile(...) or range(...)"),
     ),
 )
-def test_a_loop_iterator_states_why_its_arity_is_invalid(iterator: str, expected: str) -> None:
+def test_loop_iterator_names_arity_error(iterator: str, expected: str) -> None:
     """The shape-exact syntax must not reduce these to a bare match failure.
 
     Encoding each iterator's arity is what lets the generated grammar show the
     accepted forms, so the reason is stated before the shape rejects.
     """
     with pytest.raises(ParseError, match=re.escape(expected)):
-        if iterator == "tf.tile(10)":
-
-            @func
-            def looping(x: Tensor[(10, 4), "f32"], seed: Tensor[(4, 4), "f32"]):
-                out = tf.add(seed, seed)
-                for row in tf.tile(10):  # noqa: F821
-                    out = tf.add(x[row, :], seed)
-                return out
-
-        elif iterator == "tf.tile(1, 2, 3, 4)":
-
-            @func
-            def looping(x: Tensor[(10, 4), "f32"], seed: Tensor[(4, 4), "f32"]):
-                out = tf.add(seed, seed)
-                for row in tf.tile(1, 2, 3, 4):  # noqa: F821
-                    out = tf.add(x[row, :], seed)
-                return out
-
-        elif iterator == "range(1, 2, 3, 4)":
-
-            @func
-            def looping(x: Tensor[(10, 4), "f32"], seed: Tensor[(4, 4), "f32"]):
-                out = tf.add(seed, seed)
-                for row in range(1, 2, 3, 4):
-                    out = tf.add(x[row, :], seed)
-                return out
-
-        else:
-
-            @func
-            def looping(x: Tensor[(10, 4), "f32"], seed: Tensor[(4, 4), "f32"]):
-                out = tf.add(seed, seed)
-                for row in steps(1, 2):  # noqa: F821
-                    out = tf.add(x[row, :], seed)
-                return out
-
-
-@fixture_cases(__file__)
-def test_every_parsed_call_knows_where_it_came_from(source: Path) -> None:
-    check_parsed_call_sources(source)
+        load_authored_ir(str(FIXTURES / "diagnostics" / LOOP_ITERATORS[iterator]))

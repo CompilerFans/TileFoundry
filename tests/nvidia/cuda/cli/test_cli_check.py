@@ -15,17 +15,16 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from tests.core.cli._check import MESH_CHECK_ARGS
-from tests.nvidia.cuda.fixtures.placed import leaf_weights
-from tests.nvidia.cuda.fixtures.shapes.composed_leaf_source import composed_leaf_source
 from tests.nvidia.cuda.models.corpus import MODELS_ROOT
 from tilefoundry import cli
-from tilefoundry.cli.source import load_namespace, select_ir
+from tilefoundry.cli.source import load_authored_ir, load_namespace, select_ir
 from tilefoundry.evaluator import evaluate
 from tilefoundry.evaluator.value import to_torch_dtype
 from tilefoundry.runtime import DictResource
 from tilefoundry.runtime.resource import DrawnResource
 
 ROUTING = f"{MODELS_ROOT / 'qwen3_5_35b_a3b' / 'model.py'}:Qwen3_5Router.routing"
+LEAF_WEIGHTS = Path(__file__).parents[1] / "fixtures" / "placed" / "leaf_weights.py"
 
 
 def cpu_gen() -> torch.Generator:
@@ -47,57 +46,67 @@ class RecordingResource:
         return RecordingResource(self.inner.subtree(seg))
 
 
-def test_load_asks_the_resource_for_nothing():
+def test_load_reads_no_weights():
+    Mod = load_authored_ir(f"{LEAF_WEIGHTS}:Mod")
+    Small = load_authored_ir(f"{LEAF_WEIGHTS}:Small")
+    SmallTwin = load_namespace(str(LEAF_WEIGHTS))[0]["SmallTwin"]
     for mod, mk in (
-        (leaf_weights.Mod, leaf_weights.Mod.load),
-        (leaf_weights.Small, leaf_weights.Small.load),
-        (leaf_weights.Small, leaf_weights.SmallTwin().load),
+        (Mod, Mod.load),
+        (Small, Small.load),
+        (Small, SmallTwin().load),
     ):
         rec = RecordingResource(DrawnResource(mod, cpu_gen(), "cpu"))
         mk(rec)
         assert rec.asked == []
 
 
-def test_a_run_asks_for_exactly_the_functions_own_consts():
-    rec = RecordingResource(DrawnResource(leaf_weights.Small, cpu_gen(), "cpu"))
-    evaluate(leaf_weights.Small.load(rec).leaf, torch.zeros(1, leaf_weights.D))
+def test_evaluate_reads_own_consts():
+    Small = load_authored_ir(f"{LEAF_WEIGHTS}:Small")
+    D = load_namespace(str(LEAF_WEIGHTS))[0]["D"]
+    rec = RecordingResource(DrawnResource(Small, cpu_gen(), "cpu"))
+    evaluate(Small.load(rec).leaf, torch.zeros(1, D))
     assert rec.asked == []
-    evaluate(leaf_weights.Small.load(rec), torch.zeros(1, leaf_weights.D))
+    evaluate(Small.load(rec), torch.zeros(1, D))
     assert rec.asked == ["w"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a second device")
-def test_a_weight_on_another_device_is_named_at_first_use():
-    rec = RecordingResource(DrawnResource(leaf_weights.Small, cpu_gen(), "cpu"))
+def test_foreign_device_weight_named():
+    Small = load_authored_ir(f"{LEAF_WEIGHTS}:Small")
+    D = load_namespace(str(LEAF_WEIGHTS))[0]["D"]
+    rec = RecordingResource(DrawnResource(Small, cpu_gen(), "cpu"))
     with pytest.raises(ValueError, match=r"'w'"):
         evaluate(
-            leaf_weights.Small.load(rec),
-            torch.zeros(1, leaf_weights.D, device="cuda"),
+            Small.load(rec),
+            torch.zeros(1, D, device="cuda"),
         )
 
 
-def test_a_missing_weight_is_named_at_first_use():
-    loaded = leaf_weights.Small.load(DictResource({}))
+def test_missing_weight_named():
+    loaded = load_authored_ir(f"{LEAF_WEIGHTS}:Small").load(DictResource({}))
     with pytest.raises(KeyError, match=r"missing declared weight 'w'"):
-        evaluate(loaded, torch.zeros(1, leaf_weights.D))
+        evaluate(loaded, torch.zeros(1, load_namespace(str(LEAF_WEIGHTS))[0]["D"]))
 
 
-def test_a_twin_binds_once_and_keeps_it():
-    rec = RecordingResource(DrawnResource(leaf_weights.Small, cpu_gen(), "cpu"))
-    twin = leaf_weights.SmallTwin()
+def test_twin_binds_weights_once():
+    Small = load_authored_ir(f"{LEAF_WEIGHTS}:Small")
+    leaf_weights = load_namespace(str(LEAF_WEIGHTS))[0]
+    D = leaf_weights["D"]
+    rec = RecordingResource(DrawnResource(Small, cpu_gen(), "cpu"))
+    twin = leaf_weights["SmallTwin"]()
     twin.load(rec)
-    twin.entry(torch.zeros(1, leaf_weights.D))
-    twin.entry(torch.zeros(1, leaf_weights.D))
+    twin.entry(torch.zeros(1, D))
+    twin.entry(torch.zeros(1, D))
     assert rec.asked == ["w"]
 
 
-def test_the_two_input_axes_are_independent(tmp_path):
+def test_input_weight_axes_independent(tmp_path):
     from tilefoundry.cli import build_parser  # noqa: PLC0415 -- existing parser shape changes in M4
 
-    source = f"{leaf_weights.__file__}:Small.entry"
+    source = f"{LEAF_WEIGHTS}:Small.entry"
     a, b = tmp_path / "a.pt", tmp_path / "b.pt"
     for path in (a, b):
-        torch.save(torch.zeros(1, leaf_weights.D), path)
+        torch.save(torch.zeros(1, load_namespace(str(LEAF_WEIGHTS))[0]["D"]), path)
     for inputs in ("random", f"files:{a},{b}"):
         for weights in ("random", f"ckpt:{tmp_path}"):
             build_parser().parse_args(
@@ -177,7 +186,7 @@ def _routing_argv(routing: dict[str, Path], indices: str, *comparison: str) -> l
     ]
 
 
-def test_each_output_is_judged_by_a_predicate_its_dtype_admits(routing, capsys) -> None:
+def test_outputs_judged_per_dtype(routing, capsys) -> None:
     """One call, two kinds of output, each with its own comparison and verdict."""
     assert (
         cli.main(
@@ -208,7 +217,7 @@ def test_each_output_is_judged_by_a_predicate_its_dtype_admits(routing, capsys) 
     assert reported.rstrip().endswith("PASS") or "\nPASS" in reported
 
 
-def test_one_wrong_index_fails_and_the_command_says_so(routing, capsys) -> None:
+def test_one_wrong_index_fails(routing, capsys) -> None:
     """A single changed index is a total failure that no aggregate would see."""
     assert (
         cli.main(
@@ -237,7 +246,7 @@ def test_one_wrong_index_fails_and_the_command_says_so(routing, capsys) -> None:
     assert "FAIL" in reported
 
 
-def test_a_zero_reference_is_reported_rather_than_divided_by(routing, capsys) -> None:
+def test_zero_reference_reported(routing, capsys) -> None:
     """`ref_norm` 0 and an absolute distance, not a number scaled by a clamp."""
     assert (
         cli.main(
@@ -280,7 +289,7 @@ def test_a_zero_reference_is_reported_rather_than_divided_by(routing, capsys) ->
     assert "e+12" not in reported
 
 
-def test_the_json_report_carries_the_same_facts_as_the_text(routing, capsys, tmp_path) -> None:
+def test_json_report_matches_text(routing, capsys, tmp_path) -> None:
     """Including `ref_norm` and each predicate's own bound and value."""
     report_path = tmp_path / "report.json"
     assert (
@@ -365,14 +374,14 @@ def test_the_json_report_carries_the_same_facts_as_the_text(routing, capsys, tmp
         ),
     ],
 )
-def test_check_refuses_what_it_cannot_answer(routing, capsys, comparison, refused) -> None:
+def test_check_refuses_unanswerable_comparisons(routing, capsys, comparison, refused) -> None:
     """Each refusal names what is missing; none of them has a default to fall back on."""
     assert cli.main(_routing_argv(routing, "indices", *comparison)) == 1
 
     assert refused in capsys.readouterr().err
 
 
-def test_a_passing_check_carries_no_verification_ranking(routing, capsys) -> None:
+def test_passing_check_omits_ranking(routing, capsys) -> None:
     """A PASS says the candidate matches this Module, and claims nothing further.
 
     It used to append a ranking read out of the shipped catalog. That was a claim
@@ -407,7 +416,7 @@ def test_a_passing_check_carries_no_verification_ranking(routing, capsys) -> Non
     assert "FAIL says the candidate and reference differ" not in reported
 
 
-def test_a_random_input_fail_against_a_reference_states_its_limits(
+def test_random_input_failure_states_limits(
     routing, capsys, tmp_path
 ) -> None:
     """A failed random-input comparison qualifies both limits through the CLI."""
@@ -461,30 +470,13 @@ def test_a_random_input_fail_against_a_reference_states_its_limits(
     ]
 
 
-def test_a_nested_child_reads_only_its_own_part_of_the_checkpoint(routing, tmp_path) -> None:
+def test_nested_child_reads_own_checkpoint(routing, tmp_path) -> None:
     """Reaching `router.routing` reads `router.w_router`.
 
     Reaching `router.routing` reads `router.w_router`: the checkpoint holds
     that one tensor and none of the eight the block around it declares.
     """
-    source = tmp_path / "nested.py"
-    source.write_text(
-        """from dataclasses import replace
-from tilefoundry.dsl import *
-from tilefoundry_nvidia.cuda.models.qwen3_5_35b_a3b.model import Qwen3_5MoE, Qwen3_5Router, S, _H, _DT
-
-@module(entry="routing")
-class Wrapper:
-    router = Qwen3_5Router
-
-    @func
-    def routing(tokens: Tensor[(S, _H), _DT]):
-        return router(tokens)
-
-Root = replace(Qwen3_5MoE, functions=(*Qwen3_5MoE.functions, Wrapper.routing))
-""",
-        encoding="utf-8",
-    )
+    source = Path(__file__).parents[1] / "fixtures/cli/nested_checkpoint.py"
     save_file(
         {"router.w_router": load_file(str(routing["dir"] / "model.safetensors"))["w_router"]},
         str(tmp_path / "model.safetensors"),
@@ -506,10 +498,9 @@ Root = replace(Qwen3_5MoE, functions=(*Qwen3_5MoE.functions, Wrapper.routing))
     assert cli.main(argv) == 0
 
 
-def test_a_pinned_extent_on_a_root_that_reaches_a_child(tmp_path, capsys) -> None:
+def test_check_binds_composed_root_extent(capsys) -> None:
     """Binding an extent must not turn the child call back into an exact one."""
-    source = tmp_path / "composed.py"
-    source.write_text(composed_leaf_source("n_check"), encoding="utf-8")
+    source = Path(__file__).parents[1] / "fixtures/cli/composed_leaf_n_check.py"
     assert (
         cli.main(
             [

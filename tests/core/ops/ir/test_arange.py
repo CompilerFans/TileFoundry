@@ -5,8 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tests.core.evaluator.eval_utils import EvalCase, run_eval_case
-from tests.core.ops.ir.cost_utils import CostCase, run_cost_case
+from tests.core.ops.ir.op_case import Cost, OpCase, check_op_case
 from tilefoundry.dsl import *
 from tilefoundry.evaluator.registry import eval_registry
 from tilefoundry.evaluator.value import EvalError
@@ -20,8 +19,6 @@ from tilefoundry.visitor_registry.contexts import TrafficBytes, TypeInferContext
 from tilefoundry.visitor_registry.typeinfer import TypeInferVisitor
 
 _COORD_MESH = Mesh((Topology("thread", 4),), Layout((4,), (1,)), ("t",))
-
-
 _COORD_INDEX = TensorType.scalar(DType.i64, storage=StorageKind.RMEM)
 
 
@@ -35,20 +32,12 @@ def _infer(op: Arange) -> TensorType:
     return TypeInferVisitor().visit(call, TypeInferContext())
 
 
-def test_arange_static_type_evaluation_and_cost():
+def test_arange_infers_evaluates_and_costs():
     type_ = TensorType(shape=(3,), dtype=DType.i64, layout=Layout((3,)), storage=StorageKind.GMEM)
     op = Arange(type=type_, start=2, step=2)
-
     assert _infer(op) is type_
-    run_eval_case(
-        EvalCase(
-            "half_open",
-            op,
-            (),
-            torch.tensor([2, 4, 6], dtype=torch.int64),
-        )
-    )
-    run_cost_case(CostCase("arange", op, (), traffic=(TrafficBytes(),)))
+    check_op_case(OpCase("half_open", op, (), value=torch.tensor([2, 4, 6], dtype=torch.int64)))
+    check_op_case(OpCase("arange", op, (), cost=Cost(traffic=(TrafficBytes(),))))
 
 
 @pytest.mark.parametrize(
@@ -62,24 +51,14 @@ def test_arange_static_type_evaluation_and_cost():
         ),
         (
             Arange(
-                type=TensorType(
-                    shape=(8,),
-                    dtype=DType.i64,
-                    layout=None,
-                    storage=StorageKind.GMEM,
-                ),
+                type=TensorType(shape=(8,), dtype=DType.i64, layout=None, storage=StorageKind.GMEM),
                 step=0,
             ),
             "step must be a positive static integer",
         ),
         (
             Arange(
-                type=TensorType(
-                    shape=(8,),
-                    dtype=DType.f32,
-                    layout=None,
-                    storage=StorageKind.GMEM,
-                )
+                type=TensorType(shape=(8,), dtype=DType.f32, layout=None, storage=StorageKind.GMEM)
             ),
             "dtype must be i32 or i64",
         ),
@@ -90,7 +69,7 @@ def test_arange_rejects_unsupported_attributes(op, message):
         _infer(op)
 
 
-def test_a_bound_mesh_coordinate_is_one_number_without_placement() -> None:
+def test_bound_mesh_coord_is_scalar() -> None:
     inferred = TypeInferVisitor().visit(_coord(), TypeInferContext(current_mesh=_COORD_MESH))
     assert inferred.shape == ()
     assert inferred.dtype == DType.i64
@@ -98,12 +77,12 @@ def test_a_bound_mesh_coordinate_is_one_number_without_placement() -> None:
     assert inferred.storage is StorageKind.RMEM
 
 
-def test_an_unbound_mesh_coordinate_is_rejected() -> None:
+def test_unbound_mesh_coord_rejected() -> None:
     with pytest.raises(ValueError, match="must be bound by the current mesh scope"):
         TypeInferVisitor().visit(_coord(), TypeInferContext())
 
 
-def test_an_inner_mesh_coordinate_is_bound_by_a_multilevel_scope() -> None:
+def test_inner_mesh_coord_binds_multilevel() -> None:
     cta = Mesh((Topology("cta", 2),), Layout((2,), (1,)), ("c",))
     current = make_mesh(cta, _COORD_MESH)
     assert (
@@ -111,7 +90,7 @@ def test_an_inner_mesh_coordinate_is_bound_by_a_multilevel_scope() -> None:
     )
 
 
-def test_mesh_coordinate_evaluation_is_explicitly_unmodelled() -> None:
+def test_mesh_coord_evaluation_refused() -> None:
     handler = eval_registry.lookup(MeshCoord)
     with pytest.raises(EvalError, match="one mesh participant"):
         handler(None)

@@ -8,36 +8,10 @@ from pathlib import Path
 
 from tests.core.installed._analyze import check_usage_error
 
-_BAD_MODULE = (
-    '\n'
-    'from tilefoundry.dsl import *\n'
-    '\n'
-    '\n'
-    '@module(entry="main")\n'
-    'class Bad:\n'
-    '    @func\n'
-    '    def main(x: Tensor[(8,), "f32"]):\n'
-    '        wrong = tf.add(x, tf.cast(x, "i32"))\n'
-    '        return wrong\n'
-)
-
-_OPEN_MODULE = (
-    '\n'
-    'from tilefoundry.dsl import *\n'
-    '\n'
-    'from tilefoundry_nvidia import CudaTarget\n'
-    '\n'
-    'N = DimVar("N", 1, 8)\n'
-    '\n'
-    '@module(entry="main", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))\n'
-    'class Open:\n'
-    '    @func\n'
-    '    def main(x: Tensor[(N,), "f32"]):\n'
-    '        return tf.add(x, x)\n'
-)
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
 
-def test_logical_analyses_run(tf, cmine, tmp_path) -> None:
+def test_analyze_logical_root(tf, cmine, tmp_path) -> None:
     done = tf(
         "analyze",
         f"{cmine}:CMine.root",
@@ -53,7 +27,7 @@ def test_logical_analyses_run(tf, cmine, tmp_path) -> None:
         assert conclusion in report, conclusion
 
 
-def test_mega_kernel_reports_four_families_with_retained_occurrences(tf, tmp_path) -> None:
+def test_mega_kernel_reports_four_families(tf, tmp_path) -> None:
     source = Path(__file__).resolve().parents[1] / "fixtures" / "placed" / "moe_mega_kernel.py"
     done = tf(
         "analyze",
@@ -126,7 +100,7 @@ def test_mega_kernel_reports_four_families_with_retained_occurrences(tf, tmp_pat
         assert conclusion in text
 
 
-def test_a_bare_analyze_typechecks_and_prints_only_typed_hir(tf, cmine, tmp_path) -> None:
+def test_bare_analyze_prints_typed_hir(tf, cmine, tmp_path) -> None:
     done = tf(
         "analyze",
         f"{cmine}:CMine.root",
@@ -146,15 +120,14 @@ def test_a_bare_analyze_typechecks_and_prints_only_typed_hir(tf, cmine, tmp_path
     assert "performance=" not in report
 
 
-def test_analyze_json_needs_an_explicit_analysis(tf, cmine, tmp_path) -> None:
+def test_analyze_json_needs_analysis(tf, cmine, tmp_path) -> None:
     done = tf("analyze", f"{cmine}:CMine.root", str(tmp_path / "report.json"), "--json")
     check_usage_error(done)
     assert "tilefoundry analyze: error: --json requires at least one analysis flag:" in done.stderr
 
 
-def test_a_bare_analyze_binds_every_open_dimension(tf, tmp_path) -> None:
-    source = tmp_path / "open.py"
-    source.write_text(_OPEN_MODULE, encoding="utf-8")
+def test_bare_analyze_requires_bound_dims(tf, tmp_path) -> None:
+    source = FIXTURES / "logical/open_dimension.py"
 
     unbound = tf("analyze", f"{source}:Open", str(tmp_path / "unbound.py"))
     assert unbound.returncode == 1
@@ -201,7 +174,7 @@ def test_performance_resolves_derived_execution_geometry(tf, derived_prefill, tm
     }
 
 
-def test_analyze_reports_only_the_analyses_that_were_requested(tf, cwide, tmp_path) -> None:
+def test_analyze_reports_requested_analyses(tf, cwide, tmp_path) -> None:
     done = tf("analyze", f"{cwide}:Model", str(tmp_path / "report.py"), "--roofline")
     assert done.returncode == 0, done.stderr
 
@@ -218,9 +191,8 @@ def test_analyze_reports_only_the_analyses_that_were_requested(tf, cwide, tmp_pa
     assert "; performance=" not in report
 
 
-def test_analyze_failure_reports_line_variable_and_reason(tf, dynamic_trip_count, tmp_path) -> None:
-    bad = tmp_path / "bad.py"
-    bad.write_text(_BAD_MODULE, encoding="utf-8")
+def test_analyze_failure_reports_source_line(tf, dynamic_trip_count, tmp_path) -> None:
+    bad = FIXTURES / "diagnostics/verify_dtype_mismatch.py"
 
     done = tf("analyze", f"{bad}:Bad", str(tmp_path / "bad_report.py"))
     assert done.returncode == 1
@@ -245,7 +217,7 @@ def test_analyze_failure_reports_line_variable_and_reason(tf, dynamic_trip_count
     assert not report.exists()
 
 
-def test_analyze_loads_sibling_modules_without_leaking_paths_or_output(
+def test_analyze_isolates_sibling_modules(
     tf, siblings, tmp_path
 ) -> None:
     first = siblings("first", "First")
@@ -260,7 +232,7 @@ def test_analyze_loads_sibling_modules_without_leaking_paths_or_output(
         assert "source output" not in report.read_text(encoding="utf-8")
 
 
-def test_a_dim_that_is_not_understood_is_refused(tf, cmine, tmp_path) -> None:
+def test_malformed_dim_refused(tf, cmine, tmp_path) -> None:
     for bad in ("ctx_len", "ctx_len=", "ctx_len=wide"):
         done = tf(
             "analyze",
@@ -274,7 +246,7 @@ def test_a_dim_that_is_not_understood_is_refused(tf, cmine, tmp_path) -> None:
         assert done.stderr.strip(), bad
 
 
-def test_analyze_names_an_open_dimension_and_suggests_extents(tf, shipped, tmp_path) -> None:
+def test_analyze_suggests_open_dimension_extents(tf, shipped, tmp_path) -> None:
     model = f"{Path(shipped['models']) / 'qwen3_5_35b_a3b' / 'model.py'}:Qwen3_5FullAttention.full_attention"
     done = tf("analyze", model, str(tmp_path / "open.py"), "--memory")
     assert done.returncode == 1
@@ -284,7 +256,7 @@ def test_analyze_names_an_open_dimension_and_suggests_extents(tf, shipped, tmp_p
     assert "0, 1, 131071, 262143" in done.stderr
 
 
-def test_analyze_rejects_several_extents_for_one_dimension(tf, shipped, tmp_path) -> None:
+def test_analyze_rejects_several_extents(tf, shipped, tmp_path) -> None:
     model = f"{Path(shipped['models']) / 'qwen3_5_35b_a3b' / 'model.py'}:Qwen3_5FullAttention.full_attention"
     done = tf("analyze", model, str(tmp_path / "several.py"), "--dim", "ctx_len=0,1")
     assert done.returncode == 1
@@ -292,7 +264,7 @@ def test_analyze_rejects_several_extents_for_one_dimension(tf, shipped, tmp_path
     assert "ctx_len takes one EXTENT at a time" in done.stderr
 
 
-def test_a_selector_that_names_nothing_says_so(tf, cmine, tmp_path) -> None:
+def test_unknown_selector_refused(tf, cmine, tmp_path) -> None:
     done = tf(
         "analyze", f"{cmine}:CMine.nope", str(tmp_path / "missing-selector.py"), "--compute-cost"
     )

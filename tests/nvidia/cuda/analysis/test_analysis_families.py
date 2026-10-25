@@ -11,16 +11,11 @@ disagree with itself.
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
-from tests.nvidia.cuda.fixtures.placed.performance_findings import _CrossScopePerformance
-from tests.nvidia.cuda.fixtures.placed.symbolic_offset import (
-    _LiteralStoreOffset,
-    _SymbolicStoreOffset,
-)
-from tests.nvidia.cuda.fixtures.placed.tp_all_to_all import HELD_BYTES, TransposeShard
-from tests.nvidia.cuda.models.access_footprint.model import TiledQKVProjection
+from tests.core._corpus import Case, case, check_case, special
 from tilefoundry.analysis import (
     Breakdown,
     ComputeCostMetadata,
@@ -43,7 +38,7 @@ from tilefoundry.analysis.compute_cost import (
 from tilefoundry.analysis.errors import AnalysisError
 from tilefoundry.analysis.memory import MemoryOptions
 from tilefoundry.analysis.metadata import shifted
-from tilefoundry.dsl import *
+from tilefoundry.cli.source import load_authored_ir, load_namespace
 from tilefoundry.inspection.analysis_report import render_analysis, render_text
 from tilefoundry.ir.core import (
     Call,
@@ -57,24 +52,37 @@ from tilefoundry.visitor_registry.buffer_alias import aliased_operand
 from tilefoundry.visitor_registry.contexts import TrafficBytes
 from tilefoundry_nvidia import CudaTarget
 
-_ROUNDING_M = 14_593
+PLACED = Path(__file__).parents[1] / "fixtures" / "placed"
+ANALYSIS = Path(__file__).parents[1] / "fixtures" / "analysis"
+ACCESS_FOOTPRINT = Path(__file__).parents[1] / "models" / "access_footprint" / "model.py"
 
 
-def test_invariant_gemm_operands_repeat_in_total_traffic() -> None:
+class FamilyCase(Case):
+    """One program whose family records state the arithmetic a family must keep."""
+
+
+@case
+class InvariantGemmOperands(FamilyCase):
     """The QKV tiles load again even when one operand is invariant in one loop."""
-    result = analyze(
-        *check_program(TiledQKVProjection, TiledQKVProjection.entry_function()),
-        analysis="memory",
-    )
-    record = get_metadata(result.function, RegionMemoryMetadata)
-    gmem = record.traffic.storage.of("gmem")
 
-    assert gmem is not None
-    assert gmem.logical == TrafficBytes(read=27_262_976, write=16_777_216)
-    assert gmem.total == TrafficBytes(read=18_824_036_352, write=2_214_592_512)
+    path: Path = ACCESS_FOOTPRINT
+    name: str | None = "TiledQKVProjection"
+
+    def guard(self, state, problems):
+        result = analyze(
+            *check_program(state, state.entry_function()),
+            analysis="memory",
+        )
+        record = get_metadata(result.function, RegionMemoryMetadata)
+        gmem = record.traffic.storage.of("gmem")
+
+        assert gmem is not None
+        assert gmem.logical == TrafficBytes(read=27_262_976, write=16_777_216)
+        assert gmem.total == TrafficBytes(read=18_824_036_352, write=2_214_592_512)
 
 
-def test_reshard_compares_address_boxes_without_participant_ownership() -> None:
+def test_reshard_aliases_input_buffer() -> None:
+    TransposeShard = load_authored_ir(f"{PLACED / 'tp_all_to_all.py'}:TransposeShard")
     result = analyze(
         *check_program(TransposeShard, TransposeShard.entry_function()), analysis="memory"
     )
@@ -89,18 +97,11 @@ def test_reshard_compares_address_boxes_without_participant_ownership() -> None:
     assert record.traffic.communication.of("gpu") is None
     assert (
         get_metadata(result.function, RegionMemoryMetadata).peak_for("gmem").peak_bytes
-        == HELD_BYTES
+        == load_namespace(str(PLACED / "tp_all_to_all.py"))[0]["HELD_BYTES"]
     )
 
 
-_ROUNDING_N = 11_489
-_ROUNDING_K = 298_224_413
-_H200 = CudaTarget("nvidia.h200_sxm")
 _ALL_FAMILIES = ("compute-cost", "memory", "roofline", "performance")
-_LARGE_H200 = CudaTarget(
-    replace(_H200.device, hbm_capacity_bytes=300_000_000_000_000_000),
-    architecture=_H200.architecture,
-)
 
 
 class _RestatedCapacity(CudaTarget):
@@ -137,165 +138,110 @@ class _RoomierShared(_RestatedCapacity):
     levels = {"smem": 845_000}
 
 
-_GRID = DimVar("grid", 1, 396)
-
-
-@module(entry="main", target=_LARGE_H200, topologies=(Topology("cta", 1),))
-class _LargeRooflineRounding:
-    @func
-    def main(
-        lhs: Tensor[(_ROUNDING_M, _ROUNDING_K), "f32"],
-        rhs: ConstTensor[(_ROUNDING_K, _ROUNDING_N), "f32"],
-    ):
-        return tf.matmul(lhs, rhs)
-
-
-@module(
-    entry="unpriced_only",
-    target=CudaTarget("nvidia.h200_sxm"),
-    topologies=(Topology("cta", 1),),
-)
-class _PricingBoundary:
-    @func
-    def unpriced_only(source: Tensor[(1,), "f32"]):
-        with Mesh(("cta",), layout=(1,), names=("tile",)) as cta:
-            local = tf.reshard(source, (1 @ cta.tile,), "rmem")
-            moved = tf.reshard(local, (1 @ cta.tile,), "rmem")
-            return tf.add(moved, moved)
-
-    @func
-    def mixed(source: Tensor[(64,), "f32"]):
-        with Mesh(("cta",), layout=(1,), names=("tile",)) as cta:
-            placed = tf.reshard(source, (64 @ cta.tile,), "gmem")
-            local = tf.reshard(placed, (64 @ cta.tile,), "rmem")
-            return tf.add(local, local)
-
-    @func
-    def serviced_predicate(source: Tensor[(64,), "f32"]):
-        with Mesh(("cta",), layout=(1,), names=("tile",)) as cta:
-            placed = tf.reshard(source, (64 @ cta.tile,), "gmem")
-            return placed <= placed
-
-
-@module(entry="split", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 132),))
-class _SharedTile:
-    @func
-    def split(source: Tensor[(1056, 6600), "f32"]):
-        with Mesh(("cta",), layout=(132,), names=("tile",)) as cta:
-            local = tf.reshard(source, (1056 @ cta.tile, 6600), "smem")
-            return tf.add(local, local)
-
-    @func
-    def broadcast(source: Tensor[(1056, 6600), "f32"]):
-        with Mesh(("cta",), layout=(132,), names=("tile",)) as _cta:
-            local = tf.reshard(source, (1056, 6600), "smem")
-            return tf.add(local, local)
-
-    @func
-    def viewed(source: Tensor[(1056, 6600), "f32"]):
-        with Mesh(("cta",), layout=(132,), names=("tile",)) as cta:
-            local = tf.reshard(source, (1056 @ cta.tile, 6600), "smem")
-            view = tf.reshape(local, new_shape=(1056, 100, 66))
-            return tf.add(view, view)
-
-
 def _calls(function) -> tuple[Call, ...]:
     return tuple(expr for expr in collect_exprs(function.body) if isinstance(expr, Call))
 
 
-def test_performance_orders_a_predecessor_materialized_in_a_child_scope() -> None:
+@case
+class CrossScopePerformance(FamilyCase):
     """The outer stage waits for the inner stage to complete."""
-    results = {}
-    for name in ("cross_scope", "nested_control"):
-        function = next(fn for fn in _CrossScopePerformance.functions if fn.name == name)
-        results[name] = analyze(
-            *check_program(_CrossScopePerformance, function, dims={"seq_len": 8192}),
-            analysis=_ALL_FAMILIES,
-        )
-        assert get_metadata(results[name].function, PerformanceSummaryMetadata) is not None
 
-    cross_scope = results["cross_scope"]
-    timed = []
-    context = _build_context(cross_scope.module, cross_scope.function)[-1]
-    for call in _calls(cross_scope.function):
-        frame = context._callee_context(call)
-        occurrence = get_metadata(call, PerformanceMetadata)
-        if frame is None or occurrence is None:
-            continue
-        for primitive in _calls(frame.function):
-            record = get_metadata(primitive, PerformanceMetadata)
-            if record is None:
-                continue
-            resolved = replace(
-                record, timeline=shifted(record.timeline, occurrence.timeline.start_ns)
+    path: Path = PLACED / "performance_findings.py"
+    name: str | None = "_CrossScopePerformance"
+
+    def guard(self, state, problems):
+        results = {}
+        for name in ("cross_scope", "nested_control"):
+            function = next(fn for fn in state.functions if fn.name == name)
+            results[name] = analyze(
+                *check_program(state, function, dims={"seq_len": 8192}),
+                analysis=_ALL_FAMILIES,
             )
-            for invocation in range(occurrence.timeline.trips):
-                for iteration in range(resolved.timeline.trips):
-                    offset = (
-                        invocation * occurrence.timeline.stride_ns
-                        + iteration * resolved.timeline.stride_ns
-                    )
-                    timed.append(
-                        (
-                            primitive,
-                            replace(
-                                resolved,
-                                timeline=replace(
-                                    resolved.timeline,
-                                    start_ns=resolved.timeline.start_ns + offset,
-                                    end_ns=resolved.timeline.end_ns + offset,
-                                ),
-                            ),
+            assert get_metadata(results[name].function, PerformanceSummaryMetadata) is not None
+
+        cross_scope = results["cross_scope"]
+        timed = []
+        context = _build_context(cross_scope.module, cross_scope.function)[-1]
+        for call in _calls(cross_scope.function):
+            frame = context._callee_context(call)
+            occurrence = get_metadata(call, PerformanceMetadata)
+            if frame is None or occurrence is None:
+                continue
+            for primitive in _calls(frame.function):
+                record = get_metadata(primitive, PerformanceMetadata)
+                if record is None:
+                    continue
+                resolved = replace(
+                    record, timeline=shifted(record.timeline, occurrence.timeline.start_ns)
+                )
+                for invocation in range(occurrence.timeline.trips):
+                    for iteration in range(resolved.timeline.trips):
+                        offset = (
+                            invocation * occurrence.timeline.stride_ns
+                            + iteration * resolved.timeline.stride_ns
                         )
-                    )
-    scalar_indices = tuple(
-        (call, record)
-        for call, record in timed
-        if record is not None and isinstance(call.target, Binary) and call.type.shape == ()
-    )
-    stores = tuple(
-        (call, record)
-        for call, record in timed
-        if record is not None and isinstance(call.target, InsertSlice)
-    )
-    loads = tuple(
-        (call, record)
-        for call, record in timed
-        if record is not None and isinstance(call.target, Reshard)
-    )
+                        timed.append(
+                            (
+                                primitive,
+                                replace(
+                                    resolved,
+                                    timeline=replace(
+                                        resolved.timeline,
+                                        start_ns=resolved.timeline.start_ns + offset,
+                                        end_ns=resolved.timeline.end_ns + offset,
+                                    ),
+                                ),
+                            )
+                        )
+        scalar_indices = tuple(
+            (call, record)
+            for call, record in timed
+            if record is not None and isinstance(call.target, Binary) and call.type.shape == ()
+        )
+        stores = tuple(
+            (call, record)
+            for call, record in timed
+            if record is not None and isinstance(call.target, InsertSlice)
+        )
+        loads = tuple(
+            (call, record)
+            for call, record in timed
+            if record is not None and isinstance(call.target, Reshard)
+        )
 
-    outer_index = max(scalar_indices, key=lambda item: item[1].timeline.start_ns)[1]
-    inner_store = max(
-        (
-            record
-            for _call, record in stores
-            if record.timeline.end_ns <= outer_index.timeline.start_ns
-        ),
-        key=lambda record: record.timeline.end_ns,
-    )
-    outer_load = min(
-        (
-            record
-            for _call, record in loads
-            if record.timeline.start_ns >= outer_index.timeline.end_ns
-        ),
-        key=lambda record: record.timeline.start_ns,
-    )
+        outer_index = max(scalar_indices, key=lambda item: item[1].timeline.start_ns)[1]
+        inner_store = max(
+            (
+                record
+                for _call, record in stores
+                if record.timeline.end_ns <= outer_index.timeline.start_ns
+            ),
+            key=lambda record: record.timeline.end_ns,
+        )
+        outer_load = min(
+            (
+                record
+                for _call, record in loads
+                if record.timeline.start_ns >= outer_index.timeline.end_ns
+            ),
+            key=lambda record: record.timeline.start_ns,
+        )
 
-    assert inner_store.timeline.end_ns == outer_index.timeline.start_ns
-    assert outer_index.timeline.end_ns == outer_load.timeline.start_ns
+        assert inner_store.timeline.end_ns == outer_index.timeline.start_ns
+        assert outer_index.timeline.end_ns == outer_load.timeline.start_ns
 
 
-def test_a_symbolic_store_stride_preserves_the_literal_control_result() -> None:
+def test_symbolic_stride_adds_address_ops() -> None:
     """Group_index * 32 is an address, not an unbound parameter.
 
     Address arithmetic executes in each of the 32 position iterations.
     """
     observed = {}
-    for name, owner in (
-        ("literal", _LiteralStoreOffset),
-        ("symbolic", _SymbolicStoreOffset),
+    for name, root in (
+        ("literal", "_LiteralStoreOffset"),
+        ("symbolic", "_SymbolicStoreOffset"),
     ):
+        owner = load_authored_ir(f"{PLACED / 'symbolic_offset.py'}:{root}")
         result = analyze(
             *check_program(owner, owner.entry_function(), dims={"seq_len": 8192}),
             analysis=_ALL_FAMILIES,
@@ -322,60 +268,27 @@ def test_a_symbolic_store_stride_preserves_the_literal_control_result() -> None:
     assert symbolic_performance - literal_performance == 6 * 32
 
 
-def test_roofline_uses_exact_integer_ceiling_above_float_precision() -> None:
-    result = analyze(
-        *check_program(_LargeRooflineRounding, _LargeRooflineRounding.entry_function()),
-        analysis="roofline",
-    )
-    bound = get_metadata(result.function, RooflineMetadata)
+@case
+class LargeRooflineRounding(FamilyCase):
+    path: Path = ANALYSIS / "large_roofline_rounding.py"
+    name: str | None = "_LargeRooflineRounding"
 
-    assert bound is not None
-    assert bound.compute_ns == 197_014_925_373_451
-    assert bound.ideal_ns == 197_014_925_373_451
+    def guard(self, state, problems):
+        result = analyze(
+            *check_program(state, state.entry_function()),
+            analysis="roofline",
+        )
+        bound = get_metadata(result.function, RooflineMetadata)
+
+        assert bound is not None
+        assert bound.compute_ns == 197_014_925_373_451
+        assert bound.ideal_ns == 197_014_925_373_451
 
 
 _SPLIT_GRID = 128
-_SPLIT_HIDDEN = 2048
-_SPLIT_OUT = 12288
-_SPLIT_PER = _SPLIT_OUT // _SPLIT_GRID
-_SPLIT_BLOCK = 128
 
 
-@module(entry="last_axis", target=_H200, topologies=(Topology("cta", _SPLIT_GRID),))
-class _SplitLastAxis:
-    """The weight's N on the mesh, so the result's last axis is the split one."""
-
-    @func
-    def last_axis(
-        x: Tensor[(1, _SPLIT_BLOCK, _SPLIT_HIDDEN), "bf16"],
-        w: ConstTensor[(_SPLIT_HIDDEN, _SPLIT_OUT), "bf16"],
-    ):
-        with Mesh(("cta",), layout=(_SPLIT_GRID,), names=("unit",)) as mesh:
-            rows = tf.reshard(x[:, :, 0:_SPLIT_BLOCK], (1, _SPLIT_BLOCK, _SPLIT_BLOCK), "smem")
-            strip = tf.reshard(w[0:_SPLIT_BLOCK, :], (_SPLIT_BLOCK, _SPLIT_OUT @ mesh.unit), "smem")
-            return tf.matmul(rows, strip, out_dtype="f32")
-
-
-@module(entry="strip_major", target=_H200, topologies=(Topology("cta", _SPLIT_GRID),))
-class _SplitStripMajor:
-    """The same gemm with the split axis leading, inside the matmul's batch."""
-
-    @func
-    def strip_major(
-        x: Tensor[(1, _SPLIT_BLOCK, _SPLIT_HIDDEN), "bf16"],
-        w: ConstTensor[(_SPLIT_GRID, _SPLIT_HIDDEN, _SPLIT_PER), "bf16"],
-    ):
-        with Mesh(("cta",), layout=(_SPLIT_GRID,), names=("unit",)) as mesh:
-            rows = tf.reshard(x[:, :, 0:_SPLIT_BLOCK], (1, _SPLIT_BLOCK, _SPLIT_BLOCK), "smem")
-            strip = tf.reshard(
-                w[:, 0:_SPLIT_BLOCK, :],
-                (_SPLIT_GRID @ mesh.unit, _SPLIT_BLOCK, _SPLIT_PER),
-                "smem",
-            )
-            return tf.matmul(rows, strip, out_dtype="f32")
-
-
-def test_a_matmul_counts_its_rows_once_whichever_axis_the_mesh_split() -> None:
+def test_matmul_work_ignores_split_axis() -> None:
     """One gemm, two layouts of the weight, one per-unit answer.
 
     Split the result's last axis and the axis sharding adds lands where a batch
@@ -383,6 +296,10 @@ def test_a_matmul_counts_its_rows_once_whichever_axis_the_mesh_split() -> None:
     divides by the grid. Counting the result's elements does not care where the
     axis went, and the two spellings agree on the work and the predicted time.
     """
+    _SplitLastAxis = load_authored_ir(f"{ANALYSIS / 'split_gemm_last_axis.py'}:_SplitLastAxis")
+    _SplitStripMajor = load_authored_ir(
+        f"{ANALYSIS / 'split_gemm_strip_major.py'}:_SplitStripMajor"
+    )
     per_layout = {}
     for owner, name in ((_SplitLastAxis, "last_axis"), (_SplitStripMajor, "strip_major")):
         function = next(item for item in owner.functions if item.name == name)
@@ -407,7 +324,7 @@ def test_a_matmul_counts_its_rows_once_whichever_axis_the_mesh_split() -> None:
     assert per_layout["last_axis"] == per_layout["strip_major"]
 
 
-def test_a_program_whose_peak_exceeds_capacity_reports_an_error() -> None:
+def test_capacity_overflow_reports_error() -> None:
     """A placement error is report data rather than an aborted analysis.
 
     One shared tile of this program is twice what the tight machine states for
@@ -415,6 +332,7 @@ def test_a_program_whose_peak_exceeds_capacity_reports_an_error() -> None:
     buffer, then reports that solved high-water against capacity. Restating
     capacity changes only the error, not the logical lifetimes or placement.
     """
+    _SharedTile = load_authored_ir(f"{ANALYSIS / 'shared_tile.py'}:_SharedTile")
     tight = replace(_SharedTile, target=_TightShared("nvidia.h200_sxm"))
     split = next(function for function in tight.functions if function.name == "split")
     roomy = replace(_SharedTile, target=_RoomyShared("nvidia.h200_sxm"))
@@ -470,13 +388,14 @@ def test_a_program_whose_peak_exceeds_capacity_reports_an_error() -> None:
     ]
 
 
-def test_local_pricing_requires_compute_rates_and_uses_available_memory_rates() -> None:
+def test_local_duration_prices_stated_rates() -> None:
     """Compute holes fail while unstated memory levels remain unpriced.
 
     A compute kind promises work the machine must price, so a missing rate is an
     error. Memory traffic is timed only at levels with a stated bandwidth; the
     independently overlappable levels set a maximum rather than a sum.
     """
+    _PricingBoundary = load_authored_ir(f"{ANALYSIS / 'pricing_boundary.py'}:_PricingBoundary")
     target = _PricingBoundary.resolve_target()
     throughput = target.get_facts(ThroughputFacts)
     services = target.get_facts(PerformanceServiceFacts)
@@ -557,3 +476,11 @@ def test_local_pricing_requires_compute_rates_and_uses_available_memory_rates() 
         local_duration_ns(ComputeCostMetadata(), throughput, priced, moved=crossed, level="cta")
         == 8
     )
+
+
+CASES = special(FamilyCase)
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
+def test_family_case(case: FamilyCase) -> None:
+    check_case(case)

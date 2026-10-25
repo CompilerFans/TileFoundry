@@ -6,15 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.core._source import import_dsl
-from tests.core.parser.test_mesh_visibility import (
-    _diagnostic,
-)
-from tests.nvidia.cuda.fixtures.placed.fused_boundary import FusedBoundary
-from tests.nvidia.cuda.fixtures.placed.region_boundaries import RegionBoundaries
-from tests.nvidia.cuda.fixtures.placed.rmsnorm import RmsnormModule
+from tests.core._corpus import Case, case, check_case, special
 from tilefoundry.analysis.check import check_program
-from tilefoundry.dsl import *
+from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.ir.core import Call, binding_name
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.mesh_region import MeshRegion
@@ -22,25 +16,72 @@ from tilefoundry.ir.visitor import collect_exprs, expr_children
 from tilefoundry.parser import ParseError
 from tilefoundry.visitor_registry.contexts import TypeInferContext
 from tilefoundry.visitor_registry.typeinfer import TypeInferVisitor
-from tilefoundry_nvidia import CudaTarget
+
+PLACED = Path(__file__).parents[1] / "fixtures" / "placed"
 
 
-def test_a_function_mesh_is_an_outer_region_around_its_body() -> None:
-    stage = FusedBoundary.stage
-    assert isinstance(stage.body, MeshRegion)
-    assert [topology.name for topology in stage.body.mesh.topologies] == ["cta"]
-    assert isinstance(stage.body.body, MeshRegion)
-    assert [topology.name for topology in stage.body.body.mesh.topologies] == ["thread"]
+class MeshVisibilityCase(Case):
+    """A program checked by the mesh regions that hold its values."""
 
 
-def test_an_inner_level_layout_is_covered_by_the_whole_running_scope() -> None:
-    body = RmsnormModule.rmsnorm.body
-    assert isinstance(body, MeshRegion)
-    TypeInferVisitor().visit(body, TypeInferContext())
+@case
+class FunctionMeshOuterRegion(MeshVisibilityCase):
+    path: Path = PLACED / "fused_boundary.py"
+    name: str | None = "FusedBoundary"
+
+    def guard(self, state, problems):
+        stage = state.stage
+        assert isinstance(stage.body, MeshRegion)
+        assert [topology.name for topology in stage.body.mesh.topologies] == ["cta"]
+        assert isinstance(stage.body.body, MeshRegion)
+        assert [topology.name for topology in stage.body.body.mesh.topologies] == ["thread"]
 
 
-def test_region_boundaries_capture_external_regions_through_args() -> None:
+@case
+class InnerLayoutCoveredByScope(MeshVisibilityCase):
+    path: Path = PLACED / "rmsnorm.py"
+
+    def guard(self, state, problems):
+        body = state.rmsnorm.body
+        assert isinstance(body, MeshRegion)
+        TypeInferVisitor().visit(body, TypeInferContext())
+
+
+@case
+class SiblingChainCapturesAtBoundary(MeshVisibilityCase):
+    """An accumulator crosses each sibling region through fresh parameters."""
+
+    path: Path = Path(__file__).parents[1] / "fixtures" / "parser" / "sibling_region_chain.py"
+
+    def guard(self, state, problems):
+        entry = state.entry_function()
+        check_program(state, entry)
+        regions = [expr for expr in collect_exprs(entry.body) if isinstance(expr, MeshRegion)]
+        leaves = [region for region in regions if binding_name(region.body) is not None]
+        assert all(
+            not any(isinstance(expr, MeshRegion) for expr in collect_exprs(region.body))
+            for region in leaves
+        )
+        final = next(
+            region for region in leaves if [param.name for param in region.params] == ["acc", "rhs"]
+        )
+        previous = final.args[0]
+        assert isinstance(previous, MeshRegion)
+        assert [param.name for param in previous.params] == ["acc", "lhs"]
+        assert isinstance(previous.args[0], MeshRegion)
+
+
+CASES = special(MeshVisibilityCase)
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
+def test_mesh_visibility_case(case: MeshVisibilityCase) -> None:
+    check_case(case)
+
+
+def test_region_boundary_captures_sibling_value() -> None:
     """A sibling region receives an earlier region value through its boundary."""
+    RegionBoundaries = load_authored_ir(f"{PLACED / 'region_boundaries.py'}:RegionBoundaries")
     body = RegionBoundaries.entry_function().body
     scopes = [expr for expr in collect_exprs(body) if isinstance(expr, MeshRegion)]
     helper_call = next(
@@ -64,66 +105,17 @@ def test_region_boundaries_capture_external_regions_through_args() -> None:
     assert len(parents) == 2
     assert any(isinstance(parent, MeshRegion) and producer in parent.args for parent in parents)
 
-    import_dsl(_diagnostic("region_rebind"), "RegionRebind")
-    import_dsl(_diagnostic("region_tuple_rebind"), "RegionTupleRebind")
+    core_diagnostics = Path(__file__).parents[3] / "core" / "fixtures" / "diagnostics"
+    load_authored_ir(str(core_diagnostics / "region_rebind.py"))
+    load_authored_ir(str(core_diagnostics / "region_tuple_rebind.py"))
 
 
-def test_sibling_region_chain_captures_each_value_at_the_next_boundary() -> None:
-    """An accumulator crosses each sibling region through fresh parameters."""
-
-    @module(
-        entry="run",
-        target=CudaTarget("nvidia.h200_sxm"),
-        topologies=(Topology("cta", 1), Topology("thread", 256)),
-    )
-    class SiblingRegionChain:
-        @func
-        def run(
-            a: Tensor[(64, 32), "bf16"],
-            c: Tensor[(64, 32), "bf16"],
-        ) -> Tensor[(64, 32), "bf16"]:
-            with Mesh(("cta",), (1,), names=("block",)) as _cta:
-                with Mesh(
-                    ("thread",),
-                    (2, 128),
-                    names=("role", "participant"),
-                ) as threads:
-                    with threads[1, :] as _compute:
-                        acc = tf.zeros(Tensor[(64, 32), "bf16"])
-                    with threads[0, :32] as _loader:
-                        lhs = tf.cast(a, dtype="bf16")
-                    with threads[1, :] as _compute:
-                        acc = acc + lhs
-                    with threads[0, :32] as _loader:
-                        rhs = tf.cast(c, dtype="bf16")
-                    with threads[1, :] as _compute:
-                        acc = acc + rhs
-                    return acc
-
-    entry = SiblingRegionChain.entry_function()
-    check_program(SiblingRegionChain, entry)
-    regions = [expr for expr in collect_exprs(entry.body) if isinstance(expr, MeshRegion)]
-    leaves = [region for region in regions if binding_name(region.body) is not None]
-    assert all(
-        not any(isinstance(expr, MeshRegion) for expr in collect_exprs(region.body))
-        for region in leaves
-    )
-    final = next(
-        region for region in leaves if [param.name for param in region.params] == ["acc", "rhs"]
-    )
-    previous = final.args[0]
-    assert isinstance(previous, MeshRegion)
-    assert [param.name for param in previous.params] == ["acc", "lhs"]
-    assert isinstance(previous.args[0], MeshRegion)
-
-
-def test_unscoped_initialization_is_rejected_at_the_authored_call() -> None:
-    source = (
-        Path(__file__).parents[1] / "fixtures" / "diagnostics" / "unscoped_call_loop.py"
-    ).read_text()
+def test_unscoped_init_rejected_at_call() -> None:
+    path = Path(__file__).parents[1] / "fixtures" / "diagnostics" / "unscoped_call_loop.py"
+    source = path.read_text()
     line = next(i for i, text in enumerate(source.splitlines(), 1) if "out = tf.zeros" in text)
     with pytest.raises(ParseError, match="runs outside every mesh scope") as raised:
-        import_dsl(source, "EscapedRebindInLoop")
-    assert f"source.py:{line}:" in str(raised.value)
+        load_authored_ir(str(path))
+    assert f"unscoped_call_loop.py:{line}:" in str(raised.value)
     assert "tf.zeros" in str(raised.value)
     assert "inside with Mesh(...)" in str(raised.value)

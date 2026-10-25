@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 
 import tilefoundry
+from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.codegen.context import EmitContext
 from tilefoundry.codegen.context_builder import build_codegen_context, mangle
 from tilefoundry.codegen.linkable_module import LinkableModule
@@ -20,64 +23,7 @@ from tilefoundry.target import CpuTarget
 from tilefoundry_nvidia import CudaTarget
 from tilefoundry_nvidia.cuda.codegen.abi import launcher_symbol
 
-
-@module(entry="host", target=CudaTarget("nvidia.h200_sxm"))
-class _TwoCopyLaunches:
-    """Two concrete kernels used by the end-to-end multi-launch check."""
-
-    @prim_func(target=CudaTarget("nvidia.h200_sxm"))
-    def first(x: Tensor[(1, 128), "f32"], out: Tensor[(1, 128), "f32"]):
-        with Mesh((Topology("thread", 1),), Layout((1,), (1,))) as thread:
-            view = T.tensor_view(
-                T.ptr_of(x),
-                layout=ShardLayout(
-                    layout=Layout((1, 128), (128, 1)),
-                    attrs=(B(),),
-                    mesh=thread,
-                ),
-            )
-            out_view = T.tensor_view(
-                T.ptr_of(out),
-                layout=ShardLayout(
-                    layout=Layout((1, 128), (128, 1)),
-                    attrs=(B(),),
-                    mesh=thread,
-                ),
-            )
-            T.copy(view, out_view)
-            T.sync(thread)
-
-    @prim_func(target=CudaTarget("nvidia.h200_sxm"))
-    def second(x: Tensor[(1, 128), "f32"], out: Tensor[(1, 128), "f32"]):
-        with Mesh((Topology("thread", 1),), Layout((1,), (1,))) as thread:
-            view = T.tensor_view(
-                T.ptr_of(x),
-                layout=ShardLayout(
-                    layout=Layout((1, 128), (128, 1)),
-                    attrs=(B(),),
-                    mesh=thread,
-                ),
-            )
-            out_view = T.tensor_view(
-                T.ptr_of(out),
-                layout=ShardLayout(
-                    layout=Layout((1, 128), (128, 1)),
-                    attrs=(B(),),
-                    mesh=thread,
-                ),
-            )
-            T.copy(view, out_view)
-            T.sync(thread)
-
-    @prim_func(target=CpuTarget())
-    def host(
-        x0: Tensor[(1, 128), "f32"],
-        out0: Tensor[(1, 128), "f32"],
-        x1: Tensor[(1, 128), "f32"],
-        out1: Tensor[(1, 128), "f32"],
-    ):
-        launch(first, x0, out0, grid=(1, 1, 1), block=(1, 1, 1))  # noqa: F821
-        launch(second, x1, out1, grid=(1, 1, 1), block=(1, 1, 1))  # noqa: F821
+CODEGEN = Path(__file__).parents[1] / "fixtures" / "codegen"
 
 
 def _tensor(name: str, shape=(8,)) -> Var:
@@ -133,7 +79,7 @@ def _source(devices, launches, params) -> str:
     return host.target.resolve(LinkableModule, mod, (host,), host.target.resolve(EmitContext, view)).source
 
 
-def test_two_launches_keep_order_and_each_block_size() -> None:
+def test_launches_keep_order_and_blocks() -> None:
     a, b = _tensor("a"), _tensor("b")
     first, second = _device("first"), _device("second")
     source = _source(
@@ -150,8 +96,9 @@ def test_two_launches_keep_order_and_each_block_size() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_two_launches_compile_and_write_both_outputs() -> None:
+def test_two_launches_write_outputs() -> None:
     """Both compiled objects retain their callable and library after registration override."""
+    _TwoCopyLaunches = load_authored_ir(f"{CODEGEN / 'two_copy_launches.py'}:_TwoCopyLaunches")
     torch.manual_seed(0)
     x0 = torch.randn(1, 128, device="cuda")
     x1 = torch.randn(1, 128, device="cuda")
@@ -170,21 +117,21 @@ def test_two_launches_compile_and_write_both_outputs() -> None:
         torch.testing.assert_close(out1, x1, rtol=0, atol=0)
 
 
-def test_same_entry_parameter_may_feed_two_launches() -> None:
+def test_entry_parameter_feeds_two_launches() -> None:
     a = _tensor("a")
     first, second = _device("first"), _device("second")
     source = _source((first, second), (_launch(first, a), _launch(second, a)), (a,))
     assert source.count("a.data_ptr()") == 2
 
 
-def test_a_launch_arg_the_entry_does_not_declare_is_rejected() -> None:
+def test_undeclared_launch_arg_rejected() -> None:
     device = _device("device")
     outside = _tensor("outside")
     with pytest.raises(ValueError, match="is not a parameter of entry"):
         _source((device,), (_launch(device, outside),), (_tensor("a"),))
 
 
-def test_same_device_function_can_be_launched_twice() -> None:
+def test_device_function_launches_twice() -> None:
     a = _tensor("a")
     device = _device("device")
     source = _source((device,), (_launch(device, a, block=32), _launch(device, a, block=64)), (a,))
@@ -194,7 +141,7 @@ def test_same_device_function_can_be_launched_twice() -> None:
     assert source.count(f"{symbol}(a.data_ptr()") == 2
 
 
-def test_a_parameter_named_like_an_extent_is_still_a_parameter() -> None:
+def test_extent_like_name_stays_parameter() -> None:
     """An open axis is stated by the type, so no name is reserved for one."""
     a, looks_hidden = _tensor("a"), _tensor("a_shape_0")
     device = PrimFunction(

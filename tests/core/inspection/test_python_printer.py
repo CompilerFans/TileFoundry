@@ -1,16 +1,18 @@
 """Binding metadata and unmaterialized types in printed programs."""
 
-from tests.core._source import import_dsl
+from tests.core._corpus import reload
 from tilefoundry.dsl import *
 from tilefoundry.inspection import as_script
 from tilefoundry.inspection.analysis_report import _type_text
 from tilefoundry.ir.core import BindingMetadata, Call, Var
 from tilefoundry.ir.core.kinds import BinaryKind
+from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.math.binary import Binary
+from tilefoundry.target import CpuTarget
 
 
-def test_binding_metadata_names_the_emitted_binding():
+def test_binding_metadata_names_binding():
     tensor_type = TensorType.scalar(DType.f32)
     source = Var(name="source", type=tensor_type)
     result = Call(
@@ -51,13 +53,20 @@ def test_binding_metadata_names_the_emitted_binding():
     reserved_function = Function.build(
         name="reserved_name", params=(source,), body=named_later, return_type=tensor_type,
     )
-    reserved = as_script(reserved_function)
+    reserved = as_script(
+        Module(
+            name="Reserved",
+            functions=(reserved_function,),
+            entry="reserved_name",
+            target=CpuTarget(),
+        )
+    )
     assert "v0_2 = tf.add(source, source)" in reserved
     assert "v0 = tf.add(v0_2, source)" in reserved
-    assert as_script(import_dsl(reserved)) == reserved
+    assert as_script(reload(reserved, "Reserved")) == reserved
 
 
-def test_umat_type_is_printed_and_round_trips() -> None:
+def test_umat_type_round_trips() -> None:
     tensor_type = TensorType.scalar(DType.i64, storage=StorageKind.UMAT)
     source = Var(name="source", type=tensor_type)
     function = Function.build(
@@ -67,10 +76,12 @@ def test_umat_type_is_printed_and_round_trips() -> None:
         return_type=tensor_type,
     )
 
-    rendered = as_script(function)
+    rendered = as_script(
+        Module(name="Umat", functions=(function,), entry="umat_annotation", target=CpuTarget())
+    )
 
     assert 'Tensor[(), "i64", "umat"]' in rendered
-    rebuilt = import_dsl(rendered)
+    rebuilt = reload(rendered, "Umat").entry_function()
     assert rebuilt.params[0].type == tensor_type
     assert rebuilt.return_type == tensor_type
 

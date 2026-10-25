@@ -11,10 +11,12 @@ Function carrying it.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from tests.core._source import import_dsl
-from tests.nvidia.cuda.fixtures.logical import module_context as context_fixture
+from tests.core._corpus import Case, case, check_case, special
+from tilefoundry.cli.source import load_authored_ir, load_namespace
 from tilefoundry.dsl import *
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
@@ -22,14 +24,22 @@ from tilefoundry.ir.module_utils import list_call_paths
 from tilefoundry.target import CpuTarget
 from tilefoundry_nvidia import CudaTarget
 
-_CTA = context_fixture.CONTEXT_CTA
-_WARP = context_fixture.CONTEXT_WARP
-_THREAD = context_fixture.CONTEXT_THREAD
-_Root = context_fixture.ContextTree
+FIXTURES = Path(__file__).parents[1] / "fixtures"
+MODULE_CONTEXT = FIXTURES / "logical" / "module_context.py"
 
 
-def test_a_target_declaration_defines_its_own_execution_domain() -> None:
+def _context():
+    """The tree and the topologies it declares, from one run of the fixture."""
+    namespace = load_namespace(str(MODULE_CONTEXT))[0]
+    return tuple(
+        namespace[name]
+        for name in ("ContextTree", "CONTEXT_CTA", "CONTEXT_WARP", "CONTEXT_THREAD")
+    )
+
+
+def test_target_declaration_defines_domain() -> None:
     """A child's target can differ; an undeclared standalone root has no target."""
+    _Root, *_ = _context()
     target = _Root.resolve_target()
     assert target == CudaTarget("nvidia.h200_sxm")
     assert all(frame.target is target for frame in list_call_paths(_Root).values())
@@ -43,7 +53,7 @@ def test_a_target_declaration_defines_its_own_execution_domain() -> None:
         Module("bare", (forward,), "forward").resolve_target()
 
 
-def test_a_topology_tuple_is_undeclared_empty_or_a_whole_replacement() -> None:
+def test_topology_tuple_inherits_or_replaces() -> None:
     """The three declaration forms are three different domains.
 
     The three declaration forms are three different domains: omitting the
@@ -51,6 +61,7 @@ def test_a_topology_tuple_is_undeclared_empty_or_a_whole_replacement() -> None:
     topology-free domain (it does not fall back to the owner), and an explicit
     tuple replaces the inherited hierarchy whole rather than extending it.
     """
+    _Root, _CTA, _WARP, _THREAD = _context()
     assert _Root.inherits.topologies is None
     inherits = _Root.inherits
     frame = next(frame for frame in list_call_paths(_Root).values() if frame.module is inherits)
@@ -70,22 +81,26 @@ def test_a_topology_tuple_is_undeclared_empty_or_a_whole_replacement() -> None:
         replaces.resolve_topology("cta")
 
 
-@pytest.mark.parametrize("invalid", [[_CTA], (_CTA, object())])
-def test_module_rejects_a_non_topology_tuple(invalid) -> None:
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        pytest.param("dsl_module_topologies_list.py", id="invalid0"),
+        pytest.param("dsl_module_topologies_non_topology.py", id="invalid1"),
+    ],
+)
+def test_module_rejects_non_topology_tuple(invalid) -> None:
     with pytest.raises(TypeError, match="topologies must be a tuple of Topology"):
-
-        @module(topologies=invalid)
-        class Invalid:
-            pass
+        load_authored_ir(str(FIXTURES / "diagnostics" / invalid))
 
 
-def test_topology_resolution_failures_name_what_the_domain_holds() -> None:
+def test_topology_resolution_names_levels() -> None:
     """An unresolved level lists the levels in scope.
 
     An unresolved level lists the levels in scope, and a repeated level is
     rejected at construction -- a duplicate name would make lexical resolution
     answer with whichever declaration happened to come first.
     """
+    _Root, _CTA, _, _ = _context()
     with pytest.raises(ValueError, match="effective topology levels are cta, warp"):
         _Root.resolve_topology("block")
 
@@ -98,25 +113,16 @@ def test_topology_resolution_failures_name_what_the_domain_holds() -> None:
         )
 
 
-def test_declaring_context_on_a_function_yields_its_own_module() -> None:
+def test_function_context_yields_module() -> None:
     """A Function never carries execution context of its own.
 
     A Function never carries execution context of its own: ``@func`` with a
     Target or a topology declaration (including an explicit empty one) yields the
     Module that owns it, and a plain ``@func`` stays a Function.
     """
-
-    @func(target=CudaTarget("nvidia.h200_sxm"), topologies=(_CTA,))
-    def standalone(x: Tensor[(4,), "f32"]) -> Tensor[(4,), "f32"]:
-        return tf.relu(x)
-
-    @func(topologies=())
-    def empty(x: Tensor[(4,), "f32"]) -> Tensor[(4,), "f32"]:
-        return tf.relu(x)
-
-    @func
-    def plain(x: Tensor[(4,), "f32"]) -> Tensor[(4,), "f32"]:
-        return tf.relu(x)
+    _, _CTA, _, _ = _context()
+    namespace = load_namespace(str(FIXTURES / "dsl" / "function_context.py"))[0]
+    standalone, empty, plain = (namespace[name] for name in ("standalone", "empty", "plain"))
 
     assert isinstance(standalone, Module) and isinstance(empty, Module)
     assert (standalone.name, standalone.entry) == ("standalone", "standalone")
@@ -127,34 +133,26 @@ def test_declaring_context_on_a_function_yields_its_own_module() -> None:
     assert not hasattr(plain, "target") and not hasattr(plain, "topologies")
 
 
-_MEMBER_CONTEXT_SOURCE = """
-import tilefoundry
-from tilefoundry.dsl import Mesh, Tensor, tf
-from tilefoundry.ir.types import Topology
-from tilefoundry_nvidia import CudaTarget
-
-@tilefoundry.module(
-    entry="attention",
-    target=CudaTarget("nvidia.h200_sxm"),
-    topologies=(Topology("cta", 2),),
-)
-class Layer:
-    @tilefoundry.func
-    def attention(x: Tensor[(4,), "f32"]) -> Tensor[(4,), "f32"]:
-        with Mesh(("cta",), (2,), ("block",)) as _cta:
-            return tf.relu(x)
-
-    @tilefoundry.func(topologies=(Topology("thread", 4),))
-    def softmax(x: Tensor[(4,), "f32"]) -> Tensor[(4,), "f32"]:
-        with Mesh(("thread",), (4,), ("lane",)) as _thread:
-            return tf.square(x)
-"""
+class ModuleContextCase(Case):
+    """A program whose Modules declare the execution context their functions run in."""
 
 
-def test_member_context_builds_its_own_runtime_domain() -> None:
-    imported = import_dsl(_MEMBER_CONTEXT_SOURCE, "Layer")
+@case
+class MemberContext(ModuleContextCase):
+    """A member context builds its own runtime domain."""
 
-    assert [function.name for function in imported.functions] == ["attention"]
-    assert list(imported.children) == ["softmax"]
-    assert imported.children["softmax"].elements[0].topologies == (Topology("thread", 4),)
-    assert list_call_paths(imported)["softmax.softmax"].target == CudaTarget("nvidia.h200_sxm")
+    path: Path = Path(__file__).parents[1] / "fixtures/logical/member_context.py"
+
+    def guard(self, state, problems):
+        assert [function.name for function in state.functions] == ["attention"]
+        assert list(state.children) == ["softmax"]
+        assert state.children["softmax"].elements[0].topologies == (Topology("thread", 4),)
+        assert list_call_paths(state)["softmax.softmax"].target == CudaTarget("nvidia.h200_sxm")
+
+
+CASES = special(ModuleContextCase)
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
+def test_module_context_case(case: ModuleContextCase) -> None:
+    check_case(case)

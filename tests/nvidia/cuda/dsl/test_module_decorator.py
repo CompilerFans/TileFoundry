@@ -11,14 +11,13 @@ targeting the sibling); forward references stay unresolved and fail loudly.
 
 from __future__ import annotations
 
-import ast
 import dataclasses
 from pathlib import Path
 
 import pytest
 
-from tests.core._source import import_dsl
-from tests.nvidia.cuda.fixtures.shapes import scaled_modules
+from tests.core._corpus import Case, case, check_case, reload, special
+from tilefoundry.cli.source import load_authored_ir, load_namespace
 from tilefoundry.dsl import *
 from tilefoundry.inspection import as_script
 from tilefoundry.ir.core import Call
@@ -32,8 +31,10 @@ from tilefoundry.ir.visitor import collect_exprs
 from tilefoundry.target import CpuTarget
 from tilefoundry_nvidia import CudaTarget
 
+DSL = Path(__file__).parents[1] / "fixtures" / "dsl"
 
-def test_a_held_child_takes_its_own_owners_target_types():
+
+def test_held_child_takes_owner_target():
     """A root types its own calls of a child under its Target; the child keeps its body.
 
     The children declare no Target, so their matmuls and loop accumulators,
@@ -43,13 +44,8 @@ def test_a_held_child_takes_its_own_owners_target_types():
     Target and the call's storage, and a call the Target refuses fails where the
     root makes it, leaving the child's types as they were.
     """
-    from tests.core._source import import_dsl  # noqa: PLC0415
-    from tests.nvidia.cuda.fixtures.placed.child_matmul_target import (  # noqa: PLC0415
-        K_LEN,
-        K,
-        M,
-        N,
-    )
+    namespace = load_namespace(str(DSL / "child_matmul_cpu_root.py"))[0]
+    K, M, N = (namespace[name] for name in ("K", "M", "N"))
 
     def storages(owner):
         found = []
@@ -81,17 +77,7 @@ def test_a_held_child_takes_its_own_owners_target_types():
         (function,) = (function for function in owner.functions if function.name == name)
         return function.body.type.storage
 
-    authored = ast.parse(Path(__file__).parents[1].joinpath(
-        "fixtures/placed/child_matmul_target.py"
-    ).read_text())
-    for definition in authored.body:
-        if isinstance(definition, ast.ClassDef) and definition.name in {
-            "ChildMatmul", "ChildMatmulDirect", "ChildMatmulStaged"
-        }:
-            for decorator in definition.decorator_list:
-                if isinstance(decorator, ast.Call):
-                    decorator.keywords = [kw for kw in decorator.keywords if kw.arg != "target"]
-    cuda_root = import_dsl(ast.unparse(authored), "ChildMatmulRoot")
+    cuda_root = namespace["ChildMatmulRoot"]
     held = tuple(slot.elements[0] for slot in cuda_root.children.values())
     for child in held:
         assert child.target is None
@@ -100,22 +86,7 @@ def test_a_held_child_takes_its_own_owners_target_types():
     assert call_storage(cuda_root, "gemm_on_chip") is StorageKind.RMEM
     before = [stored_types(child) for child in held]
 
-    @module(entry="gemm", target=CpuTarget(), topologies=(Topology("cta", 1),))
-    class _CpuRoot:
-        child, direct, staged = held
-
-        @func
-        def gemm(a: Tensor[(M, K), "bf16"], b: Tensor[(K, N), "bf16"]):
-            return child(a, b)  # noqa: F821 -- class-body binding
-
-        @func
-        def gemm_on_chip(a: Tensor[(M, K), "bf16"], b: Tensor[(K, N), "bf16"]):
-            return direct(a, b)  # noqa: F821 -- class-body binding
-
-        @func
-        def gemm_staged(a: Tensor[(M, K_LEN), "bf16"], b: Tensor[(K_LEN, N), "bf16"]):
-            return staged(a, b)  # noqa: F821 -- class-body binding
-
+    _CpuRoot = namespace["ChildMatmulCpuRoot"]
     children = tuple(slot.elements[0] for slot in _CpuRoot.children.values())
     for child, original, types in zip(children, held, before, strict=True):
         assert child is original and child.target is None
@@ -131,7 +102,7 @@ def test_a_held_child_takes_its_own_owners_target_types():
     ]
     assert all(any(target is slot for target in callees) for slot in _CpuRoot.children.values())
 
-    imported = import_dsl(as_script(cuda_root), "ChildMatmulRoot")
+    imported = reload(as_script(cuda_root), "ChildMatmulRoot")
     for slot in imported.children.values():
         child = slot.elements[0]
         assert child.target is None
@@ -139,22 +110,7 @@ def test_a_held_child_takes_its_own_owners_target_types():
     assert list_call_paths(imported)["direct.direct"].target == cuda_root.target
     assert call_storage(imported, "gemm_on_chip") is StorageKind.RMEM
 
-    @module(entry="run", topologies=(Topology("cta", 1),))
-    class _Refused:
-        @func
-        def run(a: Tensor[(M, K), "f32"], b: Tensor[(K, N), "f32"]):
-            with Mesh(("cta",), layout=(1,), names=("g",)) as _cta:
-                acc = tf.matmul(
-                    tf.reshard(a[:, 0:16], (M, 16), "smem"),
-                    tf.reshard(b[0:16, :], (16, N), "smem"),
-                )
-                for k in tf.tile(16, K, 16):  # noqa: F405 -- authored tile loop
-                    acc = acc + tf.matmul(
-                        tf.reshard(a[:, k], (M, 16), "smem"),
-                        tf.reshard(b[k, :], (16, N), "smem"),
-                    )
-                return tf.reshard(acc, (M, N), "gmem")
-
+    _Refused = load_authored_ir(str(DSL / "refused_child_matmul.py"))
     parsed = stored_types(_Refused)
     refused = _Refused
     with pytest.raises(VerifyError, match="no nvidia.h200_sxm MMA reads lhs f32 smem"):
@@ -175,7 +131,12 @@ def test_a_held_child_takes_its_own_owners_target_types():
     assert all(expr.type is stored for expr, stored in parsed)
 
 
-def test_prim_func_host_resolves_sibling_device_in_class_body():
+class ModuleDecoratorCase(Case):
+    """A program whose ``@module`` class body the decorator collected into a Module."""
+
+
+@case
+class PrimFuncSiblingLaunch(ModuleDecoratorCase):
     """Test prim func host resolves sibling device in class body.
 
     A ``@prim_func`` cpu host can ``launch`` a sibling cuda device kernel
@@ -183,65 +144,56 @@ def test_prim_func_host_resolves_sibling_device_in_class_body():
     resolution works for prim_func, not only @func.
     """
 
-    @module(entry="host")
-    class _Launch:
-        @prim_func(target=CudaTarget("nvidia.h200_sxm"))
-        def dev(a: Tensor[(8,), "f32"]):  # noqa: ARG001
-            with Mesh((Topology("thread", 8),), Layout(shape=(8,), strides=(1,))) as m:
-                T.sync(m)
+    path: Path = DSL / "prim_func_sibling_launch.py"
 
-        @prim_func
-        def host(a: Tensor[(8,), "f32"]):
-            launch(dev, a, grid=(1, 1, 1), block=(8, 1, 1))  # noqa: F821
-
-    assert isinstance(_Launch, Module)
-    assert [fn.name for fn in _Launch.functions] == ["dev", "host"]
-    assert _Launch.entry == "host"
-    assert _Launch.lookup("host").target == CpuTarget()
+    def guard(self, state, problems):
+        assert isinstance(state, Module)
+        assert [fn.name for fn in state.functions] == ["dev", "host"]
+        assert state.entry == "host"
+        assert state.lookup("host").target == CpuTarget()
 
 
 @pytest.mark.parametrize(
-    "declarations,body,refused",
+    ("fixture", "refused"),
     [
-        ("layers = [ScaledChild]", "return x", "use ModuleList"),
-        ("layers = (ScaledChild,)", "return x", "use ModuleList"),
-        ("layers = ModuleList(ScaledChild, 0)", "return x", "positive integer"),
-        ("layers = ModuleList(ScaledChild, 1.5)", "return x", "positive integer"),
-        ("layers = ModuleList(())", "return x", "non-empty tuple"),
-        ("layers = ModuleList((ScaledChild, 1))", "return x", "requires Modules"),
-        ("layers = ModuleList(ScaledChild, 3)\n    other = layers", "return x", "layers.*other"),
-        ("layers = ModuleList(ScaledChild, 3)", "return layers[3](x)", "layers.*N=3"),
-        ("layers = ModuleList(ScaledChild, 3)", "return layers[-1](x)", "layers.*N=3"),
-        ("layers = ModuleList(ScaledChild, 3)", "return layers[0.5](x)", "integer scalar"),
-        ("layers = ScaledChild", "return layers[0](x)", "single slot.*cannot be indexed"),
-        ("layers = ModuleList(ScaledChild, 3)", "return layers(x)", "must be indexed"),
-        ("layers = ModuleList((ScaledChild, NestedScaledMiddle))", "return layers[i](x)", "same definition"),
-        ("layers = ModuleList(ScaledChild, 3)", "return layers[0].run(x)", "only calling an instance entry"),
-        ("layers = ScaledChild", "return layers(x, x)", "arity mismatch.*1 activation.*passed 2"),
-        ("helper = ScaledChild.run", "return helper(x)", "arity mismatch.*2 parameter.*passed 1"),
-        ("layers = replace(ScaledChild, entry=None)", "return layers(x)", "declares no entry"),
-        ("", "return ScaledChild(x)", "instance calls must use a slot name"),
+        ("list_slot", "use ModuleList"),
+        ("tuple_slot", "use ModuleList"),
+        ("zero_count", "positive integer"),
+        ("fractional_count", "positive integer"),
+        ("empty_tuple", "non-empty tuple"),
+        ("non_module", "requires Modules"),
+        ("aliased_slot", "layers.*other"),
+        ("large_index", "layers.*N=3"),
+        ("negative_index", "layers.*N=3"),
+        ("fractional_index", "integer scalar"),
+        ("indexed_single_slot", "single slot.*cannot be indexed"),
+        ("unindexed_list", "must be indexed"),
+        ("mixed_definitions", "same definition"),
+        ("non_entry_call", "only calling an instance entry"),
+        ("extra_activation", "arity mismatch.*1 activation.*passed 2"),
+        ("missing_weight", "arity mismatch.*2 parameter.*passed 1"),
+        ("missing_entry", "declares no entry"),
+        ("unbound_slot", "instance calls must use a slot name"),
     ],
 )
-def test_module_rejects_invalid_instance_declarations_and_calls(declarations, body, refused):
-    source = f'''from dataclasses import replace
-from tilefoundry.dsl import *
-from tests.nvidia.cuda.fixtures.shapes.scaled_modules import ScaledChild, NestedScaledMiddle
-
-@module(entry="main")
-class Invalid:
-    {declarations}
-
-    @func
-    def main(x: Tensor[(4,), "f32"], i: Tensor[(), "i32"]):
-        {body}
-'''
+def test_module_rejects_invalid_instances(fixture, refused):
+    source = Path(__file__).parents[1] / f"fixtures/diagnostics/parser_module_instance_{fixture}.py"
     with pytest.raises((TypeError, ValueError, VerifyError), match=refused):
-        import_dsl(source, "Invalid")
+        load_authored_ir(str(source))
 
 
-def test_an_unused_module_without_entry_can_occupy_a_slot_and_be_replaced():
-    slot = ModuleList(dataclasses.replace(scaled_modules.ScaledChild, entry=None))
+def test_entryless_module_occupies_slot():
+    scaled_modules = Path(__file__).parents[1] / "fixtures/shapes/scaled_modules.py"
+    ScaledChild = load_authored_ir(f"{scaled_modules}:ScaledChild")
+    slot = ModuleList(dataclasses.replace(ScaledChild, entry=None))
     root = Module("Container", (), None, children={"unused": slot})
     assert dataclasses.replace(root).children["unused"] is slot
     assert slot.elements[0].entry is None
+
+
+CASES = special(ModuleDecoratorCase)
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
+def test_module_decorator_case(case: ModuleDecoratorCase) -> None:
+    check_case(case)

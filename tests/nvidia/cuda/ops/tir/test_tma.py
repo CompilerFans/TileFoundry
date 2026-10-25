@@ -5,21 +5,23 @@ See [tir §2.3](docs/spec/tir.md#23-tir-ops).
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 
 import tilefoundry
 import tilefoundry_nvidia.cuda.codegen  # noqa: F401 -- trigger emitter autodiscovery
+from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.dsl import *
 from tilefoundry.ir.core import Var, VerifyError
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Evaluate, MeshScope, Return, Sequential
-from tilefoundry.ir.types.shard_layout import Broadcast
-from tilefoundry.target import CpuTarget
 from tilefoundry.visitor_registry.verify import verify_prim_function
 from tilefoundry_nvidia import CudaTarget
 from tilefoundry_nvidia.cuda.ir.tir.memory.copy_async_bulk import CopyAsyncBulk
 
+OPS = Path(__file__).parents[2] / "fixtures" / "ops"
 _BAR = make_tensor_type((1,), DType.from_name("i64"), storage="smem")
 
 
@@ -47,12 +49,12 @@ def _ty(n, dtype=DType.from_name("f32"), storage="gmem"):
     return make_tensor_type((n,), dtype, storage=storage)
 
 
-def test_accepts_a_whole_grain_gmem_to_smem_run() -> None:
+def test_tma_accepts_gmem_to_smem() -> None:
     """The shape this op is built for: a gmem run into a shared tile."""
     verify_prim_function(_pf(_ty(8), _ty(8, storage="smem")))
 
 
-def test_refuses_the_wrong_direction() -> None:
+def test_tma_refuses_wrong_direction() -> None:
     """Only gmem into smem is this instruction."""
     with pytest.raises(VerifyError, match="src: smem does not match gmem"):
         verify_prim_function(_pf(_ty(8, storage="smem"), _ty(8, storage="smem")))
@@ -60,7 +62,7 @@ def test_refuses_the_wrong_direction() -> None:
         verify_prim_function(_pf(_ty(8), _ty(8, storage="gmem")))
 
 
-def test_refuses_a_barrier_outside_shared_memory() -> None:
+def test_tma_refuses_gmem_barrier() -> None:
     with pytest.raises(VerifyError, match="barrier: gmem does not match smem"):
         verify_prim_function(
             _pf(
@@ -71,13 +73,13 @@ def test_refuses_a_barrier_outside_shared_memory() -> None:
         )
 
 
-def test_refuses_a_dtype_change() -> None:
+def test_tma_refuses_dtype_change() -> None:
     """A staging copy moves bytes; it does not convert them."""
     with pytest.raises(VerifyError, match="reads src.dtype = dst.dtype"):
         verify_prim_function(_pf(_ty(8), _ty(8, DType.from_name("bf16"), storage="smem")))
 
 
-def test_refuses_a_shape_change() -> None:
+def test_tma_refuses_shape_change() -> None:
     with pytest.raises(VerifyError, match="reads src.shape = dst.shape"):
         verify_prim_function(_pf(_ty(8), _ty(4, storage="smem")))
 
@@ -86,7 +88,7 @@ def test_refuses_a_shape_change() -> None:
     ("n", "dtype"),
     [(5, DType.from_name("f32")), (1, DType.from_name("f32")), (7, DType.from_name("bf16"))],
 )
-def test_admits_a_transfer_off_the_sixteen_byte_grain(n, dtype) -> None:
+def test_tma_admits_off_grain_transfer(n, dtype) -> None:
     """The grain belongs to one instruction, and the op does not name one.
 
     See [runtime §2.6](targets/nvidia/tilefoundry_nvidia/cuda/docs/spec/runtime.md#26-cudaops).
@@ -94,93 +96,10 @@ def test_admits_a_transfer_off_the_sixteen_byte_grain(n, dtype) -> None:
     verify_prim_function(_pf(_ty(n, dtype), _ty(n, dtype, storage="smem")))
 
 
-@module(
-    entry="tma_tiers_host",
-    target=CudaTarget("nvidia.h200_sxm"),
-    topologies=(Topology("thread", 128),),
-)
-class TmaTiers:
-    """Both staging tiers in one device function, one operand pair each."""
-
-    @prim_func(target=CudaTarget("nvidia.h200_sxm"))
-    def tma_tiers_device(
-        bulk_a: Tensor[(256,), "f32"],
-        bulk_b: Tensor[(256,), "f32"],
-        odd_a: Tensor[(5,), "f32"],
-        odd_b: Tensor[(5,), "f32"],
-    ):
-        with Mesh((Topology("thread", 128),), Layout(shape=(128,), strides=(1,)), ("t",)) as m:
-            bulk_view = T.tensor_view(
-                T.ptr_of(bulk_a),
-                layout=ShardLayout(
-                    layout=Layout(shape=(256,), strides=(1,)), attrs=(Broadcast(),), mesh=m
-                ),
-            )
-            bulk_stage = T.alloc_tensor(
-                Tensor[
-                    (256,),
-                    "f32",
-                    ShardLayout(
-                        layout=Layout(shape=(256,), strides=(1,)),
-                        attrs=(Broadcast(),),
-                        mesh=m,
-                    ),
-                    "smem",
-                ]
-            )
-            bulk_bar = T.alloc_tensor(Tensor[(1,), "i64", None, "smem"])
-            T.mbarrier_init(bulk_bar, arrive_count=1)
-            T.sync(m)
-            T.copy_async_bulk(bulk_view, bulk_stage, bulk_bar)
-            T.mbarrier_wait_parity(bulk_bar, 0)
-            T.copy(bulk_stage, bulk_b)
-        with Mesh((Topology("thread", 128),), Layout(shape=(128,), strides=(1,)), ("t",)) as mo:
-            odd_view = T.tensor_view(
-                T.ptr_of(odd_a),
-                layout=ShardLayout(
-                    layout=Layout(shape=(5,), strides=(1,)), attrs=(Broadcast(),), mesh=mo
-                ),
-            )
-            odd_stage = T.alloc_tensor(
-                Tensor[
-                    (5,),
-                    "f32",
-                    ShardLayout(
-                        layout=Layout(shape=(5,), strides=(1,)),
-                        attrs=(Broadcast(),),
-                        mesh=mo,
-                    ),
-                    "smem",
-                ]
-            )
-            odd_bar = T.alloc_tensor(Tensor[(1,), "i64", None, "smem"])
-            T.mbarrier_init(odd_bar, arrive_count=1)
-            T.sync(mo)
-            T.copy_async_bulk(odd_view, odd_stage, odd_bar)
-            T.mbarrier_wait_parity(odd_bar, 0)
-            T.copy(odd_stage, odd_b)
-
-    @prim_func(target=CpuTarget())
-    def tma_tiers_host(
-        bulk_a: Tensor[(256,), "f32"],
-        bulk_b: Tensor[(256,), "f32"],
-        odd_a: Tensor[(5,), "f32"],
-        odd_b: Tensor[(5,), "f32"],
-    ):
-        launch(  # noqa: F821
-            tma_tiers_device,  # noqa: F821
-            bulk_a,
-            bulk_b,
-            odd_a,
-            odd_b,
-            grid=(1, 1, 1),
-            block=(128, 1, 1),
-        )
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_both_tiers_stage_the_input_unchanged() -> None:
+def test_tma_tiers_stage_input_unchanged() -> None:
     """One compile behind two assertions, each naming the tier that failed."""
+    TmaTiers = load_authored_ir(f"{OPS / 'tma_tiers.py'}:TmaTiers")
     rm = tilefoundry.compile(TmaTiers, target=CudaTarget("nvidia.h200_sxm"))
     torch.manual_seed(0)
     bulk_a = torch.randn(256, dtype=torch.float32, device="cuda")

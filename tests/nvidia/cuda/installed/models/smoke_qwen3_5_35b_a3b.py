@@ -17,24 +17,6 @@ from tests.nvidia.cuda.models.qwen3_5_35b_a3b import reference
 MODEL = "qwen3_5_35b_a3b"
 CASES = contract.model_cases(MODEL)
 
-ANALYSED = [
-    pytest.param(case, selected, id=selected.id) for case in CASES for selected in case.analyze
-]
-SIZED = [pytest.param(case, sized, id=sized.id) for case in CASES for sized in case.sized]
-
-
-@pytest.mark.parametrize(("case", "selected"), ANALYSED)
-def test_every_selected_function_analyses(tf, shipped_source, case, selected) -> None:
-    contract.analysed_every_family(
-        tf, shipped_source(MODEL), case, selected.selector, selected.dims
-    )
-
-
-@pytest.mark.parametrize(("case", "sized"), SIZED)
-def test_every_analysis_answers_at_the_largest_context(tf, shipped_source, case, sized) -> None:
-    """At the ceiling the case states, not at a sample of it."""
-    contract.analysed_every_family(tf, shipped_source(MODEL), case, sized.selector, sized.ceiling)
-
 
 CTX_LENGTHS = (25, 40)
 
@@ -116,8 +98,8 @@ def test_linear_attention_matches_hugging_face(tf, shipped_source, comparison_ca
 MOE = next(case for case in CASES if case.id.endswith("_moe"))
 
 
-def test_the_moe_block_matches_hugging_face(tf, shipped_source, comparison_cache) -> None:
-    """Test the moe block matches hugging face.
+def test_moe_block_matches_hugging_face(tf, shipped_source, comparison_cache) -> None:
+    """The MoE block matches Hugging Face's own.
 
     The whole block -- post_attention_layernorm plus `Qwen3_5MoeSparseMoeBlock`,
     routed experts and the shared expert together -- against Hugging Face's own.
@@ -171,7 +153,7 @@ ZEROED = ["recurrent_state", "conv_state"]
 
 
 @pytest.mark.parametrize("zeroed", ZEROED)
-def test_each_half_of_the_state_reaches_the_answer(tf, shipped_source, comparison_cache, zeroed) -> None:
+def test_zeroed_state_half_changes_answer(tf, shipped_source, comparison_cache, zeroed) -> None:
     step = reference.linear_step(device="cpu")
     loaded = reference.load_mixer("linear_attention", step.layer)
     held = {"conv_state": step.conv_state, "recurrent_state": step.recurrent_state}
@@ -187,7 +169,7 @@ def test_each_half_of_the_state_reaches_the_answer(tf, shipped_source, compariso
     )
 
 
-def test_the_output_gate_is_applied(tf, shipped_source, comparison_cache) -> None:
+def test_output_gate_applied(tf, shipped_source, comparison_cache) -> None:
     """Half of `q_proj`'s fan-out never reaches a score.
 
     Half of `q_proj`'s fan-out never reaches a score, and this measures that it
@@ -230,3 +212,6 @@ def test_the_output_gate_is_applied(tf, shipped_source, comparison_cache) -> Non
         ),
         dims={"ctx_len": step.ctx_len},
     )
+
+
+test_model_analysis, test_model_ceiling = contract.analysis_tests(MODEL)

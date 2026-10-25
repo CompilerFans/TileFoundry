@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import torch
 from safetensors.torch import save_file
@@ -25,25 +26,12 @@ _ARGS = (
 )
 
 
-def test_check_reports_grid_loop_parser_errors_from_the_installed_wheel(
-    tf, tmp_path
-) -> None:
-    for name, loop, message in (
-        ("single", "tf.tile(8)", "tf.tile(extent) is not supported; use range(extent)"),
-        ("keyword", "tf.tile(8, step=2)", "positional-only at the IR level"),
+def test_check_reports_grid_loop_errors(tf) -> None:
+    for name, message in (
+        ("single", "tf.tile(extent) is not supported; use range(extent)"),
+        ("keyword", "positional-only at the IR level"),
     ):
-        source = tmp_path / f"{name}.py"
-        source.write_text(
-            "from tilefoundry import module\n"
-            "from tilefoundry.dsl import Tensor, func, tf\n\n"
-            '@module(entry="main")\n'
-            "class Bad:\n"
-            "    @func\n"
-            '    def main(x: Tensor[(8,), "f32"]):\n'
-            f"        for i in {loop}:\n"
-            "            y = tf.relu(x)\n",
-            encoding="utf-8",
-        )
+        source = Path(__file__).parents[1] / f"fixtures/diagnostics/parser_tile_{name}.py"
 
         done = tf("check", f"{source}:Bad", *_ARGS)
 
@@ -51,7 +39,7 @@ def test_check_reports_grid_loop_parser_errors_from_the_installed_wheel(
         assert message in done.stderr
 
 
-def test_check_help_explains_input_and_output_positions(tf) -> None:
+def test_check_help_explains_positions(tf) -> None:
     done = tf("check", "--help")
     assert done.returncode == 0, done.stderr
 
@@ -64,7 +52,7 @@ def test_check_help_explains_input_and_output_positions(tf) -> None:
     assert done.stderr == ""
 
 
-def test_a_twin_is_compared_against_the_module_it_states(
+def test_twin_compared_against_stated_module(
     tf, square_twin, fused_twin
 ) -> None:
     faithful = tf(
@@ -89,7 +77,7 @@ def test_a_twin_is_compared_against_the_module_it_states(
     assert "reference: evaluator on Fused.fused" in fused.stdout
 
 
-def test_a_whole_module_is_checked_against_an_expected_output_file(
+def test_module_checked_against_expected_file(
     tf, square_twin, tmp_path
 ) -> None:
     activation = torch.arange(168, dtype=torch.float32)
@@ -116,7 +104,7 @@ def test_a_whole_module_is_checked_against_an_expected_output_file(
     assert "elements 168" in done.stdout
 
 
-def test_check_refuses_a_named_orchestration_method_on_both_sides(tf, orchestrated_twin) -> None:
+def test_check_refuses_orchestration_method(tf, orchestrated_twin) -> None:
     for target in ("Orchestrated.forward", "OrchestratedTwin.forward"):
         done = tf(
             "check",
@@ -128,7 +116,7 @@ def test_check_refuses_a_named_orchestration_method_on_both_sides(tf, orchestrat
         assert "select one of its HIR functions instead" in done.stderr
 
 
-def test_a_non_tensor_nested_activation_leaf_names_its_position(
+def test_non_tensor_leaf_names_position(
     tf, orchestrated_twin, tmp_path
 ) -> None:
     torch.save(torch.arange(168, dtype=torch.float32), tmp_path / "hidden.pt")
@@ -157,7 +145,7 @@ def test_a_non_tensor_nested_activation_leaf_names_its_position(
     assert "mixer_args.pt[1][0]" in done.stderr
 
 
-def test_an_orchestration_method_names_the_files_its_inputs_need(tf, orchestrated_twin) -> None:
+def test_orchestration_method_names_input_files(tf, orchestrated_twin) -> None:
     done = tf(
         "check",
         f"{orchestrated_twin}:OrchestratedTwin",
@@ -169,7 +157,7 @@ def test_an_orchestration_method_names_the_files_its_inputs_need(tf, orchestrate
     assert "add_pair, affine_pair" in done.stderr
 
 
-def test_inputs_are_required(tf, square_twin) -> None:
+def test_check_requires_inputs(tf, square_twin) -> None:
     done = tf(
         "check",
         f"{square_twin}:Twin.main",
@@ -184,7 +172,7 @@ def test_inputs_are_required(tf, square_twin) -> None:
     assert "no inputs stated" in done.stderr
 
 
-def test_two_entirely_zero_sides_are_a_match_not_a_total_mismatch(tf, square_twin) -> None:
+def test_zero_sides_match(tf, square_twin) -> None:
     done = tf(
         "check",
         f"{square_twin}:Twin.zeroed",
@@ -211,7 +199,7 @@ def test_two_entirely_zero_sides_are_a_match_not_a_total_mismatch(tf, square_twi
     assert "PASS" in done.stdout
 
 
-def test_real_weights_come_from_the_checkpoint_and_activations_are_drawn(
+def test_check_reads_checkpoint_weights(
     tf, weighted_twin, tmp_path
 ) -> None:
     save_file({"w": torch.linspace(0.5, 2.0, 168)}, str(tmp_path / "model.safetensors"))
@@ -239,7 +227,7 @@ def test_real_weights_come_from_the_checkpoint_and_activations_are_drawn(
     assert "max_violation 0" in done.stdout
 
 
-def test_a_runtime_module_that_names_no_authored_module_is_refused(
+def test_unlinked_runtime_module_refused(
     tf, handwritten_twin, mislabelled_twin
 ) -> None:
     for source, target, refused in (
@@ -255,7 +243,7 @@ def test_a_runtime_module_that_names_no_authored_module_is_refused(
         assert refused in done.stderr
 
 
-def test_check_reports_the_same_verdict_as_json(tf, mine, tmp_path) -> None:
+def test_check_reports_json_verdict(tf, mine, tmp_path) -> None:
     done = tf("check", f"{mine}:MineTwin.main", *_ARGS, "--json", str(tmp_path / "report.json"))
     assert done.returncode == 0, done.stderr
     assert done.stdout == ""
@@ -272,7 +260,7 @@ def test_check_reports_the_same_verdict_as_json(tf, mine, tmp_path) -> None:
     }
 
 
-def test_check_refuses_a_criterion_it_does_not_have(tf, mine) -> None:
+def test_check_refuses_unknown_criterion(tf, mine) -> None:
     done = tf(
         "check", f"{mine}:MineTwin.main", "--inputs", "random", "--weights", "random",
         "--out", "output", "--fn", "nope"
@@ -281,7 +269,7 @@ def test_check_refuses_a_criterion_it_does_not_have(tf, mine) -> None:
     assert "nope" in done.stderr
 
 
-def test_check_names_the_sibling_it_could_not_import(tf, mine) -> None:
+def test_check_names_missing_sibling(tf, mine) -> None:
     (mine.parent / "model.py").unlink()
     done = tf("check", f"{mine}:MineTwin.main", *_ARGS)
     assert done.returncode == 1

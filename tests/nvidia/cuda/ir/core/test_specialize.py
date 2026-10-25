@@ -3,20 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
 
-from tests.core.fixtures.placed.gqa_decode import (
-    NUM_SPLITS,
-    SMALL_CONTEXT_T,
-    GqaOnline,
-)
-from tests.core.ir.core.test_specialize import ENTRY
-from tests.nvidia.cuda.fixtures.placed.specialize_through_call import ToCallee
+from tests.core._corpus import Case, case, check_case, special
 from tilefoundry.analysis.check import check_program
-from tilefoundry.dsl import *
+from tilefoundry.cli.source import load_authored_ir, load_namespace
 from tilefoundry.evaluator import evaluate
+from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.specialize import (
     SpecializationError,
     bound_dims_of,
@@ -27,118 +23,87 @@ from tilefoundry.ir.hir.specialize import (
 )
 from tilefoundry_nvidia import CudaTarget
 
-STEADY = {"ctx_len": SMALL_CONTEXT_T + NUM_SPLITS}
-_LOOP_CTX = DimVar("loop_ctx", 1, 4096)
-_CALL_M = DimVar("call_m", 1, 16)
-_N_MAX = 1023
-_CALL_N = DimVar("call_n", 1, _N_MAX)
-_NESTED_N = DimVar("nested_n", 1, _N_MAX)
-_DISPATCH_BOUND = 128
+GQA_DECODE = Path(__file__).parents[4] / "core" / "fixtures" / "placed" / "gqa_decode.py"
+IR = Path(__file__).parents[2] / "fixtures" / "ir"
 
 
-@module(entry="run")
-class _MissingCalleeDimension:
-    """A caller dimension independent of the dimension its callee dispatches on."""
-
-    @func
-    def pick(x: Tensor[(_CALL_N,), "f32"]) -> Tensor[(_CALL_N,), "f32"]:
-        pass
-
-    @pick.specialize(RangePattern("call_n", 1, _DISPATCH_BOUND - 1))
-    def pick_small(x: Tensor[(_CALL_N,), "f32"]) -> Tensor[(_CALL_N,), "f32"]:
-        return tf.add(x, x)
-
-    @pick.specialize(RangePattern("call_n", _DISPATCH_BOUND, _N_MAX))
-    def pick_big(x: Tensor[(_CALL_N,), "f32"]) -> Tensor[(_CALL_N,), "f32"]:
-        return tf.add(tf.add(x, x), x)
-
-    @func
-    def run(
-        x: Tensor[(_CALL_M,), "f32"], k: Tensor[(_CALL_N,), "f32"]
-    ) -> Tensor[(_CALL_N,), "f32"]:
-        return pick(k)  # noqa: F821
+def _gqa():
+    """The decode Module, its entry, a context past the short strategy, and the split count."""
+    constants = load_namespace(str(GQA_DECODE))[0]
+    GqaOnline = load_authored_ir(f"{GQA_DECODE}:GqaOnline")
+    steady = {"ctx_len": constants["SMALL_CONTEXT_T"] + constants["NUM_SPLITS"]}
+    return GqaOnline, GqaOnline.entry_function(), steady, constants["NUM_SPLITS"]
 
 
-@module(entry="run")
-class _NestedDispatch:
-    """A dispatch variant whose body calls a second dispatch prototype."""
-
-    @func
-    def inner(x: Tensor[(_NESTED_N,), "f32"]) -> Tensor[(_NESTED_N,), "f32"]:
-        pass
-
-    @inner.specialize(RangePattern("nested_n", 1, _DISPATCH_BOUND - 1))
-    def inner_small(x: Tensor[(_NESTED_N,), "f32"]) -> Tensor[(_NESTED_N,), "f32"]:
-        return tf.add(x, x)
-
-    @inner.specialize(RangePattern("nested_n", _DISPATCH_BOUND, _N_MAX))
-    def inner_big(x: Tensor[(_NESTED_N,), "f32"]) -> Tensor[(_NESTED_N,), "f32"]:
-        return tf.add(tf.add(x, x), x)
-
-    @func
-    def mid(x: Tensor[(_NESTED_N,), "f32"]) -> Tensor[(_NESTED_N,), "f32"]:
-        pass
-
-    @mid.specialize(RangePattern("nested_n", 1, _DISPATCH_BOUND - 1))
-    def mid_small(x: Tensor[(_NESTED_N,), "f32"]) -> Tensor[(_NESTED_N,), "f32"]:
-        return inner(x)  # noqa: F821
-
-    @mid.specialize(RangePattern("nested_n", _DISPATCH_BOUND, _N_MAX))
-    def mid_big(x: Tensor[(_NESTED_N,), "f32"]) -> Tensor[(_NESTED_N,), "f32"]:
-        return inner(x)  # noqa: F821
-
-    @func
-    def run(x: Tensor[(_NESTED_N,), "f32"]) -> Tensor[(_NESTED_N,), "f32"]:
-        return mid(x)  # noqa: F821
-
-
-def test_a_dimension_the_function_does_not_have_is_refused() -> None:
+def test_specialize_refuses_unknown_dimension() -> None:
+    GqaOnline, ENTRY, STEADY, _ = _gqa()
     with pytest.raises(SpecializationError, match="no dimension named"):
         check_program(replace(GqaOnline, target=CudaTarget("nvidia.h200_sxm")), ENTRY, dims={**STEADY, "batch": 4})[1]
 
 
 def test_specialising_nothing_is_refused() -> None:
+    GqaOnline, ENTRY, _, _ = _gqa()
     with pytest.raises(SpecializationError, match="non-empty mapping"):
         check_program(replace(GqaOnline, target=CudaTarget("nvidia.h200_sxm")), ENTRY, dims={})[1]
 
 
-def test_a_call_through_a_prototype_selects_by_the_callers_dimensions() -> None:
+class SpecializeCase(Case):
+    """A dispatching program resolved at chosen sizes."""
+
+
+@case
+class CallThroughPrototype(SpecializeCase):
     """The rebuilt call records which variant it chose, not the prototype."""
-    run = ToCallee.entry_function()
 
-    for extent, expected in ((64, "pick_small"), (512, "pick_big")):
-        rebuilt = check_program(replace(ToCallee, target=CudaTarget("nvidia.h200_sxm")), run, dims={"n": extent})[1].body.target
-        assert display_name(origin_of(rebuilt)) == expected
+    path: Path = Path(__file__).parents[2] / "fixtures/placed/specialize_through_call.py"
+    name: str | None = "ToCallee"
+
+    def guard(self, state, problems):
+        run = state.entry_function()
+
+        for extent, expected in ((64, "pick_small"), (512, "pick_big")):
+            rebuilt = check_program(replace(state, target=CudaTarget("nvidia.h200_sxm")), run, dims={"n": extent})[1].body.target
+            assert display_name(origin_of(rebuilt)) == expected
 
 
-def test_specialising_through_a_call_says_which_dimension_is_missing() -> None:
+def test_specialize_names_missing_callee_dimension() -> None:
     """A callee dispatching on an unbound dimension names that dimension."""
+    _MissingCalleeDimension = load_authored_ir(
+        f"{IR / 'missing_callee_dimension.py'}:_MissingCalleeDimension"
+    )
     caller = _MissingCalleeDimension.entry_function()
 
     with pytest.raises(SpecializationError, match="'call_n'.*was not given a size"):
         check_program(replace(_MissingCalleeDimension, target=CudaTarget("nvidia.h200_sxm")), caller, dims={"call_m": 4})[1]
 
 
-def test_specialising_follows_dispatch_variants_into_nested_dispatches() -> None:
+@case
+class NestedDispatch(SpecializeCase):
     """Selecting a variant keeps rebuilding through dispatches in its body."""
-    run = _NestedDispatch.entry_function()
 
-    for extent, suffix in ((64, "small"), (512, "big")):
-        concrete = check_program(replace(_NestedDispatch, target=CudaTarget("nvidia.h200_sxm")), run, dims={"nested_n": extent})[1]
-        middle = concrete.body.target
-        inner = middle.body.target
+    path: Path = IR / "nested_dispatch.py"
+    name: str | None = "_NestedDispatch"
 
-        assert display_name(origin_of(middle)) == f"mid_{suffix}"
-        assert display_name(origin_of(inner)) == f"inner_{suffix}"
-        assert residual_dims(concrete) == ()
+    def guard(self, state, problems):
+        run = state.entry_function()
+
+        for extent, suffix in ((64, "small"), (512, "big")):
+            concrete = check_program(replace(state, target=CudaTarget("nvidia.h200_sxm")), run, dims={"nested_n": extent})[1]
+            middle = concrete.body.target
+            inner = middle.body.target
+
+            assert display_name(origin_of(middle)) == f"mid_{suffix}"
+            assert display_name(origin_of(inner)) == f"inner_{suffix}"
+            assert residual_dims(concrete) == ()
 
 
-def test_a_specialised_function_states_extents_everywhere() -> None:
+def test_specialize_leaves_no_ranges() -> None:
     """Nothing may still be a range -- including inside the callees.
 
     Nothing may still be a range -- including inside the callees, and in the
     shape-valued attributes their operations carry, which no signature shows.
     """
+    GqaOnline, ENTRY, STEADY, _ = _gqa()
     concrete = check_program(replace(GqaOnline, target=CudaTarget("nvidia.h200_sxm")), ENTRY, dims=STEADY)[1]
 
     assert residual_dims(concrete) == ()
@@ -146,6 +111,7 @@ def test_a_specialised_function_states_extents_everywhere() -> None:
 
 def test_specialising_only_substitutes_dimensions() -> None:
     """The signature keeps its rank, dtype and storage; only extents move."""
+    GqaOnline, ENTRY, STEADY, _ = _gqa()
     chosen = variant_for(ENTRY, STEADY)
     concrete = check_program(replace(GqaOnline, target=CudaTarget("nvidia.h200_sxm")), ENTRY, dims=STEADY)[1]
 
@@ -158,12 +124,13 @@ def test_specialising_only_substitutes_dimensions() -> None:
     assert concrete.return_type.dtype == chosen.return_type.dtype
 
 
-def test_a_derived_extent_follows_the_dimension_it_derives_from() -> None:
+def test_derived_extent_follows_dimension() -> None:
     """The per-split block length is the context length over the splits.
 
     The per-split block length is the context length over the splits. It has
     to arrive at that number without being told it.
     """
+    GqaOnline, ENTRY, STEADY, NUM_SPLITS = _gqa()
     concrete = check_program(replace(GqaOnline, target=CudaTarget("nvidia.h200_sxm")), ENTRY, dims=STEADY)[1]
     shapes = {tuple(param.type.shape) for param in concrete.params}
 
@@ -174,7 +141,7 @@ def test_a_derived_extent_follows_the_dimension_it_derives_from() -> None:
     assert steady_context % NUM_SPLITS == 0
 
 
-def test_the_same_request_gives_the_same_answer_every_time() -> None:
+def test_specialize_is_deterministic() -> None:
     """Rebuilding asks a type cache keyed on node identity for the types of nodes it then discards.
 
     Rebuilding asks a type cache keyed on node identity for the types of
@@ -182,6 +149,7 @@ def test_the_same_request_gives_the_same_answer_every_time() -> None:
     reads a type belonging to something else -- which showed up as the same
     call returning a different shape, or failing, from one run to the next.
     """
+    GqaOnline, ENTRY, STEADY, _ = _gqa()
     first = check_program(replace(GqaOnline, target=CudaTarget("nvidia.h200_sxm")), ENTRY, dims=STEADY)[1]
     others = [check_program(replace(GqaOnline, target=CudaTarget("nvidia.h200_sxm")), ENTRY, dims=STEADY)[1] for _ in range(4)]
 
@@ -191,12 +159,13 @@ def test_the_same_request_gives_the_same_answer_every_time() -> None:
         assert residual_dims(other) == ()
 
 
-def test_specialising_one_function_does_not_disturb_the_next() -> None:
+def test_specialize_keeps_shared_callees_clean() -> None:
     """The callees are shared.
 
     The callees are shared, so a rebuild that left state on them would show
     up here rather than where it was caused.
     """
+    GqaOnline, ENTRY, STEADY, _ = _gqa()
     partials = check_program(replace(GqaOnline, target=CudaTarget("nvidia.h200_sxm")), GqaOnline.lookup("_ctx_partials"), dims=STEADY)[1]
     assert residual_dims(partials) == ()
 
@@ -217,7 +186,7 @@ def _reshape_targets(fn) -> list[tuple]:
         target = getattr(expr, "target", None)
         if target is not None and type(target).__name__ == "Reshape":
             found.append(tuple(target.new_shape))
-        if isinstance(target, type(ENTRY)):
+        if isinstance(target, Function):
             walk(target.body, depth + 1)
         for name in ("args", "elements", "yield_values"):
             for child in getattr(expr, name, ()) or ():
@@ -228,11 +197,12 @@ def _reshape_targets(fn) -> list[tuple]:
     return found
 
 
-def test_a_derived_extent_reaches_the_operation_that_states_it() -> None:
+def test_derived_extent_reaches_reshape() -> None:
     """At the split strategy the block length is the context over the splits.
 
     Nothing supplies it, and it has to arrive inside the callee's own reshape.
     """
+    GqaOnline, ENTRY, STEADY, NUM_SPLITS = _gqa()
     concrete = check_program(replace(GqaOnline, target=CudaTarget("nvidia.h200_sxm")), ENTRY, dims=STEADY)[1]
     block = STEADY["ctx_len"] // NUM_SPLITS
 
@@ -246,7 +216,7 @@ def test_a_derived_extent_reaches_the_operation_that_states_it() -> None:
     )
 
 
-def test_a_specialised_function_computes_what_the_prototype_computes() -> None:
+def test_specialized_function_matches_prototype() -> None:
     """The witness that shapes cannot give.
 
     The witness that shapes cannot give. Substituting an extent must not
@@ -257,6 +227,7 @@ def test_a_specialised_function_computes_what_the_prototype_computes() -> None:
     A small context keeps this runnable on a CPU; the size is in the first
     strategy's range, and the assertion below is that both routes choose it.
     """
+    GqaOnline, ENTRY, _, _ = _gqa()
     context = 32
     dims = {"ctx_len": context}
 
@@ -279,63 +250,65 @@ def test_a_specialised_function_computes_what_the_prototype_computes() -> None:
     torch.testing.assert_close(got.float(), expected.float(), atol=0, rtol=0)
 
 
-@module(entry="main", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
-class _LoopOnly:
-    """A context length that appears nowhere in the signature.
+@case
+class BodyOnlyLoopDimension(SpecializeCase):
+    """A dimension that only a loop bound in the body uses, never the signature."""
 
-    The loop scans it. Nothing about the parameters or the return says how long
-    it is, which is what makes this the case a signature-driven rebuild misses.
-    """
+    path: Path = IR / "body_only_loop_dimension.py"
+    name: str | None = "_LoopOnly"
 
-    @func
-    def main(x: Tensor[(8,), "f32"]):
-        total = tf.zeros(Tensor[(8,), "f32"])
-        for _ in range(_LOOP_CTX):
-            total = tf.add(total, x)
-        return total
+    def guard(self, state, problems):
+        problems.run("still substituted", self.still_substituted, state)
+        problems.run("two sizes told apart", self.two_sizes_told_apart, state)
+
+    def still_substituted(self, state):
+        """Whether to rebuild follows where the dimension occurs, not whether the signature moved.
+
+        Whether to rebuild follows where the dimension occurs, not whether the
+        signature moved. Deciding it from the parameters returns this function
+        untouched -- shaped correctly, and still scanning a range.
+        """
+        authored = state.entry_function()
+        assert residual_dims(authored) == ("loop_ctx",)
+        assert all(
+            isinstance(extent, int) for param in authored.params for extent in param.type.shape
+        ), "the signature is already concrete, which is the point"
+
+        concrete = check_program(replace(state, target=CudaTarget("nvidia.h200_sxm")), authored, dims={"loop_ctx": 512})[1]
+
+        assert concrete is not authored
+        assert residual_dims(concrete) == ()
+
+    def two_sizes_told_apart(self, state):
+        """A rebuild records the extents it was built at, and has to.
+
+        A rebuild records the extents it was built at, and has to: for this
+        function the signature is identical at every size.
+
+        Anything holding two derived functions and asking whether they are the same
+        program -- a report gathering several analyses of one selection -- would
+        otherwise merge measurements of two different programs, because the only
+        place the size occurs is a loop bound the signature never mentions.
+        """
+        authored = state.entry_function()
+
+        small = check_program(replace(state, target=CudaTarget("nvidia.h200_sxm")), authored, dims={"loop_ctx": 8})[1]
+        large = check_program(replace(state, target=CudaTarget("nvidia.h200_sxm")), authored, dims={"loop_ctx": 512})[1]
+
+        assert origin_of(small) is authored
+        assert origin_of(large) is authored
+
+        assert [param.type for param in small.params] == [param.type for param in large.params]
+        assert small.return_type == large.return_type
+
+        assert bound_dims_of(small) == (("loop_ctx", 8),)
+        assert bound_dims_of(large) == (("loop_ctx", 512),)
+        assert bound_dims_of(small) != bound_dims_of(large)
 
 
-def test_a_dimension_only_the_body_uses_is_still_substituted() -> None:
-    """Whether to rebuild follows where the dimension occurs, not whether the signature moved.
-
-    Whether to rebuild follows where the dimension occurs, not whether the
-    signature moved. Deciding it from the parameters returns this function
-    untouched -- shaped correctly, and still scanning a range.
-    """
-    authored = _LoopOnly.entry_function()
-    assert residual_dims(authored) == ("loop_ctx",)
-    assert all(
-        isinstance(extent, int) for param in authored.params for extent in param.type.shape
-    ), "the signature is already concrete, which is the point"
-
-    concrete = check_program(replace(_LoopOnly, target=CudaTarget("nvidia.h200_sxm")), authored, dims={"loop_ctx": 512})[1]
-
-    assert concrete is not authored
-    assert residual_dims(concrete) == ()
+CASES = special(SpecializeCase)
 
 
-def test_two_sizes_of_a_body_only_dimension_are_told_apart() -> None:
-    """A rebuild records the extents it was built at, and has to.
-
-    A rebuild records the extents it was built at, and has to: for this
-    function the signature is identical at every size.
-
-    Anything holding two derived functions and asking whether they are the same
-    program -- a report gathering several analyses of one selection -- would
-    otherwise merge measurements of two different programs, because the only
-    place the size occurs is a loop bound the signature never mentions.
-    """
-    authored = _LoopOnly.entry_function()
-
-    small = check_program(replace(_LoopOnly, target=CudaTarget("nvidia.h200_sxm")), authored, dims={"loop_ctx": 8})[1]
-    large = check_program(replace(_LoopOnly, target=CudaTarget("nvidia.h200_sxm")), authored, dims={"loop_ctx": 512})[1]
-
-    assert origin_of(small) is authored
-    assert origin_of(large) is authored
-
-    assert [param.type for param in small.params] == [param.type for param in large.params]
-    assert small.return_type == large.return_type
-
-    assert bound_dims_of(small) == (("loop_ctx", 8),)
-    assert bound_dims_of(large) == (("loop_ctx", 512),)
-    assert bound_dims_of(small) != bound_dims_of(large)
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
+def test_specialize_case(case: SpecializeCase) -> None:
+    check_case(case)

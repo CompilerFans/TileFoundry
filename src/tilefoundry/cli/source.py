@@ -7,13 +7,44 @@ import contextlib
 import importlib.util
 import io
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from tilefoundry.analysis.check import program_dim_vars
+from tilefoundry.analysis.check import check_program, program_dim_vars
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
+from tilefoundry.ir.hir.specialize import SpecializationError
+
+
+@dataclass(frozen=True)
+class Program:
+    """What every single-size HIR command starts from."""
+
+    authored: Function
+    module: Module
+    entry: Function
+
+
+def bind_dims(stated: Sequence[str] | None) -> dict[str, int] | None:
+    """Parse --dim and take one extent per dim, before the source runs."""
+    return _one_extent_per_dim(parse_dims(stated))
+
+
+def checked_program(
+    source: str, dims: Sequence[str] | None, *, command: str,
+    topology_level: str | None = None,
+) -> Program:
+    """Load the authored HIR, bind its dims, and check it."""
+    bound = bind_dims(dims)
+    module = load_authored_ir(source)
+    authored = module.entry_function()
+    _require_bound_dims(module, authored, bound, command=command)
+    try:
+        checked, entry = check_program(module, authored, topology_level=topology_level, dims=bound)
+    except SpecializationError as error:
+        raise ValueError(f"{command}: {error}") from None
+    return Program(authored, checked, entry)
 
 
 def _split_source(source: str) -> tuple[Path, str | None]:
@@ -373,7 +404,7 @@ def parse_dims(stated: Sequence[str] | None) -> dict[str, tuple[int, ...]] | Non
     return dims
 
 
-def one_extent_per_dim(
+def _one_extent_per_dim(
     dims: Mapping[str, tuple[int, ...]] | None,
 ) -> dict[str, int] | None:
     """The one-extent mapping Analyze gives its operation."""
@@ -390,7 +421,7 @@ def one_extent_per_dim(
     return chosen
 
 
-def require_bound_dims(
+def _require_bound_dims(
     module: Module,
     function: Function,
     dims: Mapping[str, int] | None,
@@ -420,11 +451,12 @@ def suggested_extents(lo: int, hi: int) -> tuple[int, ...]:
 
 
 __all__ = [
+    "Program",
+    "bind_dims",
+    "checked_program",
     "load_authored_ir",
     "load_namespace",
-    "one_extent_per_dim",
     "parse_dims",
-    "require_bound_dims",
     "select_ir",
     "selected_target",
     "suggested_extents",
