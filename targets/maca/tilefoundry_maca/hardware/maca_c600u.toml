@@ -52,7 +52,7 @@ conditions = "Design peak (vendor nominal). Measured envelopes (perf_data/bandwi
 value = 800
 unit = "ns"
 origin = "measured"
-source = "mcDeepGemm/docs/experiments/20261026_c600u_mega_mhc_tilelang_s3/probe_latency.py"
+source = "opt-lib/mcDeepGemm/docs/experiments/20261026_c600u_mega_mhc_tilelang_s3/probe_latency.py"
 conditions = "pointer-chase on a 64 MiB random permutation: 769-822 ns/load at 1-4 chains/AP (28 APs); 8-16 chains/AP is the contended plateau. A 1 MiB permutation measures 308-323 ns for the L2-resident path."
 
 [facts.memory.l2.capacity]

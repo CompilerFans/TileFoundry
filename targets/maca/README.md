@@ -32,7 +32,7 @@ uses. Measured values are evidence, recorded in each fact's `conditions` (and
 the measured column above), never substituted into a design fact:
 
 - HBM: read+write / read-only envelopes from
-  `mcDeepGemm/deep_gemm/tests/perf_data/bandwidth/20260818_MetaX_*`
+  `opt-lib/mcDeepGemm/deep_gemm/tests/perf_data/bandwidth/20260818_MetaX_*`
   (L2-flushed fits); the mega_mhc copy probe (1183 GB/s) is one more measured
   point, from a session with a ~24% speed-mode flip.
 - MMA: C600U design BF16 219.05 / FP8 438.1 TFLOPS; measured bare-MMA ceilings
@@ -123,7 +123,7 @@ With `BM=128` the model reports `gmem:r2.84GiB/w2.19GiB@total`, of which
 (512 CTAs) moves the total from 5.03 GiB to 5.70 GiB (**+13.3%**), which is the
 measured penalty of mcDeepGemm's ct64 arm; it is why the K=64 design had to
 keep 128 tokens per CTA. The same workflow on the S3 tail
-(`mcDeepGemm/docs/experiments/20261026_c600u_mega_mhc_tilelang_s3/`) gives the
+(`opt-lib/mcDeepGemm/docs/experiments/20261026_c600u_mega_mhc_tilelang_s3/`) gives the
 calibrated 2.11 ms memory floor and the instruction-bound 3.6 ms reference.
 
 ## Boundaries

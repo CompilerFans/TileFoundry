@@ -43,7 +43,7 @@ pairs: **BF16 = FP16** (16x16x16; 219.05 on C600U, 275.25 on C600UL) and
 **INT8 = FP8** (16x16x32; 438.1 / 550.5 on xcore1600; C500/C600 have no native
 FP8). A pair shares its design peak and its bare-MMA measurement. The measured columns are
 evidence recorded in each fact's `conditions`
-(`mcDeepGemm/deep_gemm/tests/perf_data/bandwidth/20260818_MetaX_*`, L2-flushed
+(`opt-lib/mcDeepGemm/deep_gemm/tests/perf_data/bandwidth/20260818_MetaX_*`, L2-flushed
 fits): read+write / read-only envelopes, plus the mega_mhc 2 GiB copy probe
 (1183 GB/s, a session with a ~24% speed-mode flip). The compute design peaks
 are `maca-perf-model` values; the measured bare-MMA ceilings are C600U BF16
@@ -62,7 +62,7 @@ mxvs rows are GEMM-achieved; the bare-MMA evidence is 215.5 (BF16/FP16) and
 
 Sources: the workspace `maca-perf-model` skill (AP/L2/nominal HBM/MMA peaks),
 `mcDeepGemm`'s `perf_data/bandwidth/20260818_MetaX_*` (measured envelopes),
-`mcDeepGemm/docs/mega_mhc_maca_c_occupancy_20261017.md` (C600U registers, smem,
+`opt-lib/mcDeepGemm/docs/mega_mhc_maca_c_occupancy_20261017.md` (C600U registers, smem,
 wave, occupancy), and `torch.cuda.get_device_properties(0)` on an MXC600-U
 (28 APs, 131072 regs/AP, 131072 B smem/AP, 2048 threads/AP).
 
@@ -201,7 +201,7 @@ cp310, below the py312 versions; `analyze` works with them. `ortools` imports
 ## 7. Multi-wave footprint accounting
 
 The S3 HIR in
-`mcDeepGemm/docs/experiments/20261026_c600u_mega_mhc_tilelang_s3/s3_fused.py`
+`opt-lib/mcDeepGemm/docs/experiments/20261026_c600u_mega_mhc_tilelang_s3/s3_fused.py`
 uses 128 tokens per CTA and a 1024-wide thread mesh. Its grid has 256 CTAs on a
 28-AP target, i.e. `ceil(256/28) = 10` waves.
 
