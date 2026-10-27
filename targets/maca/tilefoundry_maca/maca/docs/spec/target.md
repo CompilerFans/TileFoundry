@@ -24,7 +24,7 @@ pass it to `compile`/`scaffold` expecting CUDA or MACA C output.
 
 ## 2. Products and facts
 
-| product | arch id | APs | L2 | HBM design | HBM measured (rw / read) | BF16 design | FP8 design |
+| product | arch id | APs | L2 | HBM design | HBM measured (rw / read) | BF16/FP16 design | FP8/INT8 design |
 |---|---|---:|---:|---:|---:|---:|---:|
 | `maca.c500` | `maca.xcore1000` | 104 | 8 MiB | 1843.2 GB/s | 1490.5 / 1624 GB/s | 240 TFLOPS | unavailable |
 | `maca.c600` | `maca.xcore1500` | 32 | 2 MiB | 1638 GB/s | 1000.6 / 979.9 GB/s | 193.35 TFLOPS | unavailable |
@@ -38,7 +38,10 @@ XCORE1000, 128 KiB on XCORE1500/1600), `registers_per_sm_32bit = 131072`,
 `rmem_owner = thread`, and no separate tensor memory.
 
 The **design** columns are the vendor nominal values and are what the analysis
-uses, the same convention as the NVIDIA target. The measured columns are
+uses, the same convention as the NVIDIA target. The MMA issue rates come in
+pairs: **BF16 = FP16** (16x16x16; 219.05 on C600U, 275.25 on C600UL) and
+**INT8 = FP8** (16x16x32; 438.1 / 550.5 on xcore1600; C500/C600 have no native
+FP8). A pair shares its design peak and its bare-MMA measurement. The measured columns are
 evidence recorded in each fact's `conditions`
 (`mcDeepGemm/deep_gemm/tests/perf_data/bandwidth/20260818_MetaX_*`, L2-flushed
 fits): read+write / read-only envelopes, plus the mega_mhc 2 GiB copy probe
@@ -51,12 +54,11 @@ documentation only: the schema has no `int8` throughput key and the IR has no
 a tensor-core peak.
 
 mxvs 0.0.1 (GPU0/die 0, 2026-10-27) adds another measured caliber: HBM read
-1510-1534 GB/s and kernel-copy 1003-1006 GB/s at 10 GB; GEMM bf16/fp16
-196.5 TFLOPS, int8 371.2 TOPS, tf32 86.2. It has no fp8 model. On
-C600U/C600UL INT8 and FP8 share the same 16x16x32 MMA issue rate (design
-438.1 / 550.5), so the mxvs int8 GEMM row and the FP8 bare-MMA probe (415.7)
-are different calibers, not a difference in rated throughput. The recipe,
-per-size sweep and per-die caveats are in `tilefoundry spec maca/mxvs`.
+1510-1534 GB/s and kernel-copy 1003-1006 GB/s at 10 GB; GEMM bf16 196.48 /
+fp16 196.53 TFLOPS, int8 371.2 TOPS, tf32 86.2. It has no fp8 model. The
+mxvs rows are GEMM-achieved; the bare-MMA evidence is 215.5 (BF16/FP16) and
+415.7 (FP8/INT8). The recipe, per-size sweep and per-die caveats are in
+`tilefoundry spec maca/mxvs`.
 
 Sources: the workspace `maca-perf-model` skill (AP/L2/nominal HBM/MMA peaks),
 `mcDeepGemm`'s `perf_data/bandwidth/20260818_MetaX_*` (measured envelopes),

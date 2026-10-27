@@ -85,11 +85,12 @@ no design fact in the schema (recorded as evidence only).
   sits below the bare-MMA probes. The target's roofline still uses the design
   peak; the measured values answer "what did this machine reach, measured by
   this tool".
-- On C600U/C600UL, INT8 and FP8 share the 16x16x32 MMA issue rate, so the
-  design peaks are equal (438.1 / 550.5) and a bare-MMA number applies to
-  both. mxvs has no fp8 model, so its int8 row (371 TOPS, GEMM-achieved) must
-  not be compared with the FP8 bare-MMA probe (415.7): the shared design rate
-  is 438.1, and both measurements are below it for their own reasons.
+- The MMA issue rates come in pairs: **BF16 = FP16** (16x16x16; 219.05 on
+  C600U) and, on xcore1600, **INT8 = FP8** (16x16x32; 438.1). A pair shares
+  its design peak and its bare-MMA measurement. mxvs reads bf16 196.48 and
+  fp16 196.53 (GEMM-achieved, the same rate within noise); it has no fp8
+  model, so its int8 row (371 TOPS, GEMM-achieved) must not be compared with
+  the FP8 bare-MMA probe (415.7) as if the rated throughputs differed.
 - The target facts carry these readings in their `conditions` (HBM bandwidth,
   BF16/FP16, FP8) so `tilefoundry target show maca.c600u` shows both the
   design value and the evidence.

@@ -78,14 +78,14 @@ value = 219050000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill: C600U (28 AP) BF16/FP16 MMA peak"
-conditions = "Nominal 16x16x16 MMA peak; a bare-MMA microbench measured 215.5 TF/s (98.4%) on C600U; mxvs 0.0.1 ops --blas (GEMM) measured 196.5 TFLOPS"
+conditions = "Nominal 16x16x16 MMA peak; FP16 shares the same issue rate, so the same figures apply. A bare-MMA microbench measured 215.5 TF/s (98.4%) on C600U; mxvs 0.0.1 ops --blas (GEMM) measured bf16 196.48 / fp16 196.53 TFLOPS"
 
 [facts.throughput.bf16]
 value = 219050000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill: C600U (28 AP) BF16/FP16 MMA peak"
-conditions = "Nominal 16x16x16 MMA peak; a bare-MMA microbench measured 215.5 TF/s (98.4%) on C600U; mxvs 0.0.1 ops --blas (GEMM) measured 196.5 TFLOPS"
+conditions = "Nominal 16x16x16 MMA peak; FP16 shares the same issue rate, so the same figures apply. A bare-MMA microbench measured 215.5 TF/s (98.4%) on C600U; mxvs 0.0.1 ops --blas (GEMM) measured bf16 196.48 / fp16 196.53 TFLOPS"
 
 [facts.throughput.fp8e4m3]
 value = 438100000000000

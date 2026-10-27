@@ -85,14 +85,14 @@ value = 275250000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill"
-conditions = "Nominal 32-AP BF16 peak"
+conditions = "Nominal 32-AP BF16 peak; FP16 shares the same 16x16x16 issue rate"
 
 [facts.throughput.fp8e4m3]
 value = 550500000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill"
-conditions = "Nominal 32-AP FP8 peak"
+conditions = "Nominal 32-AP FP8 peak; INT8 shares the same 16x16x32 issue rate"
 
 [facts.throughput.f4e2m1]
 status = "unavailable"
