@@ -639,7 +639,7 @@ def moving_boundaries(
                 else None
             )
             wave_stated = not (
-                wave_units < declared_units and mesh_parameters and position is None
+                wave_units < declared_units and position is None
             )
             found.append(
                 MovingBoundary(
@@ -794,7 +794,13 @@ def reached_by(
             if wave_units < declared_units and mesh_parameters
             else None
         )
-        if wave_units < declared_units and mesh_parameters and position is None:
+        if wave_units < declared_units and position is None:
+            # The grid is larger than one wave, but this access cannot be
+            # restricted to the wave's units.  Returning the whole-grid
+            # footprint here would be multiplied by the wave count in
+            # `memory.py`, counting every byte `ceil(declared/wave_units)`
+            # times.  Refuse the footprint instead; the roofline then falls
+            # back to the call's traffic record.
             return None
         relation = (
             access.relation.constrain(_first(loops))
