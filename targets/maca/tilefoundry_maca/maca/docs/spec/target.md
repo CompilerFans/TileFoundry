@@ -24,12 +24,12 @@ pass it to `compile`/`scaffold` expecting CUDA or MACA C output.
 
 ## 2. Products and facts
 
-| product | arch id | APs | L2 | HBM model | BF16 | FP8 |
-|---|---|---:|---:|---:|---:|---:|
-| `maca.c500` | `maca.xcore1000` | 104 | 8 MiB | 1490.5 GB/s measured read+write (nominal 1843.2) | 240 TFLOPS | unavailable |
-| `maca.c600` | `maca.xcore1500` | 32 | 2 MiB | 1000.6 GB/s measured read+write (nominal 1638) | 193.35 TFLOPS | unavailable |
-| `maca.c600u` | `maca.xcore1600` | 28 | 2 MiB | 1482.0 GB/s measured read+write (nominal 2048) | 219.05 TFLOPS | 438.1 TFLOPS |
-| `maca.c600ul` | `maca.xcore1600` | 32 | 2 MiB | 1482.0 GB/s (estimate from C600U; nominal 2048) | 275.25 TFLOPS | 550.5 TFLOPS |
+| product | arch id | APs | L2 | HBM design | HBM measured (rw / read) | BF16 design | FP8 design |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `maca.c500` | `maca.xcore1000` | 104 | 8 MiB | 1843.2 GB/s | 1490.5 / 1624 GB/s | 240 TFLOPS | unavailable |
+| `maca.c600` | `maca.xcore1500` | 32 | 2 MiB | 1638 GB/s | 1000.6 / 979.9 GB/s | 193.35 TFLOPS | unavailable |
+| `maca.c600u` | `maca.xcore1600` | 28 | 2 MiB | 2048 GB/s | 1482.0 / 1628.5 GB/s | 219.05 TFLOPS | 438.1 TFLOPS |
+| `maca.c600ul` | `maca.xcore1600` | 32 | 2 MiB | 2048 GB/s | 1482.0 est / — | 275.25 TFLOPS | 550.5 TFLOPS |
 
 Architecture documents also state: `max_threads_per_cta = 2048`,
 `max_threads_per_warp = 64`, `max_warps_per_cta = 32`,
@@ -37,15 +37,18 @@ Architecture documents also state: `max_threads_per_cta = 2048`,
 XCORE1000, 128 KiB on XCORE1500/1600), `registers_per_sm_32bit = 131072`,
 `rmem_owner = thread`, and no separate tensor memory.
 
-The bandwidth column is the measured read+write envelope (`torch-add`,
-L2-flushed linear fit) from
-`mcDeepGemm/deep_gemm/tests/perf_data/bandwidth/20260818_MetaX_*`; read-only
-ceilings are higher (C500 1624, C600 979.9, C600U 1628.5). The compute peaks
-are nominal `maca-perf-model` values; each fact's `conditions` states the
-measured bare-MMA ceiling where one exists (C600U BF16 215.5/219.05, FP8
-415.7/438.1). INT8 peaks in the table are documentation only: the schema has
-no `int8` throughput key and the IR has no `i8` dtype, so the analysis prices
-integer work through `service.integer`, not a tensor-core peak.
+The **design** columns are the vendor nominal values and are what the analysis
+uses, the same convention as the NVIDIA target. The measured columns are
+evidence recorded in each fact's `conditions`
+(`mcDeepGemm/deep_gemm/tests/perf_data/bandwidth/20260818_MetaX_*`, L2-flushed
+fits): read+write / read-only envelopes, plus the mega_mhc 2 GiB copy probe
+(1183 GB/s, a session with a ~24% speed-mode flip). The compute design peaks
+are `maca-perf-model` values; the measured bare-MMA ceilings are C600U BF16
+215.5 / FP8 415.7 TFLOPS (design 219.05 / 438.1), and C500 INT8 477.9 TOPS
+(design 480). C600 has no bare-MMA probe. INT8 peaks in the table are
+documentation only: the schema has no `int8` throughput key and the IR has no
+`i8` dtype, so the analysis prices integer work through `service.integer`, not
+a tensor-core peak.
 
 Sources: the workspace `maca-perf-model` skill (AP/L2/nominal HBM/MMA peaks),
 `mcDeepGemm`'s `perf_data/bandwidth/20260818_MetaX_*` (measured envelopes),
@@ -214,10 +217,13 @@ GB/s). The H200 tutorial's one-wave cases are unchanged (4952 / 8697 ns).
 
 The cta-level rate is 573.4 GB/s because the target's Little's-law cap uses
 `inflight = 16 KiB/CTA`, `active = min(256, 28) = 28` and the measured 800 ns
-latency: `16384 × 28 / 800 ns = 573.4 GB/s`. The pure HBM floor at the measured
-read+write envelope is 1.12 GiB / 1482 GB/s = 0.81 ms (1.02 ms if the
-mega_mhc copy-probe ceiling of 1183 GB/s is used). The measured MACA-C S3 is 3.6 ms, above both, so that
-stage is instruction-bound.
+latency: `16384 × 28 / 800 ns = 573.4 GB/s`. The pure HBM floor depends on the caliber:
+1.12 GiB / 2048 GB/s = **0.55 ms** at the design peak; 1.12 / 1482 = **0.81 ms**
+at the measured read+write envelope; 1.12 / 1183 = **1.02 ms** at the mega_mhc
+copy probe. The measured MACA-C S3 is 3.6 ms, above all three, so that stage
+is instruction-bound. Use the design-peak floor for roofline denominators, the
+measured envelope for attained-rate statements, and 2.11 ms as the calibrated
+cta-level reachable floor.
 
 Two placement advisories remain and are still meaningful:
 
@@ -228,5 +234,7 @@ Two placement advisories remain and are still meaningful:
 
 For absolute gates, make the HIR physically placeable (per-CTA rmem ≤ 512 KiB,
 per-wave L2 window ≤ 2 MiB) and calibrate the estimated latency/clock. Until
-then, use 0.81-2.11 ms as the memory floor (1.02-2.11 ms with the copy-probe
-ceiling) and the measured 3.6 ms as the current instruction-bound reference.
+then, use 0.55 ms (design peak), 0.81 ms (measured read+write) or 1.02 ms
+(copy probe) as the memory floor depending on the caliber, 2.11 ms as the
+calibrated cta-level reachable floor, and the measured 3.6 ms as the current
+instruction-bound reference.

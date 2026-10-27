@@ -42,11 +42,11 @@ source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
 conditions = "one HBM pool shared by all APs of this single-device target"
 
 [facts.memory.hbm.bandwidth]
-value = 1482000000000
+value = 2048000000000
 unit = "byte/s"
-origin = "measured"
-source = "mcDeepGemm perf_data/bandwidth/20260818_MetaX_C600-U (torch-add fit, L2-flushed, r2=0.9996)"
-conditions = "Measured read+write envelope 1482.0 GB/s. Read-only is 1628.5 GB/s, cub-transform 1513.7, copy 1380.1; the mega_mhc 2 GiB copy probe measured 1183 GB/s in a session that saw a ~24% speed-mode flip. Nominal is 2048 GB/s (16ch x 256b x 4.0 Gbps); the model uses the read+write envelope."
+origin = "reference"
+source = "maca-perf-model skill: C600U nominal HBM (2.048 TB/s; 16ch x 256b x 4.0 Gbps)"
+conditions = "Design peak (vendor nominal). Measured envelopes (perf_data/bandwidth/20260818_MetaX_C600-U): read-only 1628.5, torch-add 1482.0, cub-transform 1513.7, copy 1380.1 GB/s; a mega_mhc 2 GiB copy probe measured 1183 GB/s in a session with a ~24% speed-mode flip. The roofline denominator is the design peak."
 
 [facts.memory.gmem.latency]
 value = 800

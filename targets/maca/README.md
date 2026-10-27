@@ -18,24 +18,29 @@ tilefoundry target show maca.c600u       # every fact and its evidence
 
 ## Products
 
-| id | arch | APs | L2 | HBM (model) | BF16 | FP8 | INT8 |
-|---|---|---:|---:|---:|---:|---:|---:|
-| `maca.c500` | `maca.xcore1000` | 104 | 8 MiB | 1490.5 GB/s (measured read+write; 1.80 TB/s nominal) | 240 TFLOPS | unavailable (emulated) | 480 TOPS |
-| `maca.c600` | `maca.xcore1500` | 32 | 2 MiB | 1000.6 GB/s (measured read+write; 1.638 TB/s nominal) | 193.35 TFLOPS | unavailable (emulated) | 386.7 TOPS |
-| `maca.c600u` | `maca.xcore1600` | 28 | 2 MiB | 1482.0 GB/s (measured read+write; 2.048 TB/s nominal) | 219.05 TFLOPS | 438.1 TFLOPS | 438.1 TOPS |
-| `maca.c600ul` | `maca.xcore1600` | 32 | 2 MiB | 1482.0 GB/s (estimated from C600U; 2.048 TB/s nominal) | 275.25 TFLOPS | 550.5 TFLOPS | 550.5 TOPS |
+| id | arch | APs | L2 | HBM design | HBM measured (rw / read) | BF16 design | FP8 design | INT8 (doc only) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `maca.c500` | `maca.xcore1000` | 104 | 8 MiB | 1843.2 GB/s | 1490.5 / 1624 GB/s | 240 TFLOPS | unavailable (emulated) | 480 TOPS |
+| `maca.c600` | `maca.xcore1500` | 32 | 2 MiB | 1638 GB/s | 1000.6 / 979.9 GB/s | 193.35 TFLOPS | unavailable (emulated) | 386.7 TOPS |
+| `maca.c600u` | `maca.xcore1600` | 28 | 2 MiB | 2048 GB/s | 1482.0 / 1628.5 GB/s | 219.05 TFLOPS | 438.1 TFLOPS | 438.1 TOPS |
+| `maca.c600ul` | `maca.xcore1600` | 32 | 2 MiB | 2048 GB/s | 1482.0 est / — | 275.25 TFLOPS | 550.5 TFLOPS | 550.5 TOPS |
 
 Every fact carries `origin` (`vendor`, `measured`, `reference`, `derived`,
-`estimated`) and `conditions`. The HBM facts use the **measured read+write
-envelope** (torch-add, L2-flushed linear fit) from
-`mcDeepGemm/deep_gemm/tests/perf_data/bandwidth/20260818_MetaX_*`; read-only
-ceilings are higher (C500 1624, C600 979.9, C600U 1628.5 GB/s) and the nominal
-rates are 1.8432 / 1.638 / 2.048 TB/s. The compute peaks are the nominal
-`maca-perf-model` values; measured bare-MMA ceilings are stated in each fact's
-`conditions` (C600U BF16 215.5/219.05, FP8 415.7/438.1). On `maca.c600u` the
-1900 MHz XCORE clock (`mx-smi --show-clock`) and 800 ns HBM latency (pointer
-chase, 769-822 ns at 1-4 chains/AP; L2 308-323 ns) are measured; C600UL
-inherits them as estimates, C500/C600 clocks and latencies remain estimates.
+`estimated`) and `conditions`. Following the NVIDIA target's convention, the
+**design** columns are the vendor nominal values and are what the roofline
+uses. Measured values are evidence, recorded in each fact's `conditions` (and
+the measured column above), never substituted into a design fact:
+
+- HBM: read+write / read-only envelopes from
+  `mcDeepGemm/deep_gemm/tests/perf_data/bandwidth/20260818_MetaX_*`
+  (L2-flushed fits); the mega_mhc copy probe (1183 GB/s) is one more measured
+  point, from a session with a ~24% speed-mode flip.
+- MMA: C600U design BF16 219.05 / FP8 438.1 TFLOPS; measured bare-MMA ceilings
+  215.5 / 415.7. C500 design INT8 480 TOPS; measured 477.9. No C600 bare-MMA
+  probe is recorded.
+- Machine state: C600U 1900 MHz (`mx-smi --show-clock`) and 800 ns HBM latency
+  (pointer chase) are measured; C600UL inherits them as estimates; C500/C600
+  clocks and latencies remain estimates.
 
 INT8 peaks are documented for reference only: the CUDA fact schema has no
 `int8` throughput key and the IR has no `i8` dtype, so the analysis prices

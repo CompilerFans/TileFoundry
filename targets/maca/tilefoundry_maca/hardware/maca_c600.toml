@@ -30,9 +30,9 @@ conditions = "no clock is published through torch or mx-smi; 1.5 GHz is an estim
 [facts.memory.hbm.capacity]
 value = 68719476736
 unit = "byte"
-origin = "measured"
-source = "torch.cuda.get_device_properties(0) on MXC600-U"
-conditions = "64 GiB class; not used by the roofline"
+origin = "estimated"
+source = "C600 product class (64 GiB); not confirmed on hardware"
+conditions = "not used by the roofline; no C600 device was on hand"
 
 [facts.memory.hbm.owner]
 value = "target"
@@ -42,12 +42,11 @@ source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
 conditions = "one HBM pool shared by all APs of this single-device target"
 
 [facts.memory.hbm.bandwidth]
-value = 1000600000000
+value = 1638000000000
 unit = "byte/s"
-origin = "measured"
-source = "mcDeepGemm perf_data/bandwidth/20260818_MetaX_C600-A (torch-add fit, L2-flushed, r2=0.9998)"
-conditions = "Measured read+write envelope 1000.6 GB/s; read-only 979.9, cub-transform 981.0, copy 829.1. Nominal is 1638 GB/s; the model uses the measured read+write envelope."
-
+origin = "reference"
+source = "maca-perf-model skill: C600 nominal HBM (1.638 TB/s)"
+conditions = "Design peak (vendor nominal). Measured envelopes (perf_data/bandwidth/20260818_MetaX_C600-A): read-only 979.9, torch-add 1000.6, cub-transform 981.0, copy 829.1 GB/s. The roofline denominator is the design peak."
 
 [facts.memory.gmem.latency]
 value = 600
@@ -87,7 +86,6 @@ unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill"
 conditions = "Nominal 16x16x16 MMA peak; no bare-MMA probe for C600 is recorded in the workspace"
-
 
 [facts.throughput.fp8e4m3]
 status = "unavailable"

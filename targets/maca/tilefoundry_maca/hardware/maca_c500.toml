@@ -30,9 +30,9 @@ conditions = "no clock is published through torch or mx-smi; 1.5 GHz is an estim
 [facts.memory.hbm.capacity]
 value = 68719476736
 unit = "byte"
-origin = "measured"
-source = "torch.cuda.get_device_properties(0) on MXC600-U"
-conditions = "64 GiB class; not used by the roofline"
+origin = "estimated"
+source = "C500 product class (64 GiB); not confirmed on hardware"
+conditions = "not used by the roofline; no C500 device was on hand"
 
 [facts.memory.hbm.owner]
 value = "target"
@@ -42,12 +42,11 @@ source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
 conditions = "one HBM pool shared by all APs of this single-device target"
 
 [facts.memory.hbm.bandwidth]
-value = 1490500000000
+value = 1843200000000
 unit = "byte/s"
-origin = "measured"
-source = "mcDeepGemm perf_data/bandwidth/20260818_MetaX_C500 (torch-add fit, L2-flushed, r2=1.0)"
-conditions = "Measured read+write envelope 1490.5 GB/s; read-only 1624, cub-transform 1483.4, paged 1468.9. Nominal is 1843.2 GB/s; the model uses the read+write envelope."
-
+origin = "reference"
+source = "maca-perf-model skill: C500 nominal HBM (1.80 TB/s; 16ch x 256b x 3.6 Gbps)"
+conditions = "Design peak (vendor nominal). Measured envelopes (perf_data/bandwidth/20260818_MetaX_C500, L2-flushed fits): read-only 1624, torch-add 1490.5, cub-transform 1483.4, paged 1468.9 GB/s. The roofline denominator is the design peak; the measured envelope answers attained-rate questions."
 
 [facts.memory.gmem.latency]
 value = 600
@@ -87,7 +86,6 @@ unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill"
 conditions = "Nominal 16x16x16 MMA peak (240 PCIe / 280 OAM); INT8 measured 477.9/480 TOPS (99.6%) but INT8 has no ThroughputFacts key in this schema"
-
 
 [facts.throughput.fp8e4m3]
 status = "unavailable"
