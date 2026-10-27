@@ -45,7 +45,11 @@ the measured column above), never substituted into a design fact:
 INT8 peaks are documented for reference only: the CUDA fact schema has no
 `int8` throughput key and the IR has no `i8` dtype, so the analysis prices
 integer work through the scalar `service.integer` fact, not a tensor-core
-peak.
+peak. On C600U/C600UL (xcore1600) INT8 and FP8 share the same 16x16x32 MMA
+issue rate, so their design peaks are equal (438.1 / 550.5) and a bare-MMA
+measurement of one applies to the other; mxvs reports them differently only
+because its int8 arm is a GEMM (371 TOPS achieved) while the FP8 evidence is a
+bare-MMA probe (415.7 TFLOPS).
 
 Measured evidence, by tool and mode (never mixed into the design facts):
 
@@ -62,9 +66,11 @@ Measured evidence, by tool and mode (never mixed into the design facts):
 | bare-MMA fp8, probe (TFLOPS) | — | — | 415.7 | — |
 
 mxvs 0.0.1 has no fp8 model and its non-blas ops path reports -0.00 on this
-build. The extraction workaround, the 64 MB-10 GB sweep and the per-die
-caveats are in `tilefoundry spec maca/mxvs`; raw JSON is under
-`docs/mxvs/20261027_c600u/`.
+build. On C600U INT8 and FP8 use the same 16x16x32 MMA, so the 371 TOPS mxvs
+int8 row (GEMM-achieved) and the 415.7 TFLOPS fp8 row (bare MMA) are not the
+same caliber; the design rate they share is 438.1. The extraction workaround,
+the 64 MB-10 GB sweep and the per-die caveats are in
+`tilefoundry spec maca/mxvs`; raw JSON is under `docs/mxvs/20261027_c600u/`.
 
 ## MACA-C programming model
 

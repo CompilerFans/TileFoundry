@@ -92,7 +92,7 @@ value = 438100000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill: C600U (28 AP) FP8 peak"
-conditions = "Nominal native 16x16x32 FP8 MMA peak; a bare-MMA probe measured 415.7 TF/s (94.9%) on C600U; mxvs 0.0.1 has no fp8 model"
+conditions = "Nominal native 16x16x32 FP8 MMA peak; a bare-MMA probe measured 415.7 TF/s (94.9%) on C600U; mxvs 0.0.1 has no fp8 model. INT8 shares the same 16x16x32 MMA issue rate, so the same design and bare-MMA figures apply to it; mxvs int8 371 TOPS is a GEMM-achieved reading, not a different rate"
 
 [facts.throughput.f4e2m1]
 status = "unavailable"

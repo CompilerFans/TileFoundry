@@ -52,7 +52,10 @@ a tensor-core peak.
 
 mxvs 0.0.1 (GPU0/die 0, 2026-10-27) adds another measured caliber: HBM read
 1510-1534 GB/s and kernel-copy 1003-1006 GB/s at 10 GB; GEMM bf16/fp16
-196.5 TFLOPS, int8 371.2 TOPS, tf32 86.2. It has no fp8 model. The recipe,
+196.5 TFLOPS, int8 371.2 TOPS, tf32 86.2. It has no fp8 model. On
+C600U/C600UL INT8 and FP8 share the same 16x16x32 MMA issue rate (design
+438.1 / 550.5), so the mxvs int8 GEMM row and the FP8 bare-MMA probe (415.7)
+are different calibers, not a difference in rated throughput. The recipe,
 per-size sweep and per-die caveats are in `tilefoundry spec maca/mxvs`.
 
 Sources: the workspace `maca-perf-model` skill (AP/L2/nominal HBM/MMA peaks),
