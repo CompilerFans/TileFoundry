@@ -47,12 +47,24 @@ INT8 peaks are documented for reference only: the CUDA fact schema has no
 integer work through the scalar `service.integer` fact, not a tensor-core
 peak.
 
-Measured with mxvs 0.0.1 on C600U (GPU0/die 0, 2026-10-27): HBM read
-1510-1534 GB/s and kernel-copy 1003-1006 GB/s at 10 GB; GEMM bf16/fp16
-196.5 TFLOPS, int8 371.2 TOPS, tf32 86.2. This mxvs build has no fp8 model,
-so FP8 evidence stays the bare-MMA probe 415.7. The extraction workaround,
-per-size sweep (64 MB to 10 GB) and per-die caveats are in
-`tilefoundry spec maca/mxvs`.
+Measured evidence, by tool and mode (never mixed into the design facts):
+
+| metric | C500 | C600 | C600U | C600UL |
+|---|---:|---:|---:|---:|
+| HBM read-only, perf_data fit (GB/s) | 1624 | 979.9 | 1628.5 | — |
+| HBM read+write, perf_data fit (GB/s) | 1490.5 | 1000.6 | 1482.0 | — |
+| HBM read 10 GB, mxvs 0.0.1 (GB/s) | — | — | 1510-1534 | — |
+| HBM kernel-copy 10 GB, mxvs (GB/s) | — | — | 1003-1006 | — |
+| GEMM bf16, mxvs `--blas` (TFLOPS) | — | — | 196.5 | — |
+| GEMM int8, mxvs `--blas` (TOPS) | — | — | 371 | — |
+| GEMM tf32, mxvs `--blas` (TFLOPS) | — | — | 86.2 | — |
+| bare-MMA bf16, probe (TFLOPS) | — | — | 215.5 | — |
+| bare-MMA fp8, probe (TFLOPS) | — | — | 415.7 | — |
+
+mxvs 0.0.1 has no fp8 model and its non-blas ops path reports -0.00 on this
+build. The extraction workaround, the 64 MB-10 GB sweep and the per-die
+caveats are in `tilefoundry spec maca/mxvs`; raw JSON is under
+`docs/mxvs/20261027_c600u/`.
 
 ## MACA-C programming model
 
