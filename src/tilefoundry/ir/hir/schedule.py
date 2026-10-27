@@ -9,6 +9,7 @@ import isl
 
 from tilefoundry.evaluator.registry import register_eval, schedule_eval_registry
 from tilefoundry.evaluator.value import EvalError
+from tilefoundry._compat import tuple_annotation
 from tilefoundry.ir.core import Call, Op
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
@@ -65,7 +66,7 @@ class ScheduleOp(Op):
     scope_inputs = ()
 
     operands = ParamDef(
-        kind="input", annotation=Tuple[is_ranked_tensor()], pattern=is_ranked_tensor()
+        kind="input", annotation=tuple_annotation(is_ranked_tensor()), pattern=is_ranked_tensor()
     )
     op = ParamDef(kind="attribute", annotation=Op)
     repeat = ParamDef(kind="attribute", annotation=tuple, optional=True, default=None)

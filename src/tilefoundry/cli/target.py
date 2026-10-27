@@ -8,7 +8,7 @@ import importlib.util
 import io
 import json
 import sys
-import tomllib
+from tilefoundry._compat import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType

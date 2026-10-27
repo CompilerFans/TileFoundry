@@ -6,6 +6,7 @@ import isl
 
 from tilefoundry.evaluator.registry import register_eval
 from tilefoundry.evaluator.value import TensorValue
+from tilefoundry._compat import tuple_annotation
 from tilefoundry.ir.core import Op
 from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.register import register_op
@@ -33,7 +34,7 @@ from tilefoundry.visitor_registry.shard_propagate import derive_output_shard_lay
 class Stack(Op):
     """Variadic input op. See Concat for encoding rationale."""
 
-    inputs = ParamDef(kind="input", annotation=Tuple[is_ranked_tensor()], pattern=is_ranked_tensor())
+    inputs = ParamDef(kind="input", annotation=tuple_annotation(is_ranked_tensor()), pattern=is_ranked_tensor())
     axis = ParamDef(kind="attribute", annotation=int)
 
 

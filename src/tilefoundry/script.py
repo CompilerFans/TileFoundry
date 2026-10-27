@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, replace
-from enum import StrEnum
+from tilefoundry._compat import StrEnum
 from types import FunctionType
 from typing import Any, Callable, ClassVar, Literal, Mapping
 

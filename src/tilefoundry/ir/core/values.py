@@ -12,10 +12,13 @@ rendering is, in inspection.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Generic, TypeVar
+
+V = TypeVar("V")
 
 
 @dataclass(frozen=True)
-class TotalAndPerUnit[V]:
+class TotalAndPerUnit(Generic[V]):
     """One quantity, stated for the whole machine and for one unit of it."""
 
     total: V

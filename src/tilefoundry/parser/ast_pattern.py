@@ -14,7 +14,7 @@ import dataclasses
 import operator
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from enum import StrEnum
+from tilefoundry._compat import StrEnum
 from types import FrameType, SimpleNamespace
 from typing import Any, ClassVar, Generic, Protocol, TypeVar, cast
 from typing import Literal as TypingLiteral

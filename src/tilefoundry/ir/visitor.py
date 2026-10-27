@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any, Callable
+from typing import Any, Callable, Generic, TypeVar
 
 from tilefoundry.ir.core import Call, Constant, Expr, Tuple, Var
 from tilefoundry.ir.hir.loop_region import LoopRegion
@@ -30,6 +30,8 @@ from tilefoundry.ir.tir.stmts import (
     While,
 )
 from tilefoundry.ir.tir.symbol_ref import SymbolRef
+
+T = TypeVar("T")
 
 __all__ = [
     "ExprFunctor",
@@ -191,7 +193,7 @@ def _stmt_expr_fields(stmt: Stmt) -> tuple[str, ...]:
             return ()
 
 
-class ExprFunctor[T]:
+class ExprFunctor(Generic[T]):
     """Expr dispatch without memoization.
 
     Read-only visitors and identity-preserving mutators share this dispatch
@@ -221,7 +223,7 @@ class ExprFunctor[T]:
         self._root = None
 
 
-class TypeFunctor[T]:
+class TypeFunctor(Generic[T]):
     """Dispatch read-only operations over IR type and layout values.
 
     Types are immutable value objects rather than expressions, so they need a
@@ -243,7 +245,7 @@ class TypeFunctor[T]:
         raise NotImplementedError(f"no type visit routine for {type(value).__name__}")
 
 
-class ExprVisitor[T](ExprFunctor[T]):
+class ExprVisitor(ExprFunctor[T]):
     """Read-only Expr traversal with identity-based DAG memoization."""
 
     def __init__(
@@ -310,7 +312,7 @@ class ExprVisitor[T](ExprFunctor[T]):
         super().clear()
 
 
-class ExprWalker[T](ExprVisitor[T]):
+class ExprWalker(ExprVisitor[T]):
     """Memoized side-effect traversal for the known value Expr shapes."""
 
     def default_visit_leaf(self, expr: Expr, operands: tuple[T, ...], ctx: Any) -> T:
@@ -464,7 +466,7 @@ class BindingSubstitutionCloner(ExprCloner):
         )
 
 
-class StmtVisitor[T]:
+class StmtVisitor(Generic[T]):
     """Read-only Stmt traversal.
 
     Read-only Stmt traversal. Does NOT descend into embedded Expr fields

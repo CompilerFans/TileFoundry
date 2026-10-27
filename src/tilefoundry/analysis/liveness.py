@@ -24,7 +24,7 @@ from .visitor import AnalyzeContext
 
 @dataclass(frozen=True)
 class UseEvent:
-    events: ClassVar = ("at",)
+    events: ClassVar[tuple[str, ...]] = ("at",)
 
     """One SSA use and whether it exists only to extend structured liveness."""
 
@@ -35,7 +35,7 @@ class UseEvent:
 
 @dataclass(frozen=True)
 class RegionInterval:
-    events: ClassVar = ("entered_at", "exited_at")
+    events: ClassVar[tuple[str, ...]] = ("entered_at", "exited_at")
 
     """One mesh region's entry and exit events on the structured timeline."""
 

@@ -6,6 +6,7 @@ import isl
 
 from tilefoundry.evaluator.registry import register_eval
 from tilefoundry.evaluator.value import TensorValue
+from tilefoundry._compat import tuple_annotation
 from tilefoundry.ir.core import Expr, Op
 from tilefoundry.ir.core.expr import Call
 from tilefoundry.ir.core.param_def import ParamDef
@@ -41,7 +42,7 @@ class Concat(Op):
     Expr). The lone Param entry documents element type.
     """
 
-    inputs = ParamDef(kind="input", annotation=Tuple[is_ranked_tensor()], pattern=is_ranked_tensor())
+    inputs = ParamDef(kind="input", annotation=tuple_annotation(is_ranked_tensor()), pattern=is_ranked_tensor())
     axis = ParamDef(kind="attribute", annotation=int)
 
 

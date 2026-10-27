@@ -6,13 +6,16 @@ from tilefoundry.ir.core import Call, Expr
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.visitor import ExprVisitor
+from typing import TypeVar
+
+T = TypeVar("T")
 
 from .contexts import ValuationContext
 
 __all__ = ["ValuationContext", "ValuationVisitor"]
 
 
-class ValuationVisitor[T](ExprVisitor[T]):
+class ValuationVisitor(ExprVisitor[T]):
     """Visit children in their lexical environment, with overridable transitions."""
 
     def __init__(self, *, contexts=None, **kwargs):

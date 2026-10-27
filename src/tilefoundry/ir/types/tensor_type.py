@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
+from typing import TypeAlias, Union
 
 from tilefoundry.ir.types.storage import StorageKind, resolve_storage
 
 from .dtype import DType
 
-type ShapeDim = "int | DimVar | Expr"
+ShapeDim: TypeAlias = "int | DimVar | Expr"
 """A shape entry: static, symbolic, or expression-valued.
 
 The string forward reference keeps this module free of any import of core

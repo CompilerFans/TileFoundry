@@ -11,13 +11,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import cached_property
-from typing import ClassVar
+from typing import ClassVar, Generic, TypeVar
 
 from tilefoundry.ir.core.expr import SSAValue
 from tilefoundry.ir.core.metadata import IRMetadata
 from tilefoundry.visitor_registry.contexts import TrafficBytes
 
 from .precision import AnalysisPrecision
+
+V = TypeVar("V")
 
 
 @dataclass(frozen=True)
@@ -28,7 +30,7 @@ class ExecutionMeshMetadata(IRMetadata):
 
 
 @dataclass(frozen=True)
-class Spread[V]:
+class Spread(Generic[V]):
     """One typed value in logical, expanded, and topology-unit domains.
 
     ``per_unit`` follows ``ComputeCostMetadata.topologies``. The value retains
@@ -52,7 +54,7 @@ class Spread[V]:
 
 
 @dataclass(frozen=True)
-class Breakdown[V]:
+class Breakdown(Generic[V]):
     """Typed quantities grouped by resource kind for traffic records."""
 
     kinds: tuple[tuple[str, Spread[V]], ...] = ()
@@ -64,7 +66,7 @@ class Breakdown[V]:
         return tuple(name for name, _ in self.kinds)
 
 
-def breakdown[V](
+def breakdown(
     total: "Mapping[str, V]",
     per_unit: "Sequence[Mapping[str, V]]",
     zero: V,
@@ -89,7 +91,7 @@ def breakdown[V](
     )
 
 
-def shares[V](
+def shares(
     held: Breakdown[V],
     topologies: tuple[str, ...],
     topology_level: "str | None" = None,
@@ -101,14 +103,14 @@ def shares[V](
     }
 
 
-def scaled[V](value: V, factor: int) -> V:
+def scaled(value: V, factor: int) -> V:
     """Multiply a work count or a directional byte count."""
     if isinstance(value, TrafficBytes):
         return TrafficBytes(value.read * factor, value.write * factor)
     return value * factor
 
 
-def added[V](left: V, right: V) -> V:
+def added(left: V, right: V) -> V:
     """Add work counts or directional byte counts."""
     if isinstance(left, TrafficBytes):
         return TrafficBytes(left.read + right.read, left.write + right.write)
@@ -230,7 +232,7 @@ class ValueLifetime:
     Display bindings are produced from ``value`` by the expression printer.
     """
 
-    events: ClassVar = ("defined_at", "last_used_at")
+    events: ClassVar[tuple[str, ...]] = ("defined_at", "last_used_at")
 
     value: SSAValue
     defined_at: int
@@ -315,7 +317,7 @@ class TimelineMetadata:
     interval spans is decided by the record it sits in.
     """
 
-    events: ClassVar = ("start_ns", "end_ns")
+    events: ClassVar[tuple[str, ...]] = ("start_ns", "end_ns")
 
     start_ns: int = 0
     end_ns: int = 0

@@ -10,7 +10,9 @@ about.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Callable
+from typing import Callable, Generic, TypeVar
+
+Key = TypeVar("Key")
 
 
 def spelled(key: object) -> str:
@@ -20,7 +22,7 @@ def spelled(key: object) -> str:
     return key.__name__ if isinstance(key, type) else str(key)
 
 
-class DispatchRegistry[Key]:
+class DispatchRegistry(Generic[Key]):
     """Key → handler map. Double registration raises; lookup miss returns None."""
 
     def __init__(self, name: str) -> None:

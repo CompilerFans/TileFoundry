@@ -3,6 +3,10 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from typing import TypeVar
+
+
+T = TypeVar("T", bound="IRMetadata")
 
 
 @dataclass(frozen=True)
@@ -40,7 +44,7 @@ class RangeMetadata(IRMetadata):
     hi: int
 
 
-def get_metadata[T: IRMetadata](expr: "Expr", cls: type[T], *, ctx=None) -> T | None:
+def get_metadata(expr: "Expr", cls: type[T], *, ctx=None) -> T | None:
     """Read a definition record, optionally interpreted in a visit context."""
     record = next((value for value in expr.metadata if type(value) is cls), None)
     return record if record is None or ctx is None else record.resolve(ctx)
