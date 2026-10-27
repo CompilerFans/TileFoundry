@@ -1,0 +1,12 @@
+{
+    "hbm": [
+        {
+            "boardid": "0",
+            "gpuid": "0",
+            "die": 0,
+            "bdf": "0000:07:00.0",
+            "datasize(Byte)": "10737418240",
+            "bandwidth(GB/s)": 1062.0
+        }
+    ]
+}

@@ -37,10 +37,13 @@ the measured column above), never substituted into a design fact:
   point, from a session with a ~24% speed-mode flip.
 - MMA: C600U design BF16 219.05 / FP8 438.1 TFLOPS; measured bare-MMA ceilings
   215.5 / 415.7. C500 design INT8 480 TOPS; measured 477.9. No C600 bare-MMA
-  probe is recorded.
+  probe is recorded; mxvs non-blas ops reaches 192.97 bf16 (99.8% of nominal)
+  on C600 but is a benchmark loop, not a bare-MMA probe.
 - Machine state: C600U 1900 MHz (`mx-smi --show-clock`) and 800 ns HBM latency
-  (pointer chase) are measured; C600UL inherits them as estimates; C500/C600
-  clocks and latencies remain estimates.
+  (pointer chase) are measured; C600UL inherits them as estimates; C600 reads
+  504 MHz idle / 1475 MHz under load (`mx-smi --show-clock`, 2026-10-27) with
+  its HBM latency still an estimate; C500 clocks and latencies remain
+  estimates.
 
 INT8 peaks are documented for reference only: the CUDA fact schema has no
 `int8` throughput key and the IR has no `i8` dtype, so the analysis prices
@@ -50,10 +53,11 @@ and its bare-MMA measurement:
 
 - **INT8 = FP8** (16x16x32 MMA): 438.1 on C600U, 550.5 on C600UL. mxvs has no
   fp8 model; its int8 arm is a GEMM (371 TOPS achieved), not a different rate
-  from the FP8 bare-MMA probe (415.7).
+  from the FP8 bare-MMA probe (415.7). C600's documented INT8 rate is 386.7
+  TOPS (2 x BF16); mxvs reads 365.73 GEMM-achieved.
 - **BF16 = FP16** (16x16x16 MMA): 219.05 on C600U, 275.25 on C600UL. mxvs
   reads them as 196.48 (bf16) and 196.53 (fp16) GEMM-achieved, and the
-  bare-MMA probe is 215.5 for both.
+  bare-MMA probe is 215.5 for both. On C600 the pair reads 185.80 / 185.79.
 
 C500/C600 have no native FP8 (emulated by BF16), so the INT8=FP8 pair applies
 only to xcore1600.
@@ -64,21 +68,23 @@ Measured evidence, by tool and mode (never mixed into the design facts):
 |---|---:|---:|---:|---:|
 | HBM read-only, perf_data fit (GB/s) | 1624 | 979.9 | 1628.5 | — |
 | HBM read+write, perf_data fit (GB/s) | 1490.5 | 1000.6 | 1482.0 | — |
-| HBM read 10 GB, mxvs 0.0.1 (GB/s) | — | — | 1510-1534 | — |
-| HBM kernel-copy 10 GB, mxvs (GB/s) | — | — | 1003-1006 | — |
-| GEMM bf16, mxvs `--blas` (TFLOPS) | — | — | 196.48 | — |
-| GEMM fp16, mxvs `--blas` (TFLOPS) | — | — | 196.53 | — |
-| GEMM int8, mxvs `--blas` (TOPS) | — | — | 371 | — |
-| GEMM tf32, mxvs `--blas` (TFLOPS) | — | — | 86.2 | — |
+| HBM read 10 GB, mxvs 0.0.1 (GB/s) | — | 1062-1063 | 1510-1534 | — |
+| HBM kernel-copy 10 GB, mxvs (GB/s) | — | 856.4-856.5 | 1003-1006 | — |
+| GEMM bf16, mxvs `--blas` (TFLOPS) | — | 185.8 | 196.48 | — |
+| GEMM fp16, mxvs `--blas` (TFLOPS) | — | 185.79 | 196.53 | — |
+| GEMM int8, mxvs `--blas` (TOPS) | — | 365.73 | 371 | — |
+| GEMM tf32, mxvs `--blas` (TFLOPS) | — | 80.22 | 86.2 | — |
 | bare-MMA bf16, probe (TFLOPS) | — | — | 215.5 | — |
 | bare-MMA fp8, probe (TFLOPS) | — | — | 415.7 | — |
 
-mxvs 0.0.1 has no fp8 model and its non-blas ops path reports -0.00 on this
-build. The dtype pairs share their issue rate (INT8=FP8 on xcore1600,
-BF16=FP16 everywhere), so compare a measurement only with the same tool and
-mode; the extraction workaround,
-the 64 MB-10 GB sweep and the per-die caveats are in
-`tilefoundry spec maca/mxvs`; raw JSON is under `docs/mxvs/20261027_c600u/`.
+mxvs 0.0.1 has no fp8 model. Its non-blas ops path is host/build dependent: it
+reported -0.00 on the C600U host but works on the C600 host, reading 192.97
+bf16 / 192.95 fp16 / 385.86 int8 / 96.46 tf32 (~99.8% of nominal). The dtype
+pairs share their issue rate (INT8=FP8 on xcore1600, BF16=FP16 everywhere), so
+compare a measurement only with the same tool and mode; the extraction
+workaround, the 64 MB-10 GB sweeps and the per-die caveats are in
+`tilefoundry spec maca/mxvs`; raw JSON is under `docs/mxvs/20261027_c600u/`
+and `docs/mxvs/20261027_c600/`.
 
 ## MACA-C programming model
 

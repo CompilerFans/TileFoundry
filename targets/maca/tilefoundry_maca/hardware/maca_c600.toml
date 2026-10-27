@@ -25,14 +25,14 @@ value = 1500000000
 unit = "Hz"
 origin = "estimated"
 source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
-conditions = "no clock is published through torch or mx-smi; 1.5 GHz is an estimate used only to derive shared-memory and scalar-service rates"
+conditions = "no clock is published through torch; mx-smi --show-clock on MXC600-A (2026-10-27) reads 504 MHz idle and 1475 MHz under mxvs load. 1.5 GHz stays a rounded estimate used only to derive shared-memory and scalar-service rates"
 
 [facts.memory.hbm.capacity]
 value = 68719476736
 unit = "byte"
 origin = "estimated"
 source = "C600 product class (64 GiB); not confirmed on hardware"
-conditions = "not used by the roofline; no C600 device was on hand"
+conditions = "not used by the roofline; mx-smi --show-hwinfo on MXC600-A (2026-10-27) reports HBM3e 72 GB (decimal), consistent with this 64 GiB class estimate; exact usable capacity is not confirmed"
 
 [facts.memory.hbm.owner]
 value = "target"
@@ -46,7 +46,7 @@ value = 1638000000000
 unit = "byte/s"
 origin = "reference"
 source = "maca-perf-model skill: C600 nominal HBM (1.638 TB/s)"
-conditions = "Design peak (vendor nominal). Measured envelopes (perf_data/bandwidth/20260818_MetaX_C600-A): read-only 979.9, torch-add 1000.6, cub-transform 981.0, copy 829.1 GB/s. The roofline denominator is the design peak."
+conditions = "Design peak (vendor nominal). Measured envelopes (perf_data/bandwidth/20260818_MetaX_C600-A): read-only 979.9, torch-add 1000.6, cub-transform 981.0, copy 829.1 GB/s. mxvs 0.0.1 (2026-10-27, MXC600-A GPU0/die 0 BDF 0000:07:00.0, 10 GB): read-only 1062-1063, kernel-copy 856.4-856.5 GB/s; the 64 MB-10 GB sweep read 971.6-1063.3, copy 830.3-856.6 GB/s (a different tool and mode; recipe in tilefoundry spec maca/mxvs). The roofline denominator is the design peak."
 
 [facts.memory.gmem.latency]
 value = 600
@@ -78,18 +78,18 @@ value = 193350000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill"
-conditions = "16x16x16 MMA; 32 AP"
+conditions = "16x16x16 MMA; 32 AP. FP16 shares the BF16 issue rate, so the same figures apply; mxvs 0.0.1 (2026-10-27, die 0): ops --blas GEMM 185.79 TFLOPS, non-blas ops 192.95"
 
 [facts.throughput.bf16]
 value = 193350000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill"
-conditions = "Nominal 16x16x16 MMA peak; no bare-MMA probe for C600 is recorded in the workspace"
+conditions = "Nominal 16x16x16 MMA peak; no bare-MMA probe for C600 is recorded in the workspace. mxvs 0.0.1 (2026-10-27, die 0): ops --blas GEMM 185.8 TFLOPS, non-blas ops 192.97 (99.8% of nominal, consistent with the 1475 MHz XCORE clock mx-smi reads under load). FP16 shares the issue rate, so the same figures apply"
 
 [facts.throughput.fp8e4m3]
 status = "unavailable"
-conditions = "no native FP8 MMA on this product; FP8 is emulated by BF16 on this architecture"
+conditions = "no native FP8 MMA on this product; FP8 is emulated by BF16 on this architecture. Confirmed by mxvs 0.0.1 (2026-10-27): ops --models rejects fp8 and accepts only int8, bf16, fp16_matrix, tf32"
 
 [facts.throughput.f4e2m1]
 status = "unavailable"
