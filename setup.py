@@ -40,6 +40,7 @@ setup(
         ],
         "nvidia": [f"tilefoundry-nvidia=={version}"],
         "apple": [f"tilefoundry-apple=={version}"],
-        "all": ["tilefoundry[nvidia,apple]"],
+        "maca": [f"tilefoundry-maca=={version}"],
+        "all": ["tilefoundry[nvidia,apple,maca]"],
     },
 )

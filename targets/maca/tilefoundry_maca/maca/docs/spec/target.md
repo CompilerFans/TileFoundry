@@ -6,12 +6,12 @@
 
 ## 1. Why a separate target
 
-TileFoundry's shipped targets are `nvidia` (CUDA codegen) and `apple` (AMX).
-MACA is not CUDA at the instruction level: a wave is 64 lanes, the execution
-unit is an AP with four PEUs, the compiler is `mxcc`/`cucc`, and the scalar /
-special / conversion instruction rates differ from an SM. Pricing a MACA
-program with the H200 target gives the right *logical* traffic but the wrong
-rates.
+TileFoundry's shipped targets are `nvidia` (CUDA codegen), `apple` (AMX
+codegen) and `maca` (analysis). MACA is not CUDA at the instruction level: a
+wave is 64 lanes, the execution unit is an AP with four PEUs, the compiler is
+`mxcc`/`cucc`, and the scalar / special / conversion instruction rates differ
+from an SM. Pricing a MACA program with the H200 target gives the right
+*logical* traffic but the wrong rates.
 
 `targets/maca` reuses the CUDA **fact** schema (`tilefoundry.cuda.device/v3`,
 `tilefoundry.cuda.architecture/v3`) and the CUDA target's fact projections, and
@@ -68,15 +68,73 @@ the target. A program whose workload needs a dtype the product does not list
 
 ## 4. Using it
 
+The target is discoverable through the same agent-facing surfaces as the
+shipped ones:
+
+```sh
+tilefoundry target list          # MacaTarget("maca.c500|c600|c600u|c600ul")
+tilefoundry target show maca.c600u
+tilefoundry spec maca/target     # this page
+```
+
+In an authored HIR:
+
 ```python
 from tilefoundry_maca import MacaTarget
 _TARGET = MacaTarget("maca.c600u")
+
+@module(entry="s3", target=_TARGET, topologies=(...))
+class S3: ...
 ```
 
-`tilefoundry target list` prints `MacaTarget("maca.c600u")`;
-`tilefoundry target show maca.c600u` prints every fact and its evidence.
+then `tilefoundry analyze model.py:S3 out.txt --compute-cost --memory --roofline`.
 
-## 5. Python 3.10
+## 5. MACA-C programming model
+
+The mapping from a hand-written MACA-C kernel to the analysis vocabulary:
+
+| MACA-C concept | HIR |
+|---|---|
+| CTA | `cta` topology, one instance per AP |
+| wave (64 lanes) | `thread` topology (`max_threads_per_warp = 64`) |
+| PEUs inside an AP | not a topology axis; read occupancy from the documented `max_warps_per_cta` / `max_resident_ctas_per_sm` facts and `mxcc --resource-usage` |
+| registers (`MTregs` per thread) | `rmem`, owner `thread`; per-AP budget `registers_per_sm_32bit = 131072` |
+| shared memory | `smem`; 128 KiB/AP on C600U, 64 KiB on C500 |
+| MMA / FP32 / conversion throughput | `ThroughputFacts` and `PerformanceServiceFacts` |
+
+Workflow:
+
+1. **Mirror the kernel's tiles.** Give each tensor the CTA and thread layout
+   the kernel actually uses. A tensor with no CTA axis is **replicated per
+   CTA**: that is how a weight re-read is charged. `@logical` is the unique
+   bytes; `@total` multiplies by the repeats (CTAs, waves, splits).
+2. **Price both sides.** Run `--compute-cost --memory --roofline`; `bound-by`
+   names the binding side, and the per-op traffic lines show where the bytes
+   go.
+3. **Validate the absolute number.** The roofline also depends on the layout's
+   access granularity (28 contiguous elements per thread prices differently
+   from the kernel's 16-byte packets). Use the model for relative comparisons
+   (e.g. one tiling versus another) and the target facts plus measurements for
+   absolutes: `mxcc --resource-usage`, `mx-smi --show-clock`, and a streaming
+   ceiling. A placement advisory (`rmem placement peak ...`) is coarse when the
+   HIR mesh is coarser than the per-thread tile; occupancy still comes from
+   `mxcc`.
+
+Worked example — mega_mhc S1 (`tilefoundry_maca/maca/models/mega_mhc_s1.py`):
+
+```sh
+tilefoundry analyze targets/maca/tilefoundry_maca/maca/models/mega_mhc_s1.py:S1MixGemm \
+    /tmp/s1.txt --compute-cost --memory --roofline
+```
+
+At `BM=128` the model reports `gmem:r2.84GiB/w2.19GiB@total`; 672 MiB of the
+read is the per-CTA `fn` re-read (256 CTAs × 2.62 MiB). At `BM=64` the total
+moves from 5.03 GiB to 5.70 GiB (+13.3%), matching the measured penalty of the
+ct64 arm and showing why it kept 128 tokens per CTA. The same method on the S3
+tail gives the calibrated 2.11 ms memory floor and the instruction-bound 3.6 ms
+reference (section 7).
+
+## 6. Python 3.10
 
 The core tree and both target distributions declare `requires-python >= 3.10`.
 The compatibility changes are:
@@ -98,7 +156,7 @@ report renders a record. The four record fields are in
 
 Install in the py310 MACA environment (validated with
 `tilefoundry analyze ... --compute-cost --memory --roofline` on the mega_mhc S3
-HIR):
+and S1 HIRs):
 
 ```bash
 python -m pip install isl-python==0.1.9 ortools==9.9.3963 graphviz \
@@ -107,7 +165,7 @@ python -m pip install "setuptools-scm==8.1.0"
 python -m pip install -e /path/to/TileFoundry --no-deps --no-build-isolation
 python -m pip install -e /path/to/TileFoundry/targets/nvidia --no-deps --no-build-isolation
 python -m pip install -e /path/to/TileFoundry/targets/maca --no-deps --no-build-isolation
-tilefoundry target list
+tilefoundry spec maca/target
 ```
 
 The internal index currently has `isl-python` 0.1.9 and `ortools` 9.9 for
@@ -116,7 +174,7 @@ cp310, below the py312 versions; `analyze` works with them. `ortools` imports
 8.1.0 is used for the editable builds. `transformers` is only needed by
 `models`/orchestrator, not by `analyze`.
 
-## 6. Multi-wave footprint accounting
+## 7. Multi-wave footprint accounting
 
 The S3 HIR in
 `mcDeepGemm/docs/experiments/20261026_c600u_mega_mhc_tilelang_s3/s3_fused.py`
@@ -158,5 +216,5 @@ Two placement advisories remain and are still meaningful:
 
 For absolute gates, make the HIR physically placeable (per-CTA rmem ≤ 512 KiB,
 per-wave L2 window ≤ 2 MiB) and calibrate the estimated latency/clock. Until
-then, use 1.02–2.11 ms as the memory floor and the measured 3.6 ms as the
+then, use 1.02-2.11 ms as the memory floor and the measured 3.6 ms as the
 current instruction-bound reference.

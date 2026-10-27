@@ -24,7 +24,7 @@ echo CONDA_ENV=tilefoundry-dev > .dev-env
 
 ```sh
 git submodule update --init --recursive   # third_party/cutlass
-python -m pip install -e '.[test]' -e targets/nvidia -e targets/apple
+python -m pip install -e '.[test]' -e targets/nvidia -e targets/apple -e targets/maca
 ```
 
 When upgrading a checkout from before the distribution split, delete the
@@ -186,6 +186,11 @@ short bullet list — keep it that way.
 
 Use [targets/apple](../targets/apple) as a minimal example and
 [targets/nvidia](../targets/nvidia) as the complete compiler/runtime reference.
+[targets/maca](../targets/maca) is the analysis-only example: it installs
+hardware documents and an agent-facing spec (`tilefoundry spec maca/target`)
+without a code generator. A target's spec is discovered from
+`<entry-point package>/docs/spec/*.md` and appears as `<entry point>/<stem>`,
+so `tilefoundry spec` lists it next to the core pages.
 Follow the [target loading and extension contract](spec/target.md#13-target-loading-and-extensions)
 in §1.3 for packaging, entry points, and registration.
 Keep tests in `tests/<vendor>/<target>/`.

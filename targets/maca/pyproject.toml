@@ -20,6 +20,4 @@ include = ["tilefoundry_maca", "tilefoundry_maca.*"]
 
 [tool.setuptools.package-data]
 "tilefoundry_maca.hardware" = ["*.toml"]
-
-[tool.setuptools.data-files]
-"share/tilefoundry/maca" = ["docs/spec/*.md"]
+"tilefoundry_maca.maca" = ["docs/spec/*.md", "models/*.py"]

@@ -46,12 +46,25 @@
 
 </details>
 
+## Targets
+
+| target | extra | what it does |
+|---|---|---|
+| NVIDIA (H200, B200, RTX 6000 Ada) | `[nvidia]` | CUDA codegen and runtime |
+| Apple AMX | `[apple]` | AMX codegen |
+| MetaX MACA (C500, C600, C600U, C600UL) | `[maca]` | **analysis only** — prices MACA-C / mcTileLang kernels against MACA facts; no MACA C codegen (`tilefoundry spec maca/target`) |
+
+The MACA target is a MetaX adaptation: `MacaTarget("maca.c600u")` maps `cta`
+to an AP and `thread` to a 64-lane wave, and carries the measured C600U clock,
+HBM latency, smem/register limits and MMA peaks. See
+[`targets/maca`](targets/maca) for the worked `mega_mhc` S1 example.
+
 ## Quick Start
 
 ### 1 · Install
 
 ```sh
-pip install "tilefoundry[all]"    # needs Python 3.12 or newer; [nvidia] or [apple] installs one vendor
+pip install "tilefoundry[all]"    # needs Python 3.10 or newer; [nvidia], [apple] or [maca] installs one vendor
 tilefoundry                # check the install: the commands an agent will ask
 ```
 
