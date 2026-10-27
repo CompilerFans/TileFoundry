@@ -42,11 +42,12 @@ source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
 conditions = "one HBM pool shared by all APs of this single-device target"
 
 [facts.memory.hbm.bandwidth]
-value = 1638000000000
+value = 1000600000000
 unit = "byte/s"
-origin = "reference"
-source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
-conditions = "C600 nominal HBM rate from the maca-perf-model skill (1.638 TB/s); no streaming ceiling was measured for this analysis"
+origin = "measured"
+source = "mcDeepGemm perf_data/bandwidth/20260818_MetaX_C600-A (torch-add fit, L2-flushed, r2=0.9998)"
+conditions = "Measured read+write envelope 1000.6 GB/s; read-only 979.9, cub-transform 981.0, copy 829.1. Nominal is 1638 GB/s; the model uses the measured read+write envelope."
+
 
 [facts.memory.gmem.latency]
 value = 600
@@ -85,7 +86,8 @@ value = 193350000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill"
-conditions = "16x16x16 MMA; 32 AP"
+conditions = "Nominal 16x16x16 MMA peak; no bare-MMA probe for C600 is recorded in the workspace"
+
 
 [facts.throughput.fp8e4m3]
 status = "unavailable"

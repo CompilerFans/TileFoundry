@@ -21,11 +21,12 @@ source = "maca-perf-model skill"
 conditions = "32 APs"
 
 [facts.compute.sm_clock_hz]
-value = 1500000000
+value = 1900000000
 unit = "Hz"
 origin = "estimated"
-source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
-conditions = "no clock is published through torch or mx-smi; 1.5 GHz is an estimate used only to derive shared-memory and scalar-service rates"
+source = "C600U measured 1900 MHz (same xcore1600 family)"
+conditions = "estimated from the C600U measurement; the 32-AP SKU is not on hand"
+
 
 [facts.memory.hbm.capacity]
 value = 77191970816
@@ -42,18 +43,20 @@ source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
 conditions = "one HBM pool shared by all APs of this single-device target"
 
 [facts.memory.hbm.bandwidth]
-value = 1183000000000
+value = 1482000000000
 unit = "byte/s"
 origin = "estimated"
-source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
-conditions = "C600UL shares the C600U HBM part; 1183 GB/s measured C600U streaming ceiling is used as an estimate"
+source = "C600U measured read+write envelope (perf_data/bandwidth/20260818_MetaX_C600-U); same xcore1600 HBM, 32-AP SKU"
+conditions = "estimated from C600U 1482.0 GB/s read+write; nominal is 2048 GB/s"
+
 
 [facts.memory.gmem.latency]
-value = 600
+value = 800
 unit = "ns"
 origin = "estimated"
-source = "mcDeepGemm docs/mega_mhc_maca_c_occupancy_20261017.md"
-conditions = "not measured; 600 ns is used so the analysis can apply Little's law to the S1 stream. Replace with a pointer-chase measurement when available."
+source = "C600U measured 800 ns pointer-chase (same xcore1600 family)"
+conditions = "estimated from the C600U measurement; replace with a pointer-chase on this SKU when available"
+
 
 [facts.memory.l2.capacity]
 value = 2097152
@@ -85,14 +88,16 @@ value = 275250000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill"
-conditions = "16x16x16 MMA; 32 AP"
+conditions = "Nominal 32-AP BF16 peak"
+
 
 [facts.throughput.fp8e4m3]
 value = 550500000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill"
-conditions = "native 16x16x32 FP8 MMA; 32 AP"
+conditions = "Nominal 32-AP FP8 peak"
+
 
 [facts.throughput.f4e2m1]
 status = "unavailable"

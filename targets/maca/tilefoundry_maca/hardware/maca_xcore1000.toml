@@ -15,7 +15,7 @@ value = ["mma.16x16x16.bf16", "mma.16x16x16.i8", "ldg.b128.bsm", "barrier.inst",
 unit = "name"
 origin = "reference"
 source = "mcDeepGemm csrc/jit_kernels/impls/bf16_mega_mhc_maca_c.hpp and maca_tile/builtin"
-conditions = "instruction families the C600U kernels select; names are this target's vocabulary, not vendor PTX names"
+conditions = "instruction families the C500 kernels select; names are this target's vocabulary, not vendor PTX names"
 
 [facts.instruction.compute_dtypes]
 value = ["f32", "f16", "bf16"]

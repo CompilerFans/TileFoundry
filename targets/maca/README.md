@@ -20,16 +20,27 @@ tilefoundry target show maca.c600u       # every fact and its evidence
 
 | id | arch | APs | L2 | HBM (model) | BF16 | FP8 | INT8 |
 |---|---|---:|---:|---:|---:|---:|---:|
-| `maca.c500` | `maca.xcore1000` | 104 | 8 MiB | 1418.7 GB/s (measured copy ceiling; 1.80 TB/s nominal) | 240 TFLOPS | unavailable (emulated) | 480 TOPS |
-| `maca.c600` | `maca.xcore1500` | 32 | 2 MiB | 1638 GB/s (nominal) | 193.35 TFLOPS | unavailable (emulated) | 386.7 TOPS |
-| `maca.c600u` | `maca.xcore1600` | 28 | 2 MiB | 1183 GB/s (measured streaming ceiling; 2.048 TB/s nominal) | 219.05 TFLOPS | 438.1 TFLOPS | 438.1 TOPS |
-| `maca.c600ul` | `maca.xcore1600` | 32 | 2 MiB | 1183 GB/s (C600U ceiling used as estimate) | 275.25 TFLOPS | 550.5 TFLOPS | 550.5 TOPS |
+| `maca.c500` | `maca.xcore1000` | 104 | 8 MiB | 1490.5 GB/s (measured read+write; 1.80 TB/s nominal) | 240 TFLOPS | unavailable (emulated) | 480 TOPS |
+| `maca.c600` | `maca.xcore1500` | 32 | 2 MiB | 1000.6 GB/s (measured read+write; 1.638 TB/s nominal) | 193.35 TFLOPS | unavailable (emulated) | 386.7 TOPS |
+| `maca.c600u` | `maca.xcore1600` | 28 | 2 MiB | 1482.0 GB/s (measured read+write; 2.048 TB/s nominal) | 219.05 TFLOPS | 438.1 TFLOPS | 438.1 TOPS |
+| `maca.c600ul` | `maca.xcore1600` | 32 | 2 MiB | 1482.0 GB/s (estimated from C600U; 2.048 TB/s nominal) | 275.25 TFLOPS | 550.5 TFLOPS | 550.5 TOPS |
 
 Every fact carries `origin` (`vendor`, `measured`, `reference`, `derived`,
-`estimated`) and `conditions`. On `maca.c600u` the 1900 MHz XCORE clock
-(`mx-smi --show-clock`) and 800 ns HBM latency (pointer chase, 769-822 ns at
-1-4 chains/AP; L2 308-323 ns) are measured; the C500/C600/C600UL clocks and
-latencies remain estimates.
+`estimated`) and `conditions`. The HBM facts use the **measured read+write
+envelope** (torch-add, L2-flushed linear fit) from
+`mcDeepGemm/deep_gemm/tests/perf_data/bandwidth/20260818_MetaX_*`; read-only
+ceilings are higher (C500 1624, C600 979.9, C600U 1628.5 GB/s) and the nominal
+rates are 1.8432 / 1.638 / 2.048 TB/s. The compute peaks are the nominal
+`maca-perf-model` values; measured bare-MMA ceilings are stated in each fact's
+`conditions` (C600U BF16 215.5/219.05, FP8 415.7/438.1). On `maca.c600u` the
+1900 MHz XCORE clock (`mx-smi --show-clock`) and 800 ns HBM latency (pointer
+chase, 769-822 ns at 1-4 chains/AP; L2 308-323 ns) are measured; C600UL
+inherits them as estimates, C500/C600 clocks and latencies remain estimates.
+
+INT8 peaks are documented for reference only: the CUDA fact schema has no
+`int8` throughput key and the IR has no `i8` dtype, so the analysis prices
+integer work through the scalar `service.integer` fact, not a tensor-core
+peak.
 
 ## MACA-C programming model
 

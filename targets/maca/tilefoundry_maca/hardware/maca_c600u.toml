@@ -42,11 +42,11 @@ source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
 conditions = "one HBM pool shared by all APs of this single-device target"
 
 [facts.memory.hbm.bandwidth]
-value = 1183000000000
+value = 1482000000000
 unit = "byte/s"
 origin = "measured"
-source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
-conditions = "1183 GB/s streaming ceiling measured on C600U; the nominal HBM rate in the maca-perf-model skill is 2.048 TB/s, which is optimistic for this kernel family"
+source = "mcDeepGemm perf_data/bandwidth/20260818_MetaX_C600-U (torch-add fit, L2-flushed, r2=0.9996)"
+conditions = "Measured read+write envelope 1482.0 GB/s. Read-only is 1628.5 GB/s, cub-transform 1513.7, copy 1380.1; the mega_mhc 2 GiB copy probe measured 1183 GB/s in a session that saw a ~24% speed-mode flip. Nominal is 2048 GB/s (16ch x 256b x 4.0 Gbps); the model uses the read+write envelope."
 
 [facts.memory.gmem.latency]
 value = 800
@@ -78,21 +78,21 @@ value = 219050000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill: C600U (28 AP) BF16/FP16 MMA peak"
-conditions = "16x16x16 MMA; C600U 28 AP"
+conditions = "Nominal 16x16x16 MMA peak; a bare-MMA microbench measured 215.5 TF/s (98.4%) on C600U"
 
 [facts.throughput.bf16]
 value = 219050000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill: C600U (28 AP) BF16/FP16 MMA peak"
-conditions = "16x16x16 MMA; C600U 28 AP"
+conditions = "Nominal 16x16x16 MMA peak; a bare-MMA microbench measured 215.5 TF/s (98.4%) on C600U"
 
 [facts.throughput.fp8e4m3]
 value = 438100000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill: C600U (28 AP) FP8 peak"
-conditions = "native 16x16x32 FP8 MMA; C600U 28 AP"
+conditions = "Nominal native 16x16x32 FP8 MMA peak; a bare-MMA probe measured 415.7 TF/s (94.9%) on C600U"
 
 [facts.throughput.f4e2m1]
 status = "unavailable"

@@ -4,16 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tilefoundry-maca"
-version = "0.1.0"
-description = "MACA (MetaX C500/C600/C600U) analysis targets for TileFoundry."
+dynamic = ["version", "dependencies"]
+description = "MACA (MetaX C500/C600/C600U/C600UL) analysis targets for TileFoundry."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-dependencies = ["tilefoundry", "tilefoundry-nvidia"]
+license-files = ["LICENSE"]
 
 [project.entry-points."tilefoundry.targets"]
 maca = "tilefoundry_maca.maca"
 
+[tool.setuptools_scm]
+root = "../.."
 
 [tool.setuptools.packages.find]
 include = ["tilefoundry_maca", "tilefoundry_maca.*"]
