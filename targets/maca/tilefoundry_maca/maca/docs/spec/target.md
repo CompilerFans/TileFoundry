@@ -50,6 +50,11 @@ documentation only: the schema has no `int8` throughput key and the IR has no
 `i8` dtype, so the analysis prices integer work through `service.integer`, not
 a tensor-core peak.
 
+mxvs 0.0.1 (GPU0/die 0, 2026-10-27) adds another measured caliber: HBM read
+1510-1534 GB/s and kernel-copy 1003-1006 GB/s at 10 GB; GEMM bf16/fp16
+196.5 TFLOPS, int8 371.2 TOPS, tf32 86.2. It has no fp8 model. The recipe,
+per-size sweep and per-die caveats are in `tilefoundry spec maca/mxvs`.
+
 Sources: the workspace `maca-perf-model` skill (AP/L2/nominal HBM/MMA peaks),
 `mcDeepGemm`'s `perf_data/bandwidth/20260818_MetaX_*` (measured envelopes),
 `mcDeepGemm/docs/mega_mhc_maca_c_occupancy_20261017.md` (C600U registers, smem,

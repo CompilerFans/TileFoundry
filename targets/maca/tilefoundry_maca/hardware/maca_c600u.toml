@@ -46,7 +46,7 @@ value = 2048000000000
 unit = "byte/s"
 origin = "reference"
 source = "maca-perf-model skill: C600U nominal HBM (2.048 TB/s; 16ch x 256b x 4.0 Gbps)"
-conditions = "Design peak (vendor nominal). Measured envelopes (perf_data/bandwidth/20260818_MetaX_C600-U): read-only 1628.5, torch-add 1482.0, cub-transform 1513.7, copy 1380.1 GB/s; a mega_mhc 2 GiB copy probe measured 1183 GB/s in a session with a ~24% speed-mode flip. The roofline denominator is the design peak."
+conditions = "Design peak (vendor nominal). Measured envelopes (perf_data/bandwidth/20260818_MetaX_C600-U): read-only 1628.5, torch-add 1482.0, cub-transform 1513.7, copy 1380.1 GB/s; a mega_mhc 2 GiB copy probe measured 1183 GB/s in a session with a ~24% speed-mode flip. mxvs 0.0.1 (10 GB, die 0, 2026-10-27): read-only 1510-1534, kernel-copy 1003-1006 GB/s (a different tool and mode; recipe in tilefoundry spec maca/mxvs). The roofline denominator is the design peak."
 
 [facts.memory.gmem.latency]
 value = 800
@@ -78,21 +78,21 @@ value = 219050000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill: C600U (28 AP) BF16/FP16 MMA peak"
-conditions = "Nominal 16x16x16 MMA peak; a bare-MMA microbench measured 215.5 TF/s (98.4%) on C600U"
+conditions = "Nominal 16x16x16 MMA peak; a bare-MMA microbench measured 215.5 TF/s (98.4%) on C600U; mxvs 0.0.1 ops --blas (GEMM) measured 196.5 TFLOPS"
 
 [facts.throughput.bf16]
 value = 219050000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill: C600U (28 AP) BF16/FP16 MMA peak"
-conditions = "Nominal 16x16x16 MMA peak; a bare-MMA microbench measured 215.5 TF/s (98.4%) on C600U"
+conditions = "Nominal 16x16x16 MMA peak; a bare-MMA microbench measured 215.5 TF/s (98.4%) on C600U; mxvs 0.0.1 ops --blas (GEMM) measured 196.5 TFLOPS"
 
 [facts.throughput.fp8e4m3]
 value = 438100000000000
 unit = "flop/s"
 origin = "reference"
 source = "maca-perf-model skill: C600U (28 AP) FP8 peak"
-conditions = "Nominal native 16x16x32 FP8 MMA peak; a bare-MMA probe measured 415.7 TF/s (94.9%) on C600U"
+conditions = "Nominal native 16x16x32 FP8 MMA peak; a bare-MMA probe measured 415.7 TF/s (94.9%) on C600U; mxvs 0.0.1 has no fp8 model"
 
 [facts.throughput.f4e2m1]
 status = "unavailable"

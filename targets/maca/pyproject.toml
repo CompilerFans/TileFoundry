@@ -22,4 +22,4 @@ include = ["tilefoundry_maca", "tilefoundry_maca.*"]
 
 [tool.setuptools.package-data]
 "tilefoundry_maca.hardware" = ["*.toml"]
-"tilefoundry_maca.maca" = ["docs/spec/*.md", "models/*.py"]
+"tilefoundry_maca.maca" = ["docs/spec/*.md", "docs/mxvs/*/*.json", "models/*.py"]

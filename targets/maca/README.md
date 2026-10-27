@@ -47,6 +47,13 @@ INT8 peaks are documented for reference only: the CUDA fact schema has no
 integer work through the scalar `service.integer` fact, not a tensor-core
 peak.
 
+Measured with mxvs 0.0.1 on C600U (GPU0/die 0, 2026-10-27): HBM read
+1510-1534 GB/s and kernel-copy 1003-1006 GB/s at 10 GB; GEMM bf16/fp16
+196.5 TFLOPS, int8 371.2 TOPS, tf32 86.2. This mxvs build has no fp8 model,
+so FP8 evidence stays the bare-MMA probe 415.7. The extraction workaround,
+per-size sweep (64 MB to 10 GB) and per-die caveats are in
+`tilefoundry spec maca/mxvs`.
+
 ## MACA-C programming model
 
 | MACA-C concept | HIR |
