@@ -1,0 +1,124 @@
+[spec]
+schema = "tilefoundry.cuda.device/v3"
+kind = "device"
+id = "maca.c600"
+
+[compatibility]
+architectures = ["maca.xcore1500"]
+
+[facts.identity.name]
+value = "c600"
+unit = "name"
+origin = "vendor"
+source = "https://www.metax-tech.com/"
+conditions = "MetaX C600 analysis product"
+
+[facts.compute.sm_count]
+value = 32
+unit = "count"
+origin = "reference"
+source = "maca-perf-model skill"
+conditions = "32 APs"
+
+[facts.compute.sm_clock_hz]
+value = 1500000000
+unit = "Hz"
+origin = "estimated"
+source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
+conditions = "no clock is published through torch or mx-smi; 1.5 GHz is an estimate used only to derive shared-memory and scalar-service rates"
+
+[facts.memory.hbm.capacity]
+value = 68719476736
+unit = "byte"
+origin = "measured"
+source = "torch.cuda.get_device_properties(0) on MXC600-U"
+conditions = "64 GiB class; not used by the roofline"
+
+[facts.memory.hbm.owner]
+value = "target"
+unit = "name"
+origin = "derived"
+source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
+conditions = "one HBM pool shared by all APs of this single-device target"
+
+[facts.memory.hbm.bandwidth]
+value = 1638000000000
+unit = "byte/s"
+origin = "reference"
+source = "mcDeepGemm docs/mega_mhc_theoretical_roofline_20261020.md"
+conditions = "C600 nominal HBM rate from the maca-perf-model skill (1.638 TB/s); no streaming ceiling was measured for this analysis"
+
+[facts.memory.gmem.latency]
+value = 600
+unit = "ns"
+origin = "estimated"
+source = "mcDeepGemm docs/mega_mhc_maca_c_occupancy_20261017.md"
+conditions = "not measured; 600 ns is used so the analysis can apply Little's law to the S1 stream. Replace with a pointer-chase measurement when available."
+
+[facts.memory.l2.capacity]
+value = 2097152
+unit = "byte"
+origin = "reference"
+source = "maca-perf-model skill: C600/C600U/C600UL L2 = 2 MiB"
+conditions = "C600 L2 = 2 MiB per device"
+
+[facts.memory.l2.bandwidth]
+status = "unavailable"
+conditions = "MetaX publishes no static L2 bandwidth; the roofline uses HBM."
+
+[facts.throughput.f32]
+value = 12300000000000
+unit = "flop/s"
+origin = "derived"
+source = "derived from AP count and an estimated 1.5 GHz clock"
+conditions = "FFMA estimate at the estimated 1.5 GHz clock; the mega_mhc S1 is memory-bound so this peak is not binding"
+
+[facts.throughput.f16]
+value = 193350000000000
+unit = "flop/s"
+origin = "reference"
+source = "maca-perf-model skill"
+conditions = "16x16x16 MMA; 32 AP"
+
+[facts.throughput.bf16]
+value = 193350000000000
+unit = "flop/s"
+origin = "reference"
+source = "maca-perf-model skill"
+conditions = "16x16x16 MMA; 32 AP"
+
+[facts.throughput.fp8e4m3]
+status = "unavailable"
+conditions = "no native FP8 MMA on this product; FP8 is emulated by BF16 on this architecture"
+
+[facts.throughput.f4e2m1]
+status = "unavailable"
+conditions = "no FP4 MMA peak is published in the maca-perf-model skill; mcDeepGemm uses FP4 as a storage format."
+
+[facts.service.integer]
+value = 96000000000
+unit = "op/s"
+origin = "derived"
+source = "64 integer results/clock/AP x 1.5 GHz"
+conditions = "per-AP scalar envelope; the analysis multiplies by AP count. Same conservative 64/clock assumption as the CUDA target."
+
+[facts.service.predicate]
+value = 96000000000
+unit = "op/s"
+origin = "derived"
+source = "64 predicate results/clock/AP x 1.5 GHz"
+conditions = "same scalar envelope as integer"
+
+[facts.service.select]
+value = 96000000000
+unit = "op/s"
+origin = "derived"
+source = "64 select results/clock/AP x 1.5 GHz"
+conditions = "same scalar envelope as integer"
+
+[facts.service.special]
+value = 24000000000
+unit = "op/s"
+origin = "derived"
+source = "16 special results/clock/AP x 1.5 GHz"
+conditions = "rsqrt/exp-style special-function envelope; same 16/clock assumption as the CUDA target"
